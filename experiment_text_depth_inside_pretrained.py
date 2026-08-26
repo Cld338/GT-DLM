@@ -166,6 +166,7 @@ def main() -> None:
     parser.add_argument(
         "--artifact-dir", default="artifacts/text_depth_inside_pretrained"
     )
+    parser.add_argument("--data-dir", default="", help="override the corpus from the base artifact config")
     parser.add_argument("--model-name", default="distilroberta-base")
     parser.add_argument("--cache-dir", default=".hf_cache/hub")
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
@@ -200,6 +201,8 @@ def main() -> None:
     ) as handle:
         base = json.load(handle)
     config = base["config"]
+    if args.data_dir:
+        config["data_dir"] = args.data_dir
     data_seed = int(config["seed"])
     training_seed = data_seed if args.seed < 0 else args.seed
     seed_everything(training_seed)
@@ -313,6 +316,7 @@ def main() -> None:
         "config": {
             **config,
             **vars(args),
+            "data_dir": str(config["data_dir"]),
             "seed": data_seed,
             "data_seed": data_seed,
             "training_seed": training_seed,
