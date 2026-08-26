@@ -500,6 +500,269 @@ class IntervalInsideBoundaryModel(nn.Module):
         return self.topology_head(torch.cat((interval_hidden, token), dim=-1))
 
 
+class PretrainedIntervalEncoder(nn.Module):
+    """Masked-language prompt encoder with custom-vocabulary boundary states.
+
+    The pretrained backbone runs once per observed prompt. Only its mask-token
+    state is needed by the interval chart; all latent tree states then reuse
+    that context and differ through custom-BPE boundary and depth embeddings.
+    """
+
+    def __init__(
+        self,
+        vocab_size: int,
+        gap_id: int,
+        pad_id: int,
+        source_tokenizer,
+        model_name: str,
+        cache_dir: str,
+        max_steps: int = 32,
+        max_length: int = 256,
+        freeze_backbone: bool = False,
+        gradient_checkpointing: bool = False,
+        local_files_only: bool = False,
+        random_init_backbone: bool = False,
+        backbone=None,
+        pretrained_tokenizer=None,
+        initialize_custom_embeddings: bool = True,
+    ) -> None:
+        super().__init__()
+        if backbone is None or pretrained_tokenizer is None:
+            from transformers import AutoConfig, AutoModel, AutoTokenizer
+
+            pretrained_tokenizer = AutoTokenizer.from_pretrained(
+                model_name,
+                cache_dir=cache_dir,
+                use_fast=True,
+                local_files_only=local_files_only,
+            )
+            if random_init_backbone:
+                config = AutoConfig.from_pretrained(
+                    model_name,
+                    cache_dir=cache_dir,
+                    local_files_only=local_files_only,
+                )
+                backbone = AutoModel.from_config(config)
+            else:
+                backbone = AutoModel.from_pretrained(
+                    model_name,
+                    cache_dir=cache_dir,
+                    local_files_only=local_files_only,
+                )
+        if pretrained_tokenizer.mask_token_id is None:
+            raise ValueError("pretrained tokenizer must define a mask token")
+        self.backbone = backbone
+        self.pretrained_tokenizer = pretrained_tokenizer
+        self.source_tokenizer = source_tokenizer
+        self.gap_id = gap_id
+        self.pad_id = pad_id
+        self.max_length = max_length
+        d_model = int(backbone.config.hidden_size)
+        self.token_embedding = nn.Embedding(vocab_size, d_model)
+        self.step_embedding = nn.Embedding(max_steps, d_model)
+        self.context_norm = nn.LayerNorm(d_model)
+        if initialize_custom_embeddings:
+            self.initialize_custom_token_embeddings()
+        if gradient_checkpointing:
+            self.backbone.gradient_checkpointing_enable()
+        if freeze_backbone:
+            for parameter in self.backbone.parameters():
+                parameter.requires_grad_(False)
+
+    @property
+    def hidden_size(self) -> int:
+        return int(self.backbone.config.hidden_size)
+
+    def initialize_custom_token_embeddings(self) -> None:
+        """Map every custom-BPE token into the pretrained embedding space."""
+        pretrained_embeddings = self.backbone.get_input_embeddings().weight.detach()
+        strings = [
+            self.source_tokenizer.decode([index], skip_special_tokens=False)
+            for index in range(self.token_embedding.num_embeddings)
+        ]
+        initialized = self.token_embedding.weight.detach().clone()
+        for start in range(0, len(strings), 256):
+            encoded = self.pretrained_tokenizer(
+                strings[start : start + 256],
+                add_special_tokens=False,
+                padding=True,
+                return_tensors="pt",
+            )
+            ids = encoded["input_ids"].to(pretrained_embeddings.device)
+            mask = encoded["attention_mask"].to(
+                device=pretrained_embeddings.device,
+                dtype=pretrained_embeddings.dtype,
+            )
+            counts = mask.sum(dim=1, keepdim=True)
+            means = (
+                pretrained_embeddings[ids] * mask.unsqueeze(-1)
+            ).sum(dim=1) / counts.clamp_min(1.0)
+            usable = counts.squeeze(1).gt(0).cpu()
+            initialized[start : start + len(means)][usable] = means[usable].cpu()
+        with torch.no_grad():
+            self.token_embedding.weight.copy_(initialized)
+
+    def render_prompts(
+        self, tokens: torch.Tensor, padding_mask: Optional[torch.Tensor]
+    ):
+        rows = tokens.detach().cpu().tolist()
+        padding_rows = (
+            padding_mask.detach().cpu().tolist()
+            if padding_mask is not None
+            else [[False] * len(row) for row in rows]
+        )
+        texts = []
+        custom_gap_positions = []
+        for row, row_padding in zip(rows, padding_rows):
+            valid = [token for token, padded in zip(row, row_padding) if not padded]
+            gaps = [index for index, token in enumerate(valid) if token == self.gap_id]
+            if len(gaps) != 1:
+                raise ValueError("pretrained exact-inside encoder requires one gap")
+            gap = gaps[0]
+            if gap == 0 or gap == len(valid) - 1:
+                raise ValueError("gap must have structural boundary tokens")
+            left = self.source_tokenizer.decode(
+                valid[1:gap], skip_special_tokens=False
+            )
+            right = self.source_tokenizer.decode(
+                valid[gap + 1 : -1], skip_special_tokens=False
+            )
+            texts.append(left + self.pretrained_tokenizer.mask_token + right)
+            custom_gap_positions.append(gap)
+        return texts, custom_gap_positions
+
+    def forward(
+        self,
+        tokens: torch.Tensor,
+        padding_mask: Optional[torch.Tensor] = None,
+        steps: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if steps is not None:
+            raise ValueError("prompt encoder does not accept generation steps")
+        texts, _ = self.render_prompts(tokens, padding_mask)
+        encoded = self.pretrained_tokenizer(
+            texts,
+            padding=True,
+            truncation=True,
+            max_length=self.max_length,
+            return_tensors="pt",
+        )
+        model_inputs = {
+            key: value.to(tokens.device) for key, value in encoded.items()
+        }
+        mask_matches = model_inputs["input_ids"].eq(
+            int(self.pretrained_tokenizer.mask_token_id)
+        )
+        counts = mask_matches.sum(dim=1)
+        if not bool(counts.eq(1).all()):
+            raise ValueError("encoded prompts must retain exactly one mask token")
+        mask_positions = mask_matches.to(torch.int64).argmax(dim=1)
+        hidden = self.backbone(**model_inputs).last_hidden_state
+        rows = torch.arange(len(tokens), device=tokens.device)
+        context = self.context_norm(hidden[rows, mask_positions])
+        custom_gaps = tokens.eq(self.gap_id).unsqueeze(-1).to(context.dtype)
+        return context.unsqueeze(1) * custom_gaps
+
+
+class PretrainedIntervalInsideModel(nn.Module):
+    """Exact interval model conditioned by a pretrained masked encoder."""
+
+    def __init__(
+        self,
+        vocab_size: int,
+        gap_id: int,
+        pad_id: int,
+        source_tokenizer,
+        model_name: str = "distilroberta-base",
+        cache_dir: str = ".hf_cache/hub",
+        max_steps: int = 32,
+        max_length: int = 256,
+        dropout: float = 0.1,
+        freeze_backbone: bool = False,
+        gradient_checkpointing: bool = False,
+        local_files_only: bool = False,
+        random_init_backbone: bool = False,
+        backbone=None,
+        pretrained_tokenizer=None,
+        initialize_custom_embeddings: bool = True,
+        tie_token_embeddings: bool = True,
+    ) -> None:
+        super().__init__()
+        self.encoder = PretrainedIntervalEncoder(
+            vocab_size,
+            gap_id,
+            pad_id,
+            source_tokenizer,
+            model_name,
+            cache_dir,
+            max_steps=max_steps,
+            max_length=max_length,
+            freeze_backbone=freeze_backbone,
+            gradient_checkpointing=gradient_checkpointing,
+            local_files_only=local_files_only,
+            random_init_backbone=random_init_backbone,
+            backbone=backbone,
+            pretrained_tokenizer=pretrained_tokenizer,
+            initialize_custom_embeddings=initialize_custom_embeddings,
+        )
+        d_model = self.encoder.hidden_size
+        self.interval_projection = nn.Linear(3 * d_model, d_model)
+        self.interval_norm = nn.LayerNorm(d_model)
+        self.interval_dropout = nn.Dropout(dropout)
+        self.token_head = nn.Linear(d_model, vocab_size)
+        if tie_token_embeddings:
+            self.token_head.weight = self.encoder.token_embedding.weight
+        self.stop_head = nn.Linear(d_model, 1)
+        self.topology_head = nn.Linear(2 * d_model, 4)
+
+    @property
+    def d_model(self) -> int:
+        return self.encoder.hidden_size
+
+    def encode(
+        self,
+        tokens: torch.Tensor,
+        padding_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        return self.encoder(tokens, padding_mask)
+
+    def interval_hidden(
+        self,
+        context_hidden: torch.Tensor,
+        left_boundary: torch.Tensor,
+        right_boundary: torch.Tensor,
+        depths: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if depths is not None:
+            context_hidden = context_hidden + self.encoder.step_embedding(depths)
+        left = self.encoder.token_embedding(left_boundary)
+        right = self.encoder.token_embedding(right_boundary)
+        hidden = self.interval_projection(
+            torch.cat((context_hidden, left, right), dim=-1)
+        )
+        return self.interval_dropout(
+            self.interval_norm(torch.nn.functional.gelu(hidden))
+        )
+
+    def interval_logits(
+        self,
+        context_hidden: torch.Tensor,
+        left_boundary: torch.Tensor,
+        right_boundary: torch.Tensor,
+        depths: Optional[torch.Tensor] = None,
+    ):
+        hidden = self.interval_hidden(
+            context_hidden, left_boundary, right_boundary, depths
+        )
+        return self.token_head(hidden), self.stop_head(hidden).squeeze(-1), hidden
+
+    def topology_logits(
+        self, interval_hidden: torch.Tensor, chosen_tokens: torch.Tensor
+    ) -> torch.Tensor:
+        token = self.encoder.token_embedding(chosen_tokens)
+        return self.topology_head(torch.cat((interval_hidden, token), dim=-1))
+
+
 class GapTreeSharedRegimeBoundaryModel(nn.Module):
     """Joint topology conditioned on one root-sampled shared branching regime."""
 

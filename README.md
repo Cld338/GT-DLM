@@ -299,6 +299,21 @@ randomly initialized 82.1M-parameter architecture remains null
 length draw makes the resulting prompt unidentifiable by construction. The
 supported result is pretrained context-length recovery, not match-and-copy
 induction. See `research/PRETRAINED_IDENTIFIABILITY.md`.
+
+That encoder has now been carried into the selected objective itself. Replacing
+the from-scratch prompt encoder with a `distilroberta-base` backbone, leaving
+the exact depth-inside recurrence untouched, lowers test exact NLL to
+`21.658+/-0.051` across three training seeds, against `25.367` for the identical
+architecture trained from random backbone weights on the same budget. The paired
+gain over that capacity-matched control is `-3.709+/-0.051` nats with every
+interval excluding zero, and oracle-structure token accuracy rises to `5.7%`,
+passing the oracle-length masked baseline's `3.7%` for the first time. Two
+findings limit it: length calibration does not improve at all (raw TV
+`0.122+/-0.002` against the control's `0.121`, so the `TV < 0.20` gate is
+saturated rather than passed more convincingly), and the Wikipedia-derived pilot
+corpus overlaps the backbone's pretraining lineage, so held-out here does not
+mean unseen by the backbone. Free samples remain unusable. See
+`research/PRETRAINED_CONTEXT_DEPTH.md`.
 Natural-text preparation expects UTF-8 input with one document per line. It
 performs a seeded document-level split, trains byte-level BPE on the training
 documents only, and writes `tokenizer.json`, `corpus.pt`, and `manifest.json`.

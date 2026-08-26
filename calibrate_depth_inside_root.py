@@ -11,7 +11,7 @@ from calibrate_tree_root_stop import solve_logit_bias
 from evaluate_text_sampling import distribution_metrics
 from experiment import choose_device, seed_everything
 from experiment_text_inside import collate_prompt_contexts, sample_inside_lengths
-from gtdlm.model import IntervalInsideBoundaryModel
+from gtdlm.model import IntervalInsideBoundaryModel, PretrainedIntervalInsideModel
 from gtdlm.text_data import random_length_windows, sample_text_infilling_examples
 from gtdlm.text_tokenizer import vocabulary_from_tokenizer
 
@@ -54,11 +54,26 @@ def main() -> None:
         os.path.join(str(config["data_dir"]), "corpus.pt"),
         map_location="cpu", weights_only=True,
     )
-    model = IntervalInsideBoundaryModel(
-        vocab_size=vocab.vocab_size, gap_id=vocab.GAP, pad_id=vocab.PAD,
-        d_model=int(config["d_model"]), nhead=int(config["heads"]),
-        layers=int(config["layers"]), max_positions=256, max_steps=32,
-    ).to(device)
+    if config.get("tree_objective") == "pretrained_context_depth_exact_inside":
+        model = PretrainedIntervalInsideModel(
+            vocab.vocab_size,
+            vocab.GAP,
+            vocab.PAD,
+            tokenizer,
+            model_name=str(config["model_name"]),
+            cache_dir=str(config["cache_dir"]),
+            max_length=int(config["max_length"]),
+            local_files_only=bool(config.get("local_files_only", False)),
+            random_init_backbone=bool(
+                config.get("random_init_backbone", False)
+            ),
+        ).to(device)
+    else:
+        model = IntervalInsideBoundaryModel(
+            vocab_size=vocab.vocab_size, gap_id=vocab.GAP, pad_id=vocab.PAD,
+            d_model=int(config["d_model"]), nhead=int(config["heads"]),
+            layers=int(config["layers"]), max_positions=256, max_steps=32,
+        ).to(device)
     model.load_state_dict(torch.load(
         os.path.join(args.artifact_dir, "inside.pt"),
         map_location=device, weights_only=True,
