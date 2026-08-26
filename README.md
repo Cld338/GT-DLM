@@ -83,6 +83,8 @@ python analyze_shared_regime.py --device cuda --artifact-dir artifacts/text_shar
 python measure_span_identifiability.py --device cuda --epochs 20 --policies uniform,copy,anchored_copy,position_marker
 python prepare_wikitext_pilot.py --output-dir artifacts/wikitext_large --vocab-size 4000 --max-document-tokens 128 --max-train-documents 0 --max-validation-documents 0 --max-test-documents 0
 python measure_span_identifiability.py --device cuda --data-dir artifacts/wikitext_large --epochs 20 --validation-passes 4 --d-model 256 --layers 6 --heads 8 --policies position_marker,local_marker,anchored_copy --output-dir artifacts/span_identifiability_large
+python measure_pretrained_span_identifiability.py --device cuda --epochs 5 --validation-passes 8 --test-passes 8 --policies anchored_copy,uniform --output-dir artifacts/span_identifiability_pretrained
+python measure_pretrained_span_identifiability.py --device cuda --epochs 5 --validation-passes 8 --test-passes 8 --policies anchored_copy,uniform --random-init-backbone --output-dir artifacts/span_identifiability_random_architecture_control
 ```
 
 The experiment writes its metrics and checkpoints to `artifacts/`.
@@ -288,9 +290,15 @@ That is memorisation, not an acquired match-and-copy rule. A six-times-larger
 corpus removes the memorisation—the training-minus-validation gap collapses
 from `0.229` to `0.041`—without moving validation at all, while a pure
 memorisation control on the same corpora does improve with the extra data.
-Corpus size is therefore not the bottleneck in this range, leaving pretraining
-as the live hypothesis, and the corruption redesign is necessary but not
-sufficient. See `research/SPAN_IDENTIFIABILITY.md`.
+Corpus size is therefore not the bottleneck in this range. Fine-tuned
+DistilRoBERTa subsequently recovers `anchored_copy` length information on held-
+out text in 3/3 seeds (`+0.089+/-0.011` identifiable nats), while the same
+randomly initialized 82.1M-parameter architecture remains null
+(`-0.015+/-0.007`). However, pretrained `uniform` is even stronger at
+`+0.235+/-0.016`, correcting the earlier claim that a document-independent
+length draw makes the resulting prompt unidentifiable by construction. The
+supported result is pretrained context-length recovery, not match-and-copy
+induction. See `research/PRETRAINED_IDENTIFIABILITY.md`.
 Natural-text preparation expects UTF-8 input with one document per line. It
 performs a seeded document-level split, trains byte-level BPE on the training
 documents only, and writes `tokenizer.json`, `corpus.pt`, and `manifest.json`.

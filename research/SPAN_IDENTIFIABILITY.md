@@ -1,5 +1,21 @@
 # Span-policy length identifiability
 
+## Pretrained update
+
+The primary remaining hypothesis has now been tested. Fine-tuned
+`distilroberta-base` recovers held-out length information on `anchored_copy` in
+3/3 seeds (`+0.089+/-0.011` identifiable nats), while the same 82.1M-parameter
+architecture with random weights remains null (`-0.015+/-0.007`). The paired
+pretraining gain is `+0.104+/-0.012`.
+
+The interpretation is narrower than match-and-copy induction: the pretrained
+model also scores `+0.235+/-0.016` on `uniform`. A label drawn independently of
+the intact document is not independent of the corrupted prompt produced from
+that label. The old claim that `uniform` is unidentifiable *by construction* is
+therefore withdrawn; its from-scratch null exposed insufficient probe capacity.
+See `research/PRETRAINED_IDENTIFIABILITY.md` for the held-out protocol, matched
+random-initialization control, and corrected next steps.
+
 ## Objective
 
 Roadmap item 1. The windowed screen established that the original corruption
@@ -162,9 +178,9 @@ and length 8 is 0.1%, so control 4 below becomes more pressing, not less.
 1. **Completed:** re-run the probe on a six-times-larger corpus holding the
    policy fixed. Memorisation disappears, generalisation does not appear, so
    data quantity is not the bottleneck in this range.
-2. re-run it with a pretrained backbone, which is roadmap item 3, since
-   match-and-copy is exactly the behaviour pretraining is expected to supply.
-   This is now the primary remaining hypothesis;
+2. **Completed:** re-run with a pretrained backbone and a parameter-matched
+   random-init control. Pretraining produces held-out length information in
+   3/3 seeds, but the stronger `uniform` result prevents a copy-specific claim;
 3. evaluate `anchored_copy` with the GT-DLM depth-inside model itself rather
    than the length head, because the recursive stopping policy may exploit the
    anchor differently from a single categorical head;
@@ -177,4 +193,6 @@ Artifacts: `artifacts/span_identifiability/`,
 `artifacts/span_identifiability_large/` (with corpus `artifacts/wikitext_large/`),
 `artifacts/span_identifiability_positive_control/`,
 `artifacts/span_identifiability_positive_control_position/`,
-`artifacts/span_identifiability_scaled/`.
+`artifacts/span_identifiability_scaled/`,
+`artifacts/span_identifiability_pretrained*`, and
+`artifacts/span_identifiability_random_architecture_control*`.

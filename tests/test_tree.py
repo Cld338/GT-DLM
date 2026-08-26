@@ -46,6 +46,11 @@ from experiment_text_depth_inside_lowrank_latent import (
 from experiment_text_inside import batch_log_likelihoods
 from experiment_text_inside import late_depth_topology_logits
 from measure_span_identifiability import marginal_length_entropy
+from measure_pretrained_span_identifiability import (
+    identifiable_statistics,
+    render_masked_text,
+    unique_token_positions,
+)
 from gtdlm.text_data import (
     anchored_repeat_pairs,
     spans_remain_recoverable,
@@ -1071,6 +1076,35 @@ class SpanPolicyTests(unittest.TestCase):
         example = TextInfillingExample(((1,), (2,), (3,)), ((4,), (5, 6)))
         self.assertAlmostEqual(
             marginal_length_entropy([example]), math.log(2), places=6
+        )
+
+    def test_pretrained_prompt_has_one_mask_and_omits_target(self):
+        class StubTokenizer:
+            def decode(self, token_ids, skip_special_tokens=False):
+                del skip_special_tokens
+                return "".join(chr(token_id) for token_id in token_ids)
+
+        example = TextInfillingExample(((65, 66), (68,)), ((67,),))
+        self.assertEqual(
+            render_masked_text(example, StubTokenizer(), "<mask>"),
+            "AB<mask>D",
+        )
+
+    def test_unique_mask_positions_rejects_missing_or_duplicate_masks(self):
+        input_ids = torch.tensor([[1, 9, 2], [9, 3, 4]])
+        self.assertTrue(torch.equal(unique_token_positions(input_ids, 9), torch.tensor([1, 0])))
+        with self.assertRaises(ValueError):
+            unique_token_positions(torch.tensor([[1, 2], [9, 9]]), 9)
+
+    def test_identifiable_bootstrap_is_zero_for_the_empirical_prior(self):
+        evaluation = {
+            "targets": [1, 2, 1, 2],
+            "example_nlls": [math.log(2)] * 4,
+        }
+        result = identifiable_statistics(evaluation, 2, seed=3, bootstrap_samples=100)
+        self.assertAlmostEqual(result["identifiable_nats"], 0.0, places=6)
+        self.assertEqual(
+            result["identifiable_nats_document_bootstrap_95_ci"], [0.0, 0.0]
         )
 
 

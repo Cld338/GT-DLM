@@ -84,35 +84,30 @@ finite marginalization itself remains verified and reusable.
 
 ## Open items
 
-### 1. Task identifiability (addressed; now coupled to item 3)
+### 1. Task identifiability (probe-level blocker resolved)
 
 Source: `research/JOINT_LEXICAL_OBJECTIVE.md` item 6; diagnosed in
 `research/WINDOWED_SCREENING.md`. Worked in `research/SPAN_IDENTIFIABILITY.md`.
 
-The original corruption samples gap length independently of the prompt, so
-exact recovery is unidentifiable by construction and the `0%` accuracy on
-9--16 token extrapolation is a property of the task. Context-constrained span
-policies now exist, along with a probe that measures how much of a corruption's
-length is recoverable, validated against positive controls.
+The original corruption draws gap length without inspecting the intact
+document, but the resulting corrupted prompt is not independent of that draw.
+Observed length, gap position, legal placement range, token boundaries, and
+language context can retain information. The earlier claim that `uniform` was
+unidentifiable by construction has been withdrawn.
 
-The outcome revised this item's premise. `anchored_copy` is identifiable by
-construction and verified so, yet no model tested extracts it. At pilot scale
-its training NLL fell well below the marginal entropy while validation did not
-move, which is memorisation rather than an acquired match-and-copy rule.
+The from-scratch model did not extract `anchored_copy`: at pilot scale it
+memorised training examples, and six times the data removed that memorisation
+without moving validation. The remaining pretrained-backbone hypothesis has
+now passed. Fine-tuned DistilRoBERTa obtains `+0.089+/-0.011` held-out
+identifiable nats across three seeds, versus `-0.015+/-0.007` for the same
+randomly initialized architecture. The paired gain is `+0.104+/-0.012`.
 
-A six-times-larger corpus then settled the obvious follow-up question: the
-memorisation disappears, the training-minus-validation gap collapses from
-`0.229` to `0.041`, and validation NLL still does not move. A pure memorisation
-control on the same corpora does respond to the extra data, so the copy rule's
-flat response is specific to it. Data quantity is therefore not the bottleneck
-in this range, which leaves architecture and pretraining as the live
-hypothesis.
-
-Changing the corruption consequently makes the length-extrapolation slice
-measurable *in principle* without making it informative in practice. This item
-is **necessary but not sufficient**, no longer gates the others on its own, and
-should advance together with item 3. Remaining controls are listed in
-`research/SPAN_IDENTIFIABILITY.md`.
+This is not yet evidence for match-and-copy induction. Pretrained `uniform`
+scores an even larger `+0.235+/-0.016`, so generic prompt cues are sufficient
+for recoverable length. The categorical probe-level blocker is resolved, while
+a clean long-span slice still requires a flattened length distribution and a
+matched intervention isolating the surviving twin. See
+`research/PRETRAINED_IDENTIFIABILITY.md`.
 
 ### 2. Claim-grade controls
 
@@ -128,7 +123,9 @@ should advance together with item 3. Remaining controls are listed in
 Source: named independently by `research/LEXICAL_EVALUATION.md` and
 `research/JOINT_LEXICAL_OBJECTIVE.md` item 5.
 
-Replace the small from-scratch encoder with a genuinely pretrained backbone.
+The categorical identifiability probe has now established that a genuinely
+pretrained backbone supplies recoverable length information. The remaining
+model task is to integrate it with the selected depth-inside objective.
 Evaluation must keep reporting both proper sequence NLL and oracle-structure
 token scores, so that a structural likelihood gain cannot be misreported as
 semantic fluency.
@@ -151,7 +148,7 @@ compute. The oracle-length gap must be reported either way.
 
 | Condition | State |
 |---|---|
-| Length-extrapolation slice | Now measurable in principle, but uninformative at pilot data scale (item 1) |
+| Length-extrapolation slice | Pretrained probe is positive; long lengths and copy-specific attribution remain uncontrolled |
 | Gap-composition slice | Synthetic passes; text has likelihood evidence only |
 | Compute-matched AR competitiveness | Not attempted |
 
@@ -159,16 +156,17 @@ The `research/PROPOSAL.md` hold on scaling to 50--100M therefore stands.
 
 ## Recommended order
 
-1. Pretrained backbone (item 3), then re-run the identifiability probe on
-   `anchored_copy`. Corpus size has been tested and ruled out, so pretraining
-   is the remaining way to test whether match-and-copy can be induced.
-2. From-scratch matched two-gap training (open item 2, row 1).
-3. Complete the baseline table and the FLOP-matched comparison.
-4. Re-evaluate the scale-up gate.
+1. Integrate the pretrained context encoder with depth-conditioned exact inside
+   and evaluate exact NLL, oracle-structure tokens, and length calibration.
+2. Flatten `anchored_copy` lengths and add a matched twin intervention.
+3. Run from-scratch matched two-gap training (open item 2, row 1).
+4. Complete the baseline table and the FLOP-matched comparison.
+5. Re-evaluate the scale-up gate.
 
 ## Currently claimable
 
 The synthetic strict multi-gap length-generalization result, and, on natural
 text, exact latent-tree marginalization with passing length calibration. A
-natural-text generation-quality advantage is **not** claimable, and the
-existing documents do not claim it.
+pretrained categorical probe also recovers missing-span length on held-out
+text, but this is not yet a GT-DLM generation or copy-rule result. A
+natural-text generation-quality advantage is **not** claimable.
