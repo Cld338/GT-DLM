@@ -1,0 +1,9 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+artifacts_smoke*/
+.hf_cache/
+.codex/
+.agents/
+artifacts/
+*.pt

@@ -1,0 +1,372 @@
+# Gap-Tree Diffusion Language Model (GT-DLM)
+
+This repository contains a minimal research prototype for variable-length text
+infilling without a preallocated token canvas.
+
+The central state is a **gap**, meaning an unknown sequence. The root gap may be
+empty; every child gap explicitly created by a topology bit is known to be
+non-empty:
+
+```text
+ROOT -> epsilon | NODE
+NODE -> NODE^left token NODE^right
+```
+
+The optional left/right children are predicted jointly. This root/child typing
+is essential: allowing both an omitted child and a created child that immediately
+stops gives the same sequence duplicate derivations.
+
+All currently open gaps are expanded in parallel. With a balanced latent tree,
+an `n`-token span therefore needs logarithmically many model evaluations rather
+than one evaluation per inserted token.
+
+## Quick start
+
+```powershell
+python -m unittest discover -s tests -v
+python experiment.py --epochs 80 --device auto
+python ablate_stop.py --artifact-dir artifacts
+python ablate_children.py --artifact-dir artifacts
+python replicate_children.py --artifact-dir artifacts
+python ablate_boundaries.py --artifact-dir artifacts
+python ablate_tree_proposals.py --artifact-dir artifacts --seeds 17
+python experiment_multi_gap.py --artifact-dir artifacts
+python replicate_multi_gap.py --artifact-dir artifacts
+python experiment_strict_controls.py --artifact-dir artifacts --seeds 17
+python experiment_strict_controls.py --artifact-dir artifacts --seeds 23,41
+python ablate_strict_tree_mix.py --artifact-dir artifacts --evaluation validation
+python ablate_strict_tree_mix.py --artifact-dir artifacts --evaluation test --probabilities 1
+python prepare_text_pilot.py --input path/to/documents.txt --output-dir artifacts/text_pilot
+python prepare_wikitext_pilot.py --output-dir artifacts/wikitext_pilot
+python experiment_text_pilot.py --device cuda --artifact-dir artifacts/text_screen
+python experiment_text_factorized.py --device cuda
+python sweep_text_stop_threshold.py --device cuda
+python experiment_text_dynamic.py --device cuda
+python evaluate_text_deconfounded.py --device cuda
+python experiment_text_dynamic.py --device cuda --epochs 30 --random-window-min 24 --random-window-max 96 --artifact-dir artifacts/text_windowed
+python evaluate_text_sampling.py --device cuda --artifact-dir artifacts/text_windowed
+python experiment_text_trajectory.py --device cuda --artifact-dir artifacts/text_trajectory
+python experiment_text_joint_topology.py --device cuda --artifact-dir artifacts/text_joint_topology
+python experiment_text_joint_topology.py --device cuda --topology depth1_coupled_joint --artifact-dir artifacts/text_frontier_coupled
+python experiment_text_joint_topology.py --device cuda --topology refined_joint --artifact-dir artifacts/text_topology_refined
+python experiment_text_joint_topology.py --device cuda --topology block_conditional_joint --artifact-dir artifacts/text_topology_block_conditional
+python experiment_text_joint_topology.py --device cuda --topology symmetric_block_conditional_joint --artifact-dir artifacts/text_topology_symmetric_block
+python experiment_text_joint_topology.py --device cuda --topology three_stage_conditional_joint --artifact-dir artifacts/text_topology_three_stage
+python replicate_tree_sampling.py --device cuda --base-artifact-dir artifacts/text_joint_topology --candidate-artifact-dir artifacts/text_frontier_coupled
+python replicate_tree_sampling.py --device cuda --base-artifact-dir artifacts/text_joint_topology --candidate-artifact-dir artifacts/text_topology_block_conditional --output-dir artifacts/text_topology_block_conditional/replication_vs_pernode
+python benchmark_tree_sampling.py --device cuda
+python calibrate_tree_root_stop.py --device cuda --artifact-dir artifacts/text_topology_block_conditional
+python calibrate_tree_topology.py --device cuda --artifact-dir artifacts/text_topology_block_conditional
+python analyze_multistage_exposure.py --device cuda --output-dir artifacts/text_topology_three_stage
+python experiment_inside_objective.py --max-length 8 --output-dir artifacts/inside_objective
+python experiment_text_inside.py --device cuda --epochs 5 --artifact-dir artifacts/text_inside_root_gate_screen
+python calibrate_inside_topology.py --device cuda --artifact-dir artifacts/text_inside_root_gate_screen
+python experiment_text_depth_inside.py --device cuda --epochs 5 --batch-size 16 --late-depth-child-penalty 0 --artifact-dir artifacts/text_depth_inside_screen
+python calibrate_depth_inside_root.py --device cuda --artifact-dir artifacts/text_depth_inside_screen
+python replicate_depth_inside_sampling.py --device cuda --artifact-dir artifacts/text_depth_inside_screen
+python evaluate_inside_lexical.py --device cuda --output-dir artifacts/text_inside_lexical
+python evaluate_lexical_baselines.py --device cuda --output-dir artifacts/text_inside_lexical
+python evaluate_text_sequence_likelihoods.py --device cuda --output-dir artifacts/text_inside_lexical
+python pretrain_depth_lexical.py --device cuda --epochs 5 --artifact-dir artifacts/text_depth_lexical_pretrain
+python experiment_text_depth_inside.py --device cuda --epochs 5 --batch-size 16 --late-depth-child-penalty 0 --lexical-weight 1 --checkpoint artifacts/text_depth_lexical_pretrain/inside.pt --artifact-dir artifacts/text_depth_inside_joint
+python calibrate_depth_inside_root.py --device cuda --artifact-dir artifacts/text_depth_inside_joint
+python experiment_text_depth_inside_multigap.py --device cuda --epochs 1 --checkpoint artifacts/text_depth_inside_joint/inside.pt --artifact-dir artifacts/text_depth_inside_multigap_screen
+python compare_multigap_checkpoints.py --device cuda
+python adapt_multigap_proper_mle.py --device cuda --epochs 1 --batch-size 8 --lr 0.0001
+python experiment_text_depth_inside_shared_latent.py --device cuda --regimes 2 --epochs 2 --artifact-dir artifacts/text_depth_inside_shared_latent_frozen
+python compare_shared_latent_variants.py --device cuda
+python experiment_text_depth_inside_lowrank_latent.py --device cuda --regimes 2 --rank 4 --epochs 2 --lr 3e-4 --artifact-dir artifacts/text_depth_inside_lowrank_grid/r2_rank4_lr3e-4
+python experiment_text_depth_inside_lowrank_latent.py --device cuda --regimes 1 --rank 8 --epochs 2 --lr 3e-4 --artifact-dir artifacts/text_depth_inside_lowrank_grid/r1_rank8_lr3e-4
+python analyze_topology_exposure.py --device cuda --artifact-dir artifacts/text_joint_topology
+python experiment_text_shared_regime.py --device cuda --artifact-dir artifacts/text_shared_regime
+python analyze_shared_regime.py --device cuda --artifact-dir artifacts/text_shared_regime
+python measure_span_identifiability.py --device cuda --epochs 20 --policies uniform,copy,anchored_copy,position_marker
+python prepare_wikitext_pilot.py --output-dir artifacts/wikitext_large --vocab-size 4000 --max-document-tokens 128 --max-train-documents 0 --max-validation-documents 0 --max-test-documents 0
+python measure_span_identifiability.py --device cuda --data-dir artifacts/wikitext_large --epochs 20 --validation-passes 4 --d-model 256 --layers 6 --heads 8 --policies position_marker,local_marker,anchored_copy --output-dir artifacts/span_identifiability_large
+```
+
+The experiment writes its metrics and checkpoints to `artifacts/`.
+
+Current natural-text topology result: a scalable two-block conditional frontier
+factorization reduces replicated length-distribution TV from `0.172+/-0.010`
+to `0.133+/-0.003` in 3/3 sampling seeds. It is statistically tied with the
+non-scalable 16-way depth-1 tuple head (`0.133+/-0.016`) while keeping four
+classes per gap. A simultaneous refinement model trained with marginal
+site-wise loss failed, showing that the conditional likelihood—not merely
+cross-gap attention—is essential. See `research/BLOCK_CONDITIONAL_TOPOLOGY.md`.
+Randomizing and mixing both block orders was subsequently rejected under a
+128-sample-per-prompt evaluation (TV `0.131` versus fixed-order `0.126`); see
+`research/SYMMETRIC_BLOCK_ORDER.md`.
+A single root STOP bias fitted only on validation then improves fixed-order TV
+to `0.112` and corrects `P(empty)` from `0.248` to `0.209`, but leaves overflow
+unchanged; see `research/ROOT_STOP_CALIBRATION.md`.
+Validation-only topology temperature/vector scaling improves selected proper
+scores but worsens TV from `0.112` to `0.117`, ruling out simple four-class
+miscalibration as the main residual bottleneck. See
+`research/TOPOLOGY_CALIBRATION.md`.
+A three-stage chain-rule factorization was also rejected: replicated TV worsens
+from `0.141+/-0.011` to `0.197+/-0.012`, root calibration reaches only `0.176`,
+and a sampled-prefix audit shows severe conditional exposure. See
+`research/THREE_STAGE_FACTORIZATION.md`.
+An exact differentiable interval inside algorithm now sums every ordered pivot
+tree in `O(n^3)` and matches brute-force enumeration through length 8. It
+formalizes the gap between the current midpoint joint surrogate and a coherent
+latent-tree marginal, while also showing why full-canvas cross-gap coupling
+breaks tractability. See `research/TREE_INSIDE_OBJECTIVE.md`.
+The corresponding 10.37M interval-local text model improved test sequence NLL
+from the midpoint joint term `32.741` to the exact marginal `24.873`, but failed
+the preregistered length-calibration gate: TV was `0.257` and overflow `0.100`.
+Validation-only root/topology calibration reached TV `0.234` while leaving
+overflow `0.106`. Exact marginalization is therefore working, but the induced
+recursive length law remains defective; the 30-epoch scale-up is paused. See
+`research/EXACT_INSIDE_PILOT.md`.
+Adding root-relative tree depth to the exact chart resolves most of that defect
+without adding parameters or a fixed tail penalty. The five-epoch depth model
+improves test exact NLL to `24.495`, raw TV to `0.150`, and overflow to `0.057`.
+After one validation-only root bias, three sampling seeds give TV
+`0.123+/-0.004` and overflow `0.061+/-0.001`. This passes the preregistered
+`TV < 0.20` gate while retaining an exact `O(D n^3)` sequence marginal. See
+`research/DEPTH_INSIDE.md`.
+Independent training replication also passes in 3/3 seeds: test exact NLL is
+`24.470+/-0.174`, raw TV `0.144+/-0.005`, and root-calibrated TV
+`0.125+/-0.013`. Root bias itself varies substantially (`-0.191+/-0.159`), so
+the uncalibrated result is the stronger architecture-level evidence. Equal-length
+chart batching exactly preserves results and cuts the one-epoch end-to-end
+benchmark from about 213 to 145 seconds. See
+`artifacts/text_depth_inside_training_replication/TRAINING_REPLICATION.md`.
+Proper held-out sequence likelihood supplies a positive lexical-distribution
+result: all three depth seeds beat the 30-epoch sequential filler by
+`0.924--1.269` nats and length-masked baseline by `0.648--0.993` nats, with
+paired-bootstrap 95% intervals entirely below zero. However, oracle-length
+greedy token accuracy remains only `2.1--2.3%` for depth versus `3.7%` for the
+masked baseline, and qualitative temperature-1 samples are weak. The supported
+claim is improved joint span probability, driven substantially by structure—not
+strong lexical generation. See `research/LEXICAL_EVALUATION.md`.
+
+Aligned midpoint-tree lexical pretraining followed by a validation-only grid
+fixes the auxiliary weight at `lambda=1` under a `+0.1`-nat exact-NLL
+constraint. In matched joint-versus-`lambda=0` runs at seeds 17, 23, and 41,
+the auxiliary improves aligned lexical NLL and root-calibrated length TV in
+3/3 seeds. Mean joint-minus-control changes are `-0.065` lexical NLL and
+`-0.012` calibrated TV. Exact NLL changes by only `+0.024` on average, but the
+effect is seed-dependent: seed 17 has a significant `+0.088` cost, whereas
+seeds 23 and 41 have small nonsignificant improvements. Free-sample quality
+remains weak, so the supported result is better aligned token probabilities
+and calibration—not fluent generation. See
+`research/JOINT_LEXICAL_OBJECTIVE.md`.
+
+A coherent factorized multi-gap extension now shares one prompt encoding while
+running an exact depth-inside chart for each gap. It matches the one-gap
+likelihood to `1e-6` and supports empty or adjacent roots. One two-gap exact
+epoch improves joint NLL from `44.444` to `44.125`; the paired difference is
+`-0.318` nat with 95% CI `[-0.632,-0.004]`. Proper all-gap sequential and
+length-masked evaluators are also implemented. Their diagnostic NLLs are worse,
+but their checkpoints did not receive matched two-gap training, so no
+superiority claim is made. See `research/MULTIGAP_EXACT_INSIDE.md`.
+
+An equal-332-update two-gap adaptation attempt was also rejected: validation
+NLL worsens by `+1.237` for sequential and `+0.885` for masked, whereas exact
+improves slightly. This exposes an objective mismatch—proper exact sequence MLE
+versus sampled trajectory or denoising surrogates—rather than establishing an
+update-matched win. The next baseline control must train directly against the
+same proper sequence likelihood used by evaluation.
+
+That direct proper-MLE control is now implemented. Validation selects one
+`1e-4` adaptation epoch for sequential but retains the zero-update masked
+checkpoint. On test, factorized exact reaches joint NLL `44.125` versus
+`46.568` sequential and `46.378` masked, with paired intervals below zero.
+Because the starting checkpoints still have different total training histories,
+this is a validation-selected adaptation result—not a from-scratch
+compute-matched superiority claim.
+
+An exact finite shared-latent extension now places a two-way prompt-conditioned
+mixture outside all per-gap inside charts. With the base frozen, it improves
+test NLL from `44.125` to `44.074` (`-0.051`, paired 95% CI
+`[-0.083,-0.020]`). The gate, however, assigns 98.5% mass to one component and
+the posterior has only 1.067 effective regimes. A one-offset control reaches
+`44.078`; the two-regime advantage is only `-0.0035` with CI
+`[-0.0073,+0.0002]`. The additive-offset mixture is therefore rejected as a
+cross-gap dependence model, while exact marginalization is retained for a
+component-specific low-rank head-adapter follow-up.
+
+That low-rank follow-up has now also failed its preregistered gate. Against a
+parameter-matched one-component control (42,601 versus 42,922 trainable
+weights), screened symmetrically over two epochs and two learning rates, the
+two-regime mixture reaches validation NLL `49.925` while the control reaches
+`49.913`—the mixture loses by `+0.0115` nat, and the control wins at both
+learning rates. An earlier one-epoch screen favoring the mixture was an
+optimization artifact: the control had not started improving, so validation
+selected its untrained zero-initialized adapter. Posterior collapse is
+nonetheless solved (effective regimes `1.045` to `1.429`) without any likelihood
+benefit, and the highest regime usage in the grid (`1.652`) coincides with the
+worst two-regime likelihood. The best validation NLL anywhere in the latent
+study belongs to the single-component low-rank adapter, so the measurable gains
+are adapter capacity rather than shared latents. Two independently designed
+finite shared-latent parameterizations have now failed, closing that direction;
+a future cross-gap claim needs a different mechanism plus a diagnostic showing
+the residual dependence is large enough to model. See
+`research/MULTIGAP_EXACT_INSIDE.md`.
+
+Current replicated result: predicting left/right child-gap existence directly
+improves held-out exact accuracy from `0.200±0.043` to `0.267±0.041` and reduces
+mean Transformer evaluations from `3.65` to `2.83`, but does not materially
+improve length accuracy. Adding explicit left/right boundary features then raises
+exact accuracy to `0.307±0.081` and edit similarity from `0.575` to `0.626` with
+only 192 extra parameters. See `artifacts/CHILD_REPLICATION.md` and
+`artifacts/BOUNDARY_ABLATION.md`.
+
+With token-conditioned child decisions, a 50/50 midpoint/uniform mixed tree
+proposal further improves exact accuracy from `0.307±0.100` to `0.400±0.028`
+and length accuracy from `0.347` to `0.473`, while mean evaluations change only
+from `2.93` to `3.02`. See `artifacts/TREE_PROPOSAL.md`.
+
+On compositional two-gap infilling, the trained GT-DLM reaches
+`0.905±0.043` joint exact accuracy versus `0.657±0.081` for learned per-gap
+length plus masks. Since 98.4% of test prompts recombine locally seen intervals
+and the models use different NFE, this is evidence for local recombination—not
+yet unseen-span or compute-matched superiority. See
+`artifacts/MULTI_GAP_REPLICATION.md`.
+
+The strict follow-up removes every training example containing a designated
+side-aware local interval, so every test prompt has at least one genuinely
+unseen local gap. At matched inference budgets, GT-DLM reaches
+`0.607±0.061` joint exact accuracy (3.01 NFE), versus `0.003±0.003` for learned
+per-gap length plus iterative masks (2.93 NFE). Oracle lengths raise the masked
+model to `0.973±0.030` at 2.83 NFE. The supported conclusion is therefore
+specific: recursive local stopping generalizes unseen interval lengths much
+better than one-shot length classification on this task; masked token denoising
+itself remains stronger once length is supplied. See
+`artifacts/STRICT_CONTROLS.md`.
+
+A leakage-safe validation sweep then selected midpoint-only tree supervision.
+Retraining on the full strict training split raised GT-DLM joint exact accuracy
+from `0.607±0.061` at midpoint probability 0.5 to `0.792±0.033` at probability
+1.0, while reducing NFE from 3.01 to 2.95. All three paired seeds improved.
+This reverses the earlier single-gap result: tree-order augmentation is
+task-dependent and becomes harmful in the strict multi-gap setting. See
+`artifacts/STRICT_TREE_MIX_VALIDATION.md` and
+`artifacts/STRICT_TREE_MIX_TEST.md`.
+
+## Experiment
+
+The initial experiment uses a deterministic range-infilling task. Given two
+boundary tokens such as
+
+```text
+<LEFT> 3 [GAP] 7 <RIGHT>
+```
+
+the target is
+
+```text
+<LEFT> 3 3 4 5 6 7 <RIGHT>
+```
+
+This deliberately small task measures the mechanism rather than natural-language
+knowledge:
+
+- Can local gap-closing decisions recover an unknown global length?
+- Does parallel tree expansion have the expected logarithmic number of rounds?
+- How does it compare with a model that predicts the length globally and then
+  fills an oracle-sized mask canvas?
+
+See [research/PROPOSAL.md](research/PROPOSAL.md) for the formalization, hypotheses,
+and limitations. The preregistered next-stage design is in
+[research/NATURAL_LANGUAGE_PILOT.md](research/NATURAL_LANGUAGE_PILOT.md).
+[research/ROADMAP.md](research/ROADMAP.md) consolidates what is established,
+which directions are closed, and which controls remain open, with the scale-up
+gate status.
+
+Context-constrained span policies now exist alongside the original
+prompt-independent corruption, together with a probe that measures how much of
+a corruption's gap length is recoverable. Validated against positive controls,
+the probe recovers the full entropy of a position-determined length
+(`+2.073` nats) but reports zero for `anchored_copy`, whose spans are
+recoverable by construction: at the scaled probe size training NLL falls to
+`0.870` against a `1.092` marginal entropy while validation stays at `1.099`.
+That is memorisation, not an acquired match-and-copy rule. A six-times-larger
+corpus removes the memorisation—the training-minus-validation gap collapses
+from `0.229` to `0.041`—without moving validation at all, while a pure
+memorisation control on the same corpora does improve with the extra data.
+Corpus size is therefore not the bottleneck in this range, leaving pretraining
+as the live hypothesis, and the corruption redesign is necessary but not
+sufficient. See `research/SPAN_IDENTIFIABILITY.md`.
+Natural-text preparation expects UTF-8 input with one document per line. It
+performs a seeded document-level split, trains byte-level BPE on the training
+documents only, and writes `tokenizer.json`, `corpus.pt`, and `manifest.json`.
+
+The first matched 10M-parameter WikiText-2 screening trains on one gap of length
+0--8. On IID text, unified GT-DLM improves exact length from 16.1% to 33.7%
+over learned length plus masks and processes fewer token positions. Both models,
+however, fail zero-shot two-gap joint length (about 3--4%) and 9--16 token length
+extrapolation (0%). Oracle-length token edit similarity is only 0.33, indicating
+substantial lexical underfitting and target ambiguity.
+
+Separating the STOP hazard from token identity improves IID length MAE from 2.07
+to 1.88 after validation-only threshold selection, but lowers edit similarity
+from 0.211 to 0.186 and does not fix composition or length OOD. The pilot has not
+passed the scale-up criterion. See `artifacts/text_screen/RESULTS.md`,
+`artifacts/text_screen/ANALYSIS.md`, and
+`artifacts/text_factorized/STOP_THRESHOLD.md`.
+
+Dynamic corruption and a matched sequential blank filler exposed a positional
+shortcut. Sequential filling appeared to reach 47.5% length accuracy on 9--16
+token gaps, but 59.1% of those examples reconstructed to the preprocessing cap
+of 128 tokens. On variable 24--96-token windows its OOD length accuracy falls to
+0%, like tree and masked models, while 56% of generations remain unfinished.
+Tree decoding is five to six times cheaper and avoids runaway generation, but it
+also does not extrapolate length. See `research/DYNAMIC_SCREENING.md` and
+`artifacts/text_dynamic/DECONFOUNDED.md`.
+
+Training from the beginning on random 24--96-token windows with twice the update
+budget makes the deeper issue explicit: gap length was sampled independently of
+the prompt. All greedy models converge to the 20% zero-length mode and obtain
+about 21% IID length accuracy; the masked length NLL reaches the theoretical
+entropy of the corruption prior. Exact recovery is therefore statistically
+unidentifiable, not merely undertrained. The next evaluation must use stochastic
+length calibration and conditional likelihood. See
+`research/WINDOWED_SCREENING.md` and `artifacts/text_windowed/RESULTS.md`.
+
+Temperature-1 sampling confirms that this is not only an argmax artifact. The
+learned length head reproduces the corruption prior (TV distance `0.038`), while
+the balanced tree (`0.260`) and sequential filler (`0.388`) remain biased toward
+short spans. The next experiment corrects frontier-state sampling so the local
+loss estimates full trajectory likelihood; scaling remains paused.
+
+That correction is now complete. It reduces sequential filler's length TV from
+`0.388` to `0.066` and empty probability from `0.537` to `0.188`, validating the
+local STOP formulation. The tree's empty probability also improves from `0.384`
+to `0.219`, but TV only moves from `0.260` to `0.244`. Its remaining error is
+explained by treating correlated left/right child existence as independent
+Bernoulli variables. The next ablation uses one joint four-way topology head.
+See `research/TRAJECTORY_CORRECTION.md`.
+
+The joint four-class topology ablation reduces corrected-tree TV from `0.244`
+to `0.165` and restores length-1 probability from `0.020` to `0.099` (target
+`0.100`). This confirms the within-node correlation diagnosis. The remaining
+gap to sequential TV `0.066` points to correlations across separate gaps on the
+same parallel frontier and free-running non-canonical states. See
+`research/JOINT_TOPOLOGY.md`.
+
+The follow-up topology audit finds only `0.005--0.023` teacher/free marginal TV
+and zero forbidden right-only events in 7,905 free-running emissions. In
+contrast, the two depth-1 gaps carry `0.549` nats of total correlation. This
+identifies independent sampling across simultaneous gaps, plus depth-1 local
+underfitting, as the main remaining bottleneck rather than exposure shift. See
+`research/FRONTIER_DEPENDENCE.md`.
+
+A three-state root-sampled branching regime was tested as a shared-randomness
+control. It matches the empty rate and improves JS/Brier, but tree TV changes
+from `0.165` to `0.172`, providing no demonstrated gain. Forced-regime rollouts
+stay in the intended coarse bucket `90.9--99.0%` of the time but remain strongly
+miscalibrated within each bucket. This favorable, target-posterior control is
+therefore rejected as the primary architecture. See
+`research/SHARED_REGIME.md`.
+
+An exact, deliberately non-scalable depth-1 coupling head directly predicts the
+two-gap topology tuple. It reduces tree TV from `0.165` to `0.131` in the primary
+run. Across three additional sampling seeds, TV improves from `0.172±0.010` to
+`0.122±0.009` in every seed. This confirms that frontier dependence is causally
+important. Direct tuple enumeration grows as `4^k`, so the next architecture is
+a small number of within-frontier topology-denoising refinements. See
+`research/FRONTIER_COUPLING.md`.
