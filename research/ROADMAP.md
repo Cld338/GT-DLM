@@ -51,12 +51,16 @@ that capacity-matched control is `-3.709+/-0.051` nats with all three intervals
 excluding zero. Oracle-structure token accuracy reaches `5.7%`, above the
 oracle-length masked baseline's `3.7%` for the first time.
 
-Two limits are load-bearing. The pilot corpus is Wikipedia-derived and the
-backbone's pretraining lineage includes Wikipedia, so held-out here does not
-mean unseen by the backbone. Length calibration does **not** improve: raw TV
-`0.122+/-0.002` against the control's `0.121`, which indicates the `TV < 0.20`
-gate is saturated rather than that the model improved. See
-`research/PRETRAINED_CONTEXT_DEPTH.md`.
+The corpus-overlap objection has since been answered. On BBC News published
+five years after the backbone's pretraining lineage, the same control gives
+`-6.136 [-7.150,-5.211]`, larger than the `-4.879 [-5.661,-4.127]` measured on
+possibly-seen 2017 text. Contamination predicts the opposite ordering. See
+`research/CORPUS_OVERLAP_CONTROL.md`.
+
+One limit remains load-bearing: length calibration does **not** improve. Raw TV
+is `0.122+/-0.002` against the control's `0.121`, reproduced independently on
+both BBC slices, which indicates the `TV < 0.20` gate is saturated rather than
+that the model improved. See `research/PRETRAINED_CONTEXT_DEPTH.md`.
 
 ### Lexical objective (partial)
 
@@ -135,7 +139,7 @@ matched intervention isolating the surviving twin. See
 | Joint and per-gap length calibration under parallel sampling | `MULTIGAP_EXACT_INSIDE.md` control 3 | Not started; multi-gap has likelihood evidence only |
 | Comparison by training FLOPs or wall-clock, not epoch count | `JOINT_LEXICAL_OBJECTIVE.md` item 4 | Not started |
 | Insertion/blank baselines and the selected two-block frontier model | `DEPTH_INSIDE.md` control 4 | Partial: sequential and masked are done |
-| Corpus not seen by the pretrained backbone | `PRETRAINED_CONTEXT_DEPTH.md` limit 1 | Not started; blocks quoting the pretrained NLL as a modeling result |
+| Corpus not seen by the pretrained backbone | `PRETRAINED_CONTEXT_DEPTH.md` limit 1 | **Done:** gain is larger on post-lineage text (`-6.136` vs `-4.879`); see `CORPUS_OVERLAP_CONTROL.md` |
 
 ### 3. Generation quality
 
@@ -183,8 +187,9 @@ The `research/PROPOSAL.md` hold on scaling to 50--100M therefore stands.
 1. **Completed:** integrate the pretrained context encoder with
    depth-conditioned exact inside; exact NLL, oracle-structure tokens, and
    length calibration are reported in `research/PRETRAINED_CONTEXT_DEPTH.md`.
-2. Re-run the pretrained encoder on a corpus outside the backbone's pretraining
-   lineage; until then its NLL gain is not quotable as a modeling result.
+2. **Completed:** re-run the pretrained encoder on a corpus outside the
+   backbone's pretraining lineage; the gain survives and is larger there, so
+   the overlap objection is answered (`research/CORPUS_OVERLAP_CONTROL.md`).
 3. Flatten `anchored_copy` lengths and add a matched twin intervention.
 4. Run from-scratch matched two-gap training (open item 2, row 1).
 5. Complete the baseline table and the FLOP-matched comparison.
@@ -199,6 +204,7 @@ text, but this is not yet a GT-DLM generation or copy-rule result.
 
 The pretrained context encoder is the strongest single-gap text model by exact
 NLL, replicated in 3/3 seeds against a capacity-matched control. It is claimable
-as an encoder-ablation result only: the corpus overlaps the backbone's
-pretraining lineage, and it buys likelihood and token quality, not calibration.
+as an encoder-ablation result: it buys likelihood and token quality, not
+calibration, and it is a single-gap result on pilot-scale corpora. The overlap
+objection is answered on post-lineage text.
 A natural-text generation-quality advantage is **not** claimable.

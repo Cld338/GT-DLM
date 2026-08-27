@@ -122,12 +122,14 @@ Scale-up decisions should not lean on TV alone.
 
 ## Limits
 
-1. **Backbone data overlap.** The pilot corpus is Wikipedia-derived and the
-   RoBERTa pretraining lineage includes Wikipedia text. Held-out documents here
-   are held out of *this* training run, not of the backbone's pretraining. The
-   NLL gain therefore cannot be read as evidence about generalization from this
-   corpus alone, and a contamination-controlled corpus is required before the
-   number is quoted as a modeling result.
+1. **Backbone data overlap — since resolved.** The pilot corpus is
+   Wikipedia-derived and the RoBERTa pretraining lineage includes Wikipedia
+   text, so held-out documents here are held out of *this* training run, not of
+   the backbone's pretraining. The follow-up control repeats the experiment on
+   BBC News from 2024, published after every corpus in that lineage: the gain
+   is `-6.136 [-7.150,-5.211]` there against `-4.879 [-5.661,-4.127]` on
+   possibly-seen 2017 news. It is larger on unseen text, the opposite of what
+   contamination predicts. See `research/CORPUS_OVERLAP_CONTROL.md`.
 2. **Only the random-init control is capacity-matched.** The `-2.837` row
    against the from-scratch model confounds pretraining with an 8.4x parameter
    increase and is reported only for continuity with earlier documents.
@@ -153,8 +155,8 @@ structure.
 It does not move the scale-up gate on its own. The remaining order is unchanged:
 flatten `anchored_copy` lengths and add the matched twin intervention, run the
 from-scratch matched two-gap training, and complete the FLOP-matched baseline
-table. Before any of those are quoted with this encoder, the corpus-overlap
-control in limit 1 has to be settled.
+table. The corpus-overlap control in limit 1 has since been run and clears the
+objection.
 
 Artifacts: `artifacts/text_depth_inside_pretrained`,
 `artifacts/text_depth_inside_pretrained_seed23`,

@@ -314,6 +314,21 @@ saturated rather than passed more convincingly), and the Wikipedia-derived pilot
 corpus overlaps the backbone's pretraining lineage, so held-out here does not
 mean unseen by the backbone. Free samples remain unusable. See
 `research/PRETRAINED_CONTEXT_DEPTH.md`.
+
+The overlap objection has since been tested directly. Two BBC News slices are
+built by one pipeline with one shared vocabulary and identical 128-token
+documents, differing only in date: 2017 articles fall inside the CC-News window
+RoBERTa trained on, while 2024 articles postdate every corpus in that lineage.
+The pretrained-minus-random-init gain is `-6.136 [-7.150,-5.211]` nats on the
+2024 slice against `-4.879 [-5.661,-4.127]` on the 2017 slice. The gain is
+larger on text the backbone cannot have seen, which is the opposite of what
+memorisation predicts, so the WikiText likelihood gain is not an artifact of
+pretraining-corpus overlap. Exact-span reproduction does jump on the 2017 slice
+(`4.8%` against `0.0%` under oracle structure), but the random-init control is
+elevated there too, so that is corpus repetition rather than backbone recall —
+it does mean exact-match metrics cannot be compared across eras. Length
+calibration fails to improve on both slices, independently reproducing the
+saturated-gate finding. See `research/CORPUS_OVERLAP_CONTROL.md`.
 Natural-text preparation expects UTF-8 input with one document per line. It
 performs a seeded document-level split, trains byte-level BPE on the training
 documents only, and writes `tokenizer.json`, `corpus.pt`, and `manifest.json`.
