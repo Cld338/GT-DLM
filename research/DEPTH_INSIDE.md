@@ -147,3 +147,14 @@ root-calibrated TV improve in 3/3 seeds; their mean changes are `-0.065` and
 at seed 17 and intervals spanning zero at seeds 23 and 41. The defensible claim
 is a replicated lexical/calibration regularization effect, not a uniform exact
 likelihood improvement or fluent generation.
+
+## Pretrained context encoder
+
+The prompt encoder is the one component of this model that the exact recurrence
+does not constrain. Swapping it for `distilroberta-base`, with the chart, the
+root STOP gate, and the vocabulary normalization unchanged, lowers test exact
+NLL from `24.470+/-0.174` to `21.658+/-0.051` and raises oracle-structure token
+accuracy from `2.1--2.3%` to `5.7%`. Length calibration is unchanged, which is
+itself informative: the `TV < 0.20` gate no longer separates models at this
+scale. See `research/PRETRAINED_CONTEXT_DEPTH.md` for the capacity-matched
+control and the corpus-overlap limit.

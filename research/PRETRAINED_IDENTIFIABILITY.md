@@ -73,6 +73,12 @@ pretrained context encoder with depth-conditioned exact inside training and
 retain exact sequence NLL, oracle-structure token metrics, and length
 calibration.
 
+That integration is now complete and positive: the same backbone inside the
+exact depth chart lowers test NLL by `-3.709+/-0.051` nats against a
+capacity-matched random-init control in 3/3 seeds. It also inherits this
+document's caveat and adds one of its own, since the pilot corpus overlaps the
+backbone's pretraining lineage. See `research/PRETRAINED_CONTEXT_DEPTH.md`.
+
 Before using `anchored_copy` as a long-span scale-up slice:
 
 1. flatten its target-length distribution; the present test split has only

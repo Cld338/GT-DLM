@@ -1,6 +1,7 @@
 import math
 import random
 import unittest
+from types import SimpleNamespace
 
 import torch
 import torch.nn.functional as F
@@ -75,6 +76,7 @@ from gtdlm.model import (
     GapTreeThreeStageTopologyBoundaryModel,
     IntervalInsideBoundaryModel,
     LengthMaskedModel,
+    PretrainedIntervalInsideModel,
     immediate_gap_boundaries,
 )
 from gtdlm.inside import (
@@ -417,6 +419,58 @@ class FrontierTest(unittest.TestCase):
         )
         self.assertGreaterEqual(float(exact[0]), float(midpoint[0]))
         (-exact.mean()).backward()
+        self.assertIsNotNone(model.encoder.step_embedding.weight.grad)
+
+    def test_pretrained_context_depth_likelihood_is_differentiable(self):
+        class StubSourceTokenizer:
+            def decode(self, token_ids, skip_special_tokens=False):
+                del skip_special_tokens
+                return "".join(chr(65 + token_id) for token_id in token_ids)
+
+        class StubPretrainedTokenizer:
+            mask_token = "<mask>"
+            mask_token_id = 9
+
+            def __call__(self, texts, **kwargs):
+                del kwargs
+                rows = [[1, self.mask_token_id, 2] for _ in texts]
+                return {
+                    "input_ids": torch.tensor(rows),
+                    "attention_mask": torch.ones(len(rows), 3, dtype=torch.long),
+                }
+
+        class StubBackbone(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.config = SimpleNamespace(hidden_size=8)
+                self.embedding = torch.nn.Embedding(16, 8)
+
+            def get_input_embeddings(self):
+                return self.embedding
+
+            def forward(self, input_ids, attention_mask):
+                del attention_mask
+                return SimpleNamespace(last_hidden_state=self.embedding(input_ids))
+
+        vocab = TextVocabulary(12, PAD=0, GAP=1, MASK=2, LEFT=3, RIGHT=4)
+        example = corrupt_token_sequence([5, 6, 7, 8, 9], [(1, 3)])
+        backbone = StubBackbone()
+        model = PretrainedIntervalInsideModel(
+            vocab.vocab_size,
+            vocab.GAP,
+            vocab.PAD,
+            StubSourceTokenizer(),
+            backbone=backbone,
+            pretrained_tokenizer=StubPretrainedTokenizer(),
+            initialize_custom_embeddings=False,
+        )
+        exact, midpoint = depth_batch_log_likelihoods(
+            model, [example], vocab, torch.device("cpu"), 4, 0.0
+        )
+        self.assertTrue(torch.isfinite(exact).all())
+        self.assertGreaterEqual(float(exact[0]), float(midpoint[0]))
+        (-exact.mean()).backward()
+        self.assertIsNotNone(backbone.embedding.weight.grad)
         self.assertIsNotNone(model.encoder.step_embedding.weight.grad)
 
     def test_lexical_metrics_condition_on_nonempty_length_matches(self):

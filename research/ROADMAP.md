@@ -10,9 +10,10 @@ own document and update the status here.
 
 ## Status in one line
 
-The mechanism is established and a coherent exact objective is in hand. The
-natural-text claims remain likelihood-and-calibration claims, not generation
-claims, and the preregistered scale-up gate has not been passed.
+The mechanism is established, a coherent exact objective is in hand, and a
+pretrained context encoder now supplies the largest single-gap likelihood gain
+so far. The natural-text claims remain likelihood-and-calibration claims, not
+generation claims, and the preregistered scale-up gate has not been passed.
 
 ## What is established
 
@@ -39,6 +40,23 @@ Test exact NLL is `24.470+/-0.174` across three training seeds, raw length TV
 on the selected model give `0.123+/-0.004` with overflow `0.061+/-0.001`. This
 passes the preregistered `TV < 0.20` gate. See
 `research/TREE_INSIDE_OBJECTIVE.md` and `research/DEPTH_INSIDE.md`.
+
+### Pretrained context encoder (selected single-gap text model)
+
+Swapping the from-scratch prompt encoder for a `distilroberta-base` backbone,
+with the exact depth-inside objective unchanged, gives test exact NLL
+`21.658+/-0.051` across three training seeds against `25.367` for the same
+architecture with randomly initialized backbone weights. The paired gain over
+that capacity-matched control is `-3.709+/-0.051` nats with all three intervals
+excluding zero. Oracle-structure token accuracy reaches `5.7%`, above the
+oracle-length masked baseline's `3.7%` for the first time.
+
+Two limits are load-bearing. The pilot corpus is Wikipedia-derived and the
+backbone's pretraining lineage includes Wikipedia, so held-out here does not
+mean unseen by the backbone. Length calibration does **not** improve: raw TV
+`0.122+/-0.002` against the control's `0.121`, which indicates the `TV < 0.20`
+gate is saturated rather than that the model improved. See
+`research/PRETRAINED_CONTEXT_DEPTH.md`.
 
 ### Lexical objective (partial)
 
@@ -117,18 +135,24 @@ matched intervention isolating the surviving twin. See
 | Joint and per-gap length calibration under parallel sampling | `MULTIGAP_EXACT_INSIDE.md` control 3 | Not started; multi-gap has likelihood evidence only |
 | Comparison by training FLOPs or wall-clock, not epoch count | `JOINT_LEXICAL_OBJECTIVE.md` item 4 | Not started |
 | Insertion/blank baselines and the selected two-block frontier model | `DEPTH_INSIDE.md` control 4 | Partial: sequential and masked are done |
+| Corpus not seen by the pretrained backbone | `PRETRAINED_CONTEXT_DEPTH.md` limit 1 | Not started; blocks quoting the pretrained NLL as a modeling result |
 
 ### 3. Generation quality
 
 Source: named independently by `research/LEXICAL_EVALUATION.md` and
 `research/JOINT_LEXICAL_OBJECTIVE.md` item 5.
 
-The categorical identifiability probe has now established that a genuinely
-pretrained backbone supplies recoverable length information. The remaining
-model task is to integrate it with the selected depth-inside objective.
-Evaluation must keep reporting both proper sequence NLL and oracle-structure
-token scores, so that a structural likelihood gain cannot be misreported as
-semantic fluency.
+The integration is done and reported with both proper sequence NLL and
+oracle-structure token scores, so that the structural gain is not misreported
+as fluency. Oracle-structure token accuracy rises to `5.7%` and free-sample
+token accuracy to `2.1%`, the latter being the metric that separates
+pretraining from capacity: the capacity-matched random-init control stays at
+`0.5%`.
+
+Generation itself remains unusable. Free-sample exact match is `0.2--0.5%` and
+edit similarity `2.3%`, so the item stays open. What has changed is its
+diagnosis: the bottleneck is no longer missing context in the encoder. See
+`research/PRETRAINED_CONTEXT_DEPTH.md`.
 
 ### 4. Cross-gap dependence, if pursued again
 
@@ -148,7 +172,7 @@ compute. The oracle-length gap must be reported either way.
 
 | Condition | State |
 |---|---|
-| Length-extrapolation slice | Pretrained probe is positive; long lengths and copy-specific attribution remain uncontrolled |
+| Length-extrapolation slice | Pretrained probe is positive and the encoder now carries into the objective; long lengths, copy-specific attribution, and backbone corpus overlap remain uncontrolled |
 | Gap-composition slice | Synthetic passes; text has likelihood evidence only |
 | Compute-matched AR competitiveness | Not attempted |
 
@@ -156,17 +180,25 @@ The `research/PROPOSAL.md` hold on scaling to 50--100M therefore stands.
 
 ## Recommended order
 
-1. Integrate the pretrained context encoder with depth-conditioned exact inside
-   and evaluate exact NLL, oracle-structure tokens, and length calibration.
-2. Flatten `anchored_copy` lengths and add a matched twin intervention.
-3. Run from-scratch matched two-gap training (open item 2, row 1).
-4. Complete the baseline table and the FLOP-matched comparison.
-5. Re-evaluate the scale-up gate.
+1. **Completed:** integrate the pretrained context encoder with
+   depth-conditioned exact inside; exact NLL, oracle-structure tokens, and
+   length calibration are reported in `research/PRETRAINED_CONTEXT_DEPTH.md`.
+2. Re-run the pretrained encoder on a corpus outside the backbone's pretraining
+   lineage; until then its NLL gain is not quotable as a modeling result.
+3. Flatten `anchored_copy` lengths and add a matched twin intervention.
+4. Run from-scratch matched two-gap training (open item 2, row 1).
+5. Complete the baseline table and the FLOP-matched comparison.
+6. Re-evaluate the scale-up gate.
 
 ## Currently claimable
 
 The synthetic strict multi-gap length-generalization result, and, on natural
 text, exact latent-tree marginalization with passing length calibration. A
 pretrained categorical probe also recovers missing-span length on held-out
-text, but this is not yet a GT-DLM generation or copy-rule result. A
-natural-text generation-quality advantage is **not** claimable.
+text, but this is not yet a GT-DLM generation or copy-rule result.
+
+The pretrained context encoder is the strongest single-gap text model by exact
+NLL, replicated in 3/3 seeds against a capacity-matched control. It is claimable
+as an encoder-ablation result only: the corpus overlaps the backbone's
+pretraining lineage, and it buys likelihood and token quality, not calibration.
+A natural-text generation-quality advantage is **not** claimable.
