@@ -193,17 +193,81 @@ def evaluate(
     }
 
 
+def balance_by_length(
+    examples: Sequence[TextInfillingExample],
+    document_ids: Sequence[int],
+    per_length: int,
+    seed: int,
+) -> Tuple[List[TextInfillingExample], List[int], int]:
+    """Subsample to an equal number of examples per span length.
+
+    The natural `anchored_copy` length distribution is dominated by short
+    spans, which leaves only a handful of held-out examples at lengths 7--8 and
+    makes the long-span slice unmeasurable at any sample size the pilot can
+    afford. Balancing trades total examples for equal resolution at every
+    length, and raises the marginal prior the model has to beat.
+    """
+    grouped: Dict[int, List[Tuple[TextInfillingExample, int]]] = (
+        collections.defaultdict(list)
+    )
+    for example, document_id in zip(examples, document_ids):
+        grouped[len(example.spans[0])].append((example, document_id))
+    if not grouped:
+        raise ValueError("no examples to balance")
+    available = min(len(value) for value in grouped.values())
+    target = available if per_length <= 0 else min(per_length, available)
+    if target < 1:
+        raise ValueError("no length class has an example to balance against")
+    rng = random.Random(seed)
+    balanced_examples: List[TextInfillingExample] = []
+    balanced_ids: List[int] = []
+    for length in sorted(grouped):
+        chosen = list(grouped[length])
+        rng.shuffle(chosen)
+        for example, document_id in chosen[:target]:
+            balanced_examples.append(example)
+            balanced_ids.append(document_id)
+    return balanced_examples, balanced_ids, target
+
+
+def cap_by_length(
+    examples: Sequence[TextInfillingExample], cap: int, seed: int
+) -> List[TextInfillingExample]:
+    """Discard surplus examples from over-represented lengths.
+
+    Only ``per_length`` examples are drawn from each length class per epoch, so
+    keeping the full pool wastes memory in proportion to the imbalance it
+    exists to correct: at pilot scale length 1 is two thirds of it. Capping
+    keeps enough headroom for the per-epoch redraw to stay varied.
+    """
+    if cap <= 0:
+        return list(examples)
+    grouped: Dict[int, List[TextInfillingExample]] = collections.defaultdict(list)
+    for example in examples:
+        grouped[len(example.spans[0])].append(example)
+    rng = random.Random(seed)
+    capped: List[TextInfillingExample] = []
+    for length in sorted(grouped):
+        bucket = grouped[length]
+        if len(bucket) > cap:
+            bucket = rng.sample(bucket, cap)
+        capped.extend(bucket)
+    return capped
+
+
 def identifiable_statistics(
     evaluation: Dict[str, object],
-    document_count: int,
+    document_ids: Sequence[int],
     seed: int,
     bootstrap_samples: int,
 ) -> Dict[str, object]:
     """Compare prompt NLL to its split's empirical marginal, by document.
 
-    ``materialize`` is pass-major, so example ``i`` belongs to source document
-    ``i % document_count``.  Averaging within document before resampling avoids
-    treating repeated corruptions of one held-out document as independent.
+    ``document_ids`` gives the source document of each evaluated example, so
+    averaging within document before resampling avoids treating repeated
+    corruptions of one held-out document as independent. Ids are passed
+    explicitly because length balancing breaks the pass-major ordering that
+    would otherwise let the document be recovered as ``index % document_count``.
     """
     targets = [int(value) for value in evaluation["targets"]]
     model_nlls = [float(value) for value in evaluation["example_nlls"]]
@@ -211,11 +275,21 @@ def identifiable_statistics(
     total = len(targets)
     prior_nlls = [-math.log(counts[target] / total) for target in targets]
     deltas = [prior - model for prior, model in zip(prior_nlls, model_nlls)]
-    grouped: List[List[float]] = [[] for _ in range(document_count)]
-    for index, delta in enumerate(deltas):
-        grouped[index % document_count].append(delta)
-    group_means = [sum(values) / len(values) for values in grouped if values]
-    point = sum(deltas) / max(len(deltas), 1)
+    if len(document_ids) != len(deltas):
+        raise ValueError("document_ids must align with the evaluated examples")
+    grouped: Dict[int, List[float]] = collections.defaultdict(list)
+    for document_id, delta in zip(document_ids, deltas):
+        grouped[int(document_id)].append(delta)
+    group_means = [
+        sum(values) / len(values) for values in grouped.values() if values
+    ]
+    # Length balancing makes documents contribute very unequal numbers of
+    # examples, so the example-weighted mean and the document-resampled
+    # interval no longer describe the same quantity. The document-weighted
+    # mean is the one the interval belongs to, and documents are the
+    # independent units, so it is the primary estimate.
+    point = sum(group_means) / max(len(group_means), 1)
+    example_point = sum(deltas) / max(len(deltas), 1)
     rng = random.Random(seed)
     draws = []
     for _ in range(bootstrap_samples):
@@ -225,10 +299,21 @@ def identifiable_statistics(
     lower = draws[int(0.025 * len(draws))]
     upper = draws[min(int(0.975 * len(draws)), len(draws) - 1)]
     entropy = sum(prior_nlls) / max(total, 1)
+    by_length: Dict[int, List[float]] = collections.defaultdict(list)
+    for target, delta in zip(targets, deltas):
+        by_length[int(target)].append(delta)
     return {
         "marginal_length_entropy": entropy,
         "identifiable_nats": point,
+        "identifiable_nats_example_weighted": example_point,
         "identifiable_nats_document_bootstrap_95_ci": [lower, upper],
+        "identifiable_nats_by_length": {
+            str(length): sum(values) / len(values)
+            for length, values in sorted(by_length.items())
+        },
+        "examples_by_length": {
+            str(length): len(values) for length, values in sorted(by_length.items())
+        },
     }
 
 
@@ -278,8 +363,29 @@ def train_policy(
             : args.max_validation_documents
         ]
         test_source.documents = test_source.documents[: args.max_validation_documents]
-    validation = materialize(validation_source, args.validation_passes)
-    test = materialize(test_source, args.test_passes)
+    validation_passes = args.validation_passes
+    test_passes = args.test_passes
+    if args.flatten_lengths:
+        # Long spans are rare, so a balanced set can only be cut from a much
+        # larger pool of corruptions than the unbalanced protocol needs.
+        validation_passes = max(validation_passes, args.flatten_passes)
+        test_passes = max(test_passes, args.flatten_passes)
+    validation = materialize(validation_source, validation_passes)
+    test = materialize(test_source, test_passes)
+    validation_ids = [index % len(validation_source) for index in range(len(validation))]
+    test_ids = [index % len(test_source) for index in range(len(test))]
+    if args.flatten_lengths:
+        validation, validation_ids, validation_per_length = balance_by_length(
+            validation, validation_ids, args.flatten_eval_per_length, args.seed + 5501
+        )
+        test, test_ids, test_per_length = balance_by_length(
+            test, test_ids, args.flatten_eval_per_length, args.seed + 5503
+        )
+        print(
+            "{} flattened evaluation: {} per length in validation, {} in test"
+            .format(policy, validation_per_length, test_per_length),
+            flush=True,
+        )
     entropy = marginal_length_entropy(validation)
     collate_fn = partial(
         collate_pretrained_length,
@@ -292,6 +398,41 @@ def train_policy(
         collate_fn(validation[start : start + args.batch_size])
     for start in range(0, len(test), args.batch_size):
         collate_fn(test[start : start + args.batch_size])
+
+    training_pool = None
+    train_per_length = 0
+    if args.flatten_lengths:
+        # Long spans are so rare that a balanced draw needs a pool many times
+        # the size of one ordinary epoch.
+        training_pool = materialize(
+            train_source, args.flatten_train_passes or args.flatten_passes
+        )
+        if args.flatten_pool_cap:
+            training_pool = cap_by_length(
+                training_pool, args.flatten_pool_cap, args.seed + 5509
+            )
+        _, _, train_per_length = balance_by_length(
+            training_pool,
+            list(range(len(training_pool))),
+            args.flatten_per_length,
+            args.seed + 5507,
+        )
+        train_source.set_epoch(0)
+        print(
+            "{} flattened training pool: {} examples, histogram {}, "
+            "{} per length per epoch".format(
+                policy,
+                len(training_pool),
+                length_histogram(training_pool),
+                train_per_length,
+            ),
+            flush=True,
+        )
+    training_size = (
+        train_per_length * len(set(len(example.spans[0]) for example in training_pool))
+        if training_pool is not None
+        else len(train_source)
+    )
 
     model = PretrainedLengthProbe(
         args.model_name,
@@ -314,7 +455,7 @@ def train_policy(
         ],
         weight_decay=args.weight_decay,
     )
-    steps_per_epoch = math.ceil(len(train_source) / args.batch_size)
+    steps_per_epoch = math.ceil(training_size / args.batch_size)
     total_steps = max(steps_per_epoch * args.epochs, 1)
     warmup_steps = int(total_steps * args.warmup_ratio)
     scheduler = get_linear_schedule_with_warmup(
@@ -341,8 +482,21 @@ def train_policy(
     )
     for epoch in range(args.epochs):
         train_source.set_epoch(epoch)
+        if training_pool is None:
+            epoch_examples = train_source
+        else:
+            # Redraw the balanced subset every epoch. Freezing one subset would
+            # show the rare long-span classes the same handful of prompts ten
+            # times over, which is the memorisation failure this policy already
+            # hit once at pilot scale.
+            epoch_examples, _, _ = balance_by_length(
+                training_pool,
+                list(range(len(training_pool))),
+                train_per_length,
+                args.seed + 6101 + epoch,
+            )
         loader = DataLoader(
-            train_source,
+            epoch_examples,
             batch_size=args.batch_size,
             shuffle=True,
             collate_fn=collate_fn,
@@ -418,13 +572,13 @@ def train_policy(
     )
     validation_statistics = identifiable_statistics(
         best_evaluation,
-        len(validation_source),
+        validation_ids,
         args.seed + 1201,
         args.bootstrap_samples,
     )
     test_statistics = identifiable_statistics(
         test_evaluation,
-        len(test_source),
+        test_ids,
         args.seed + 1601,
         args.bootstrap_samples,
     )
@@ -436,6 +590,8 @@ def train_policy(
     return {
         "policy": policy,
         "train_documents": len(train_source),
+        "train_examples": training_size,
+        "flattened": bool(args.flatten_lengths),
         "validation_examples": len(validation),
         "validation_length_histogram": length_histogram(validation),
         "marginal_length_entropy": entropy,
@@ -444,6 +600,9 @@ def train_policy(
         "validation_length_nll": best_nll,
         "validation_length_accuracy": best_accuracy,
         "identifiable_nats": entropy - best_nll,
+        "validation_identifiable_nats_document_weighted": (
+            validation_statistics["identifiable_nats"]
+        ),
         "validation_identifiable_nats_document_bootstrap_95_ci": (
             validation_statistics["identifiable_nats_document_bootstrap_95_ci"]
         ),
@@ -456,6 +615,13 @@ def train_policy(
         "test_length_nll": test_evaluation["length_nll"],
         "test_length_accuracy": test_evaluation["length_accuracy"],
         "test_identifiable_nats": test_statistics["identifiable_nats"],
+        "test_identifiable_nats_example_weighted": test_statistics[
+            "identifiable_nats_example_weighted"
+        ],
+        "test_identifiable_nats_by_length": test_statistics[
+            "identifiable_nats_by_length"
+        ],
+        "test_examples_by_length": test_statistics["examples_by_length"],
         "test_identifiable_nats_document_bootstrap_95_ci": test_statistics[
             "identifiable_nats_document_bootstrap_95_ci"
         ],
@@ -540,6 +706,36 @@ def main() -> None:
     parser.add_argument("--random-window-min", type=int, default=24)
     parser.add_argument("--random-window-max", type=int, default=96)
     parser.add_argument("--max-train-examples", type=int, default=0)
+    parser.add_argument(
+        "--flatten-lengths",
+        action="store_true",
+        help="balance train/validation/test to equal examples per span length",
+    )
+    parser.add_argument("--flatten-passes", type=int, default=8)
+    parser.add_argument(
+        "--flatten-pool-cap",
+        type=int,
+        default=4000,
+        help="cap the training pool per length class; 0 keeps every example",
+    )
+    parser.add_argument(
+        "--flatten-train-passes",
+        type=int,
+        default=0,
+        help="pool passes for training; 0 reuses --flatten-passes",
+    )
+    parser.add_argument(
+        "--flatten-eval-per-length",
+        type=int,
+        default=0,
+        help="held-out examples kept per length; 0 uses the rarest length's count",
+    )
+    parser.add_argument(
+        "--flatten-per-length",
+        type=int,
+        default=0,
+        help="examples kept per length; 0 uses the rarest length's count",
+    )
     parser.add_argument("--max-validation-documents", type=int, default=0)
     parser.add_argument("--freeze-backbone", action="store_true")
     parser.add_argument("--gradient-checkpointing", action="store_true")
