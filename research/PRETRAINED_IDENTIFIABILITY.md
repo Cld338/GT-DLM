@@ -185,10 +185,35 @@ The `none` baseline of `+0.098` reproduces the `+0.101` reported for seed 17 in
 the held-out table, which confirms the intervention harness loads and scores the
 same probe.
 
-This intervention was **not** repeated on the flattened probe. With flattened
+This intervention is **not** reported on the flattened probe. With flattened
 identifiable nats at `+0.037` document-weighted and `-0.001` under the
 intervention harness's own pooling, there is no signal left to ablate, so the
 ablation would be uninformative by construction.
+
+### A superseded artifact that must not be read as a result
+
+`artifacts/twin_intervention_pretrained` exists and contains a flattened-probe
+intervention table. It is **not** a result and nothing in this project cites
+it. It was produced by an earlier version of `measure_twin_intervention.py`
+whose paired bootstrap did not resample the same quantity as its point
+estimate, and it is internally impossible on its own face: the `far_content_swap`
+row reports a mean NLL change of `+0.001` with a 95% interval of
+`[+0.002,+0.005]`, so the point estimate falls outside its own interval. The
+`far_length_perturb` row has the same defect, `+0.00075` against
+`[+0.00108,+0.00538]`, hidden by rounding in the rendered table. The file is
+also missing the `mean_nll_change_example_weighted` field that every current
+run writes, which is what dates it.
+
+It is kept rather than deleted because deleting experiment output is the
+project owner's call, and because the failure is itself worth recording: a
+bootstrap that resamples a different unit from its point estimate produces
+tables that look ordinary and pass casual reading. The check that catches it is
+cheap. Confirm the point estimate lies inside its own interval before reporting
+any bootstrapped difference.
+
+Re-running it would require retraining the flattened seed-17 probe, since the
+checkpoint that produced it was overwritten. That work is not justified while
+the quantity being ablated is indistinguishable from zero.
 
 Item 3, evaluating the depth-inside stopping policy rather than a categorical
 length head, remains open.
