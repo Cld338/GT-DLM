@@ -39,6 +39,7 @@ def train_factorized_model(
     config: Dict[str, object],
     device: torch.device,
     trajectory_weighted: bool = False,
+    on_epoch_end=None,
 ) -> Dict[str, List[float]]:
     updates_per_epoch = math.ceil(reference_examples / int(config["batch_size"]))
     optimizer = torch.optim.AdamW(
@@ -150,6 +151,9 @@ def train_factorized_model(
                 history["child_bce"][-1],
             )
         )
+        if on_epoch_end is not None:
+            on_epoch_end(epoch, model)
+            model.train()
     return history
 
 

@@ -1155,10 +1155,41 @@ class SpanPolicyTests(unittest.TestCase):
             "targets": [1, 2, 1, 2],
             "example_nlls": [math.log(2)] * 4,
         }
-        result = identifiable_statistics(evaluation, 2, seed=3, bootstrap_samples=100)
+        result = identifiable_statistics(
+            evaluation, [0, 1, 0, 1], seed=3, bootstrap_samples=100
+        )
         self.assertAlmostEqual(result["identifiable_nats"], 0.0, places=6)
+        self.assertAlmostEqual(
+            result["identifiable_nats_example_weighted"], 0.0, places=6
+        )
         self.assertEqual(
             result["identifiable_nats_document_bootstrap_95_ci"], [0.0, 0.0]
+        )
+
+    def test_identifiable_statistics_rejects_misaligned_document_ids(self):
+        evaluation = {
+            "targets": [1, 2, 1, 2],
+            "example_nlls": [math.log(2)] * 4,
+        }
+        with self.assertRaises(ValueError):
+            identifiable_statistics(
+                evaluation, [0, 1], seed=3, bootstrap_samples=10
+            )
+
+    def test_identifiable_statistics_weights_documents_not_examples(self):
+        # One document contributes three examples and the other contributes
+        # one, so the two weightings must disagree.
+        evaluation = {
+            "targets": [1, 1, 1, 2],
+            "example_nlls": [0.0, 0.0, 0.0, 0.0],
+        }
+        result = identifiable_statistics(
+            evaluation, [0, 0, 0, 1], seed=5, bootstrap_samples=50
+        )
+        self.assertNotAlmostEqual(
+            result["identifiable_nats"],
+            result["identifiable_nats_example_weighted"],
+            places=6,
         )
 
 
