@@ -88,8 +88,9 @@ superiority.
 2. **Completed:** generalize sequential and length-masked proper likelihoods to
    all gaps; diagnostic comparisons favor exact but are not training-matched.
 3. evaluate joint and per-gap length calibration under parallel sampling;
-4. retrain all three models on identical two-gap corruptions with matched
-   optimizer updates or training FLOPs and validation-selected endpoints;
+4. **Completed:** all three models retrained from scratch on identical two-gap
+   corruptions at matched updates with validation-selected endpoints; the exact
+   model's advantage widens to `-7.9` and `-7.6` nats (see below);
 5. add a small shared latent and test whether it improves held-out joint NLL
    beyond the factorized model at matched parameter and compute budgets.
 
@@ -247,3 +248,53 @@ endpoints. The supported conclusion is therefore limited: after one
 validation-selected proper-MLE adaptation opportunity, the factorized exact
 checkpoint retains a large two-gap likelihood advantage. A clean comparison
 still requires from-scratch two-gap training or matched total training FLOPs.
+
+## From-scratch update-matched training
+
+This is control 4, and it removes the last training confound. All three models
+start from random initialization, draw the same two-gap corruption stream from
+the same seed, take the same 125 optimizer updates per epoch for 30 epochs, and
+select their endpoint on the same 128 held-out validation examples. The test
+split is 256 two-gap examples. Parameter counts are `10,366,245`, `10,056,803`
+and `10,050,097`, so the three models are also close to capacity-matched.
+
+| Model | Selected epoch | Validation joint NLL | Test joint NLL | Test NLL / gap |
+|---|---:|---:|---:|---:|
+| Factorized depth exact | 30 | **44.363** | **43.300** | **21.650** |
+| Sequential filler | 29 | 52.072 | 51.247 | 25.623 |
+| Learned lengths + masks | 30 | 51.760 | 50.946 | 25.473 |
+
+| Comparison | Mean NLL difference | Paired 95% CI |
+|---|---:|---:|
+| Exact minus sequential | `-7.947` | `[-8.711,-7.202]` |
+| Exact minus length-masked | `-7.646` | `[-8.394,-6.926]` |
+
+Both intervals exclude zero by a wide margin, and the advantage is three times
+the `-2.539` and `-2.253` measured without training matching. The confound ran
+against the exact model, not for it.
+
+Convergence decides how to read the endpoints. Every model selected epoch 29 or
+30, which would normally mean the budget rather than validation chose the
+endpoint. The validation curves show this is only true for the exact model:
+over the last five epochs the sequential baseline moves `+0.012` and the masked
+baseline `-0.012`, both flat since roughly epoch 20, while the exact model is
+still falling at `-0.284`. The baselines have converged and their late-epoch
+selection is noise across a plateau; the exact model has not, so the reported
+gap is a lower bound under this budget.
+
+One asymmetry is worth recording. Training from scratch on two-gap corruptions
+makes both baselines substantially worse than the earlier one-gap-trained
+checkpoints did, `51.247` and `50.946` against `46.568` and `46.378`, whereas
+the exact model improves slightly, `43.300` against `44.125`. The baselines
+evidently benefit from a one-gap curriculum that the exact objective does not
+need. The ordering is therefore robust across both training regimes, and
+matching the training budget widens rather than creates the gap.
+
+The supported claim is now a training-matched one: under identical two-gap
+corruptions, identical update budgets and validation-selected endpoints, the
+factorized exact depth-inside model attains a large held-out two-gap likelihood
+advantage over both proper baselines. This remains a likelihood result. Control
+3, joint and per-gap length calibration under parallel sampling, is still not
+started, so no sampling or generation claim follows.
+
+Artifacts: `artifacts/text_multigap_matched_training`.

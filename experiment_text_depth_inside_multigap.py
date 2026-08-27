@@ -213,7 +213,8 @@ def multi_depth_gap_log_likelihoods(
     return example_exact, example_midpoint, flat_exact
 
 
-def train(model, source, vocab, device, epochs, batch_size, learning_rate):
+def train(model, source, vocab, device, epochs, batch_size, learning_rate,
+          on_epoch_end=None):
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=1e-4)
     history = []
     model.train()
@@ -232,6 +233,9 @@ def train(model, source, vocab, device, epochs, batch_size, learning_rate):
             count += len(examples)
         history.append(total / count)
         print("multi-gap epoch {}/{} joint_nll={:.4f}".format(epoch + 1, epochs, history[-1]))
+        if on_epoch_end is not None:
+            on_epoch_end(epoch, model)
+            model.train()
     return history
 
 

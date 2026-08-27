@@ -46,6 +46,7 @@ def train_dynamic_baseline(
     vocab: TextVocabulary,
     config: Dict[str, object],
     device: torch.device,
+    on_epoch_end=None,
 ) -> Dict[str, List[float]]:
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=float(config["lr"]), weight_decay=1e-4
@@ -109,6 +110,9 @@ def train_dynamic_baseline(
                 history["token_nll"][-1]
             )
         )
+        if on_epoch_end is not None:
+            on_epoch_end(epoch, model)
+            model.train()
     return history
 
 

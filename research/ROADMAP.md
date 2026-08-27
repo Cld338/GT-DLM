@@ -75,15 +75,22 @@ against `3.7%` for the oracle-length masked model, and free samples are weak.
 This is a joint structural likelihood result. See
 `research/LEXICAL_EVALUATION.md` and `research/JOINT_LEXICAL_OBJECTIVE.md`.
 
-### Factorized multi-gap (structure complete, claim limited)
+### Factorized multi-gap (training-matched likelihood result)
 
 One shared prompt encoding with a separate exact depth chart per gap. Matches
-the one-gap likelihood to `1e-6`. Test joint NLL `44.125` against `46.568`
-sequential and `46.378` masked, with paired intervals below zero.
+the one-gap likelihood to `1e-6`.
 
-The claim is capped by its controls: the baselines received one
-validation-selected proper-MLE adaptation from differently trained checkpoints.
-This is not a from-scratch compute-matched comparison. See
+The from-scratch training-matched comparison is now done. All three models
+start from random initialization, see the same two-gap corruption stream at the
+same 125 updates per epoch for 30 epochs, and select endpoints on the same
+validation split. Test joint NLL is `43.300` against `51.247` sequential and
+`50.946` masked, giving `-7.947 [-8.711,-7.202]` and `-7.646 [-8.394,-6.926]`
+nats. Both baselines converge by roughly epoch 20 while the exact model is
+still improving, so the gap is a lower bound under this budget.
+
+The remaining cap is evidential, not procedural: this is a held-out likelihood
+result. Joint and per-gap calibration under parallel sampling (control 3) is
+not started, so no sampling or generation claim follows. See
 `research/MULTIGAP_EXACT_INSIDE.md`.
 
 ## Closed directions
@@ -135,7 +142,7 @@ matched intervention isolating the surviving twin. See
 
 | Item | Source | State |
 |---|---|---|
-| From-scratch matched two-gap training of all three models | `MULTIGAP_EXACT_INSIDE.md` control 4 | Not started; sole blocker on the multi-gap superiority claim |
+| From-scratch matched two-gap training of all three models | `MULTIGAP_EXACT_INSIDE.md` control 4 | **Done:** exact beats both baselines by `-7.947 [-8.711,-7.202]` and `-7.646 [-8.394,-6.926]` nats at matched updates; the multi-gap likelihood claim is unblocked |
 | Joint and per-gap length calibration under parallel sampling | `MULTIGAP_EXACT_INSIDE.md` control 3 | Not started; multi-gap has likelihood evidence only |
 | Comparison by training FLOPs or wall-clock, not epoch count | `JOINT_LEXICAL_OBJECTIVE.md` item 4 | Not started |
 | Insertion/blank baselines and the selected two-block frontier model | `DEPTH_INSIDE.md` control 4 | Partial: sequential and masked are done |
@@ -198,7 +205,11 @@ The `research/PROPOSAL.md` hold on scaling to 50--100M therefore stands.
    natural-distribution gain, reverses under example weighting, and is selected
    by validation that prefers an untrained model
    (`research/PRETRAINED_IDENTIFIABILITY.md`).
-4. Run from-scratch matched two-gap training (open item 2, row 1).
+4. **Completed:** from-scratch matched two-gap training of all three models.
+   The exact model's advantage widens to `-7.9` and `-7.6` nats against the
+   unmatched `-2.5` and `-2.3`, and the baselines converge by epoch 20 while
+   the exact model is still improving, so the gap is a lower bound
+   (`research/MULTIGAP_EXACT_INSIDE.md`).
 5. Complete the baseline table and the FLOP-matched comparison.
 6. Re-evaluate the scale-up gate.
 
