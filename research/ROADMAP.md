@@ -176,7 +176,7 @@ compute. The oracle-length gap must be reported either way.
 
 | Condition | State |
 |---|---|
-| Length-extrapolation slice | Pretrained probe is positive and the encoder now carries into the objective; long lengths, copy-specific attribution, and backbone corpus overlap remain uncontrolled |
+| Length-extrapolation slice | Copy-specific attribution and corpus overlap are now controlled, but at flattened lengths neither arm beats the uniform prior per example, so `anchored_copy` is not usable as a long-span slice on this corpus |
 | Gap-composition slice | Synthetic passes; text has likelihood evidence only |
 | Compute-matched AR competitiveness | Not attempted |
 
@@ -190,7 +190,14 @@ The `research/PROPOSAL.md` hold on scaling to 50--100M therefore stands.
 2. **Completed:** re-run the pretrained encoder on a corpus outside the
    backbone's pretraining lineage; the gain survives and is larger there, so
    the overlap objection is answered (`research/CORPUS_OVERLAP_CONTROL.md`).
-3. Flatten `anchored_copy` lengths and add a matched twin intervention.
+3. **Completed:** the flattened split and the matched twin intervention are
+   both run. The twin intervention is conclusive on the natural distribution:
+   about half the identifiable signal is copy-specific. Flattening leaves the
+   task close to unlearnable for both arms; a document-weighted pretraining gap
+   of `+0.065+/-0.038` reproduces in 3/3 seeds but is half the
+   natural-distribution gain, reverses under example weighting, and is selected
+   by validation that prefers an untrained model
+   (`research/PRETRAINED_IDENTIFIABILITY.md`).
 4. Run from-scratch matched two-gap training (open item 2, row 1).
 5. Complete the baseline table and the FLOP-matched comparison.
 6. Re-evaluate the scale-up gate.
@@ -200,7 +207,10 @@ The `research/PROPOSAL.md` hold on scaling to 50--100M therefore stands.
 The synthetic strict multi-gap length-generalization result, and, on natural
 text, exact latent-tree marginalization with passing length calibration. A
 pretrained categorical probe also recovers missing-span length on held-out
-text, but this is not yet a GT-DLM generation or copy-rule result.
+text, and a matched twin intervention now attributes about half of that signal
+to the copy source specifically. It remains a probe result on the natural
+length distribution: it is not a GT-DLM generation result, and it does not
+survive length flattening.
 
 The pretrained context encoder is the strongest single-gap text model by exact
 NLL, replicated in 3/3 seeds against a capacity-matched control. It is claimable
