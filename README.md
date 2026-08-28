@@ -73,6 +73,8 @@ python calibrate_depth_inside_root.py --device cuda --artifact-dir artifacts/tex
 python experiment_text_depth_inside_multigap.py --device cuda --epochs 1 --checkpoint artifacts/text_depth_inside_joint/inside.pt --artifact-dir artifacts/text_depth_inside_multigap_screen
 python compare_multigap_checkpoints.py --device cuda
 python adapt_multigap_proper_mle.py --device cuda --epochs 1 --batch-size 8 --lr 0.0001
+python experiment_multigap_matched_training.py --device cuda --epochs 30 --artifact-dir artifacts/text_multigap_matched_training
+python evaluate_multigap_sampling.py --device cuda --artifact-dir artifacts/text_multigap_matched_training
 python experiment_text_depth_inside_shared_latent.py --device cuda --regimes 2 --epochs 2 --artifact-dir artifacts/text_depth_inside_shared_latent_frozen
 python compare_shared_latent_variants.py --device cuda
 python experiment_text_depth_inside_lowrank_latent.py --device cuda --regimes 2 --rank 4 --epochs 2 --lr 3e-4 --artifact-dir artifacts/text_depth_inside_lowrank_grid/r2_rank4_lr3e-4

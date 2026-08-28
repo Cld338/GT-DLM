@@ -254,6 +254,14 @@ def paired_statistics(
     bootstrap_samples: int,
 ) -> Dict[str, object]:
     """Document-grouped bootstrap of the per-example NLL change."""
+    if not (
+        len(baseline_nlls) == len(condition_nlls) == len(document_ids)
+    ):
+        raise ValueError("NLL arrays and document ids must align")
+    if not document_ids:
+        raise ValueError("at least one paired example is required")
+    if bootstrap_samples < 1:
+        raise ValueError("bootstrap_samples must be positive")
     deltas = [
         condition - baseline
         for baseline, condition in zip(baseline_nlls, condition_nlls)

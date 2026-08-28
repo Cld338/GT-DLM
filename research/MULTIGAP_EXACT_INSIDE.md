@@ -87,7 +87,9 @@ superiority.
    excludes zero.
 2. **Completed:** generalize sequential and length-masked proper likelihoods to
    all gaps; diagnostic comparisons favor exact but are not training-matched.
-3. evaluate joint and per-gap length calibration under parallel sampling;
+3. **Completed:** evaluate joint and per-gap length calibration under parallel
+   sampling; marginal and total-length calibration pass, but ordered-pair
+   calibration does not improve (see below);
 4. **Completed:** all three models retrained from scratch on identical two-gap
    corruptions at matched updates with validation-selected endpoints; the exact
    model's advantage widens to `-7.9` and `-7.6` nats (see below);
@@ -293,8 +295,37 @@ matching the training budget widens rather than creates the gap.
 The supported claim is now a training-matched one: under identical two-gap
 corruptions, identical update budgets and validation-selected endpoints, the
 factorized exact depth-inside model attains a large held-out two-gap likelihood
-advantage over both proper baselines. This remains a likelihood result. Control
-3, joint and per-gap length calibration under parallel sampling, is still not
-started, so no sampling or generation claim follows.
+advantage over both proper baselines. The sampling control below adds a positive
+per-gap and total-length calibration result, but exact ordered length-pair
+calibration and lexical generation remain weak. No fluent-generation claim
+follows.
+
+
+## Parallel two-gap length calibration
+
+Control 3 is complete on the from-scratch matched exact checkpoint. One root
+STOP bias is fitted on 128 validation prompts and shared by both gaps. The 256
+fixed test prompts are sampled 128 times at seeds 1701, 2701, and 3701.
+Validation empty probability is `0.2266`, against predicted `0.2572`; bias
+`-0.1707` matches the pooled validation rate exactly.
+
+Per-gap calibration passes: pooled TV is `0.132+/-0.000` raw and
+`0.120+/-0.004` calibrated; the two calibrated gap TVs are `0.119+/-0.002`
+and `0.121+/-0.005`. Total-length TV to the empirical distribution improves
+slightly from `0.196+/-0.001` to `0.192+/-0.003`, and TV to the convolved
+corruption prior improves from `0.203+/-0.001` to `0.179+/-0.004`.
+
+Exact ordered-pair calibration does not improve: pair TV moves
+`0.293+/-0.000 -> 0.296+/-0.002`, target-pair probability falls slightly,
+and overflow is unchanged. The 100-cell pair histogram is sparse at 256
+examples: even the theoretical independent prior is `0.219` TV from the test
+histogram. Observed length covariance is `0.143`, but its document-bootstrap
+interval `[-0.734,1.009]` includes zero, so this does not establish residual
+cross-gap dependence or reopen the rejected finite-latent direction.
+
+The supported sampling claim is limited to calibrated per-gap marginals and
+reasonable total length; no exact-pair or fluent-generation claim follows.
+Evaluator: `evaluate_multigap_sampling.py`; results are in the matched-training
+artifact directory.
 
 Artifacts: `artifacts/text_multigap_matched_training`.
