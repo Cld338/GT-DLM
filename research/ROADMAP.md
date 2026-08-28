@@ -179,6 +179,17 @@ edit similarity `2.3%`, so the item stays open. What has changed is its
 diagnosis: the bottleneck is no longer missing context in the encoder. See
 `research/PRETRAINED_CONTEXT_DEPTH.md`.
 
+An exact decomposition of the two-gap likelihood now narrows the diagnosis
+further. Splitting `log p(x)` into lexical, structural, and tree-entropy parts
+shows the advantage is `-9.2` to `-9.5` nats lexical, `+3.7` nats *against* the
+exact model on structure, and only `-2.2` nats of tree entropy. Two mechanical
+explanations are ruled out: tree multiplicity accounts for just `27%` of the
+gap, and the lexical advantage is flat across tree depth (`5.571` nats/token at
+the root against `5.4--5.8` deeper), so it is not bought with tighter gold
+context. The remaining caveat is that all lexical numbers are expectations
+under the gold-conditioned tree posterior. See
+`research/LIKELIHOOD_DECOMPOSITION.md`.
+
 ### 4. Cross-gap dependence, if pursued again
 
 Before screening another parameterization, first run a diagnostic establishing
@@ -231,7 +242,16 @@ The `research/PROPOSAL.md` hold on scaling to 50--100M therefore stands.
    The exact model costs 12.05x / 7.09x more wall-clock per epoch than the
    two baselines; retraining both for a matched wall-clock budget still loses
    by `-5.916` and `-7.486` nats (`research/MULTIGAP_EXACT_INSIDE.md`).
-7. Re-evaluate the scale-up gate (below).
+7. **Completed:** exact decomposition of the likelihood advantage into
+   lexical, structural, and tree-entropy terms. The advantage is lexical, not
+   tree multiplicity, and the exact model is measurably *worse* at structure
+   (`research/LIKELIHOOD_DECOMPOSITION.md`).
+8. **Next:** re-score the lexical term under the model's own tree prior
+   `E_{p(T|prompt)}[log p(x|T)]` instead of the gold-conditioned posterior.
+   This is the generation-relevant quantity and needs no retraining. It
+   decides whether the bottleneck is decoding or scoring, and should run
+   before any scale-up decision.
+9. Re-evaluate the scale-up gate (below).
 
 ## Currently claimable
 

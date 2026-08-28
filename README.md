@@ -89,6 +89,7 @@ python measure_pretrained_span_identifiability.py --device cuda --epochs 5 --val
 python measure_pretrained_span_identifiability.py --device cuda --epochs 5 --validation-passes 8 --test-passes 8 --policies anchored_copy,uniform --random-init-backbone --output-dir artifacts/span_identifiability_random_architecture_control
 python measure_multigap_wallclock.py --device cuda --calibration-epochs 3 --artifact-dir artifacts/text_multigap_wallclock_calibration
 python experiment_multigap_matched_training.py --device cuda --models sequential_filler,length_masked --epochs-per-model "sequential_filler=361,length_masked=212" --exact-checkpoint artifacts/text_multigap_matched_training/factorized_depth_exact.pt --artifact-dir artifacts/text_multigap_wallclock_matched
+python decompose_multigap_likelihood.py --device cuda --artifact-dir artifacts/text_multigap_decomposition
 ```
 
 The experiment writes its metrics and checkpoints to `artifacts/`.
@@ -427,3 +428,18 @@ after roughly 43 epochs. This also satisfies the preregistered scale-up
 gate's compute-matched autoregressive-competitiveness condition on this
 project's joint-likelihood metric. See "Wall-clock-matched baseline
 retraining" in `research/MULTIGAP_EXACT_INSIDE.md`.
+
+An exact decomposition then locates where that likelihood advantage lives.
+Writing `log p(x) = root + E_q[token] + E_q[topology] + H(q)` for the tree
+posterior `q`, the advantage is `-9.453 [-10.329,-8.595]` nats lexical,
+`+3.670 [+3.283,+4.070]` nats *against* the exact model on structure, and
+`-2.164 [-2.372,-1.962]` nats of tree entropy. This refutes the hypothesis the
+study was built to test: tree multiplicity supplies only `27%` of the gap, not
+the bulk of it, even though a length-8 span admits 1430 ordered pivot trees.
+The lexical term is also flat across tree depth (`5.571` nats/token at the
+root against `5.4--5.8` deeper), so it is not an artifact of the tighter
+two-sided gold context that deep chart nodes enjoy; at the root the exact
+model sees no more than the masked baseline and still costs `5.571` against
+`6.933` nats/token. The load-bearing caveat is that every lexical number is an
+expectation under the gold-conditioned tree posterior, which free generation
+cannot access. See `research/LIKELIHOOD_DECOMPOSITION.md`.

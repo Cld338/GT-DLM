@@ -32,6 +32,7 @@ from experiment_text_depth_inside import (
     depth_batch_log_likelihoods,
     reachable_depth_intervals,
 )
+from decompose_multigap_likelihood import decompose_exact_batch
 from experiment_text_depth_inside_multigap import (
     collate_multi_prompt_contexts,
     multi_depth_gap_log_likelihoods,
@@ -204,6 +205,48 @@ class FrontierTest(unittest.TestCase):
         self.assertTrue(torch.allclose(joint[0], individual.sum(), atol=1e-6))
         (-joint.mean()).backward()
         self.assertGreater(float(model.token_head.weight.grad.abs().sum()), 0.0)
+
+    def test_likelihood_decomposition_reconstructs_the_exact_value(self):
+        """lexical + structure + tree entropy must equal the exact likelihood.
+
+        The whole point of the decomposition diagnostic is that the split is
+        exact rather than approximate, so the identity is pinned here. The
+        entropy term must also be non-negative and must vanish for a
+        single-token span, whose interval admits exactly one pivot tree.
+        """
+        vocab = TextVocabulary(
+            vocab_size=12, PAD=0, GAP=1, MASK=2, LEFT=3, RIGHT=4
+        )
+        model = IntervalInsideBoundaryModel(
+            vocab_size=vocab.vocab_size, gap_id=vocab.GAP, pad_id=vocab.PAD,
+            d_model=24, nhead=4, layers=1, max_positions=32, max_steps=8,
+            dropout=0.0,
+        )
+        model.eval()
+        examples = [
+            TextInfillingExample(
+                segments=((5,), (6,), (7,)), spans=((8, 9, 10, 11), (10,))
+            ),
+            TextInfillingExample(segments=((6,), (8,), (7,)), spans=((), (9, 5))),
+        ]
+        parts = decompose_exact_batch(
+            model, examples, vocab, torch.device("cpu")
+        )
+        reconstructed = (
+            parts["lexical"] + parts["structure"] + parts["tree_entropy"]
+        )
+        self.assertTrue(
+            torch.allclose(reconstructed, parts["total"], atol=1e-5)
+        )
+        self.assertTrue(bool((parts["tree_entropy"] >= -1e-6).all()))
+
+        single = [TextInfillingExample(segments=((5,), (6,)), spans=((8,),))]
+        single_parts = decompose_exact_batch(
+            model, single, vocab, torch.device("cpu")
+        )
+        self.assertAlmostEqual(
+            float(single_parts["tree_entropy"][0]), 0.0, places=5
+        )
 
     def test_shared_latent_exactly_marginalizes_and_nests_factorized_model(self):
         vocab = TextVocabulary(

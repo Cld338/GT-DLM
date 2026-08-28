@@ -68,12 +68,21 @@ def multi_depth_gap_log_likelihoods(
     context_offsets: torch.Tensor = None,
     interval_logits_fn=None,
     topology_logits_fn=None,
+    return_charts: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Return per-example exact/midpoint values and flat per-gap exact values.
 
     ``encoded`` lets finite-mixture extensions reuse the prompt Transformer.
     ``context_offsets`` has one row per example and conditions every gap chart
     in that example on the same shared latent regime.
+
+    ``return_charts`` appends a fourth value: the per-gap local weight charts
+    with the token and topology contributions kept separate, plus the root
+    STOP/non-STOP term. `decompose_multigap_likelihood.py` uses these to split
+    the exact log likelihood into lexical, structural, and tree-entropy parts
+    without duplicating chart construction. Component charts hold zero (not
+    ``-inf``) on unreachable entries so that they can be multiplied by
+    posterior marginals, which are zero there.
     """
     tokens, padding, roots = collate_multi_prompt_contexts(examples, vocab, device)
     interval_logits_fn = interval_logits_fn or model.interval_logits
@@ -103,6 +112,11 @@ def multi_depth_gap_log_likelihoods(
     gap_exact: List[torch.Tensor] = [gap_contexts.new_zeros(()) for _ in roots]
     gap_midpoint: List[torch.Tensor] = [gap_contexts.new_zeros(()) for _ in roots]
 
+    charts_out = (
+        {"combined": {}, "token": {}, "topology": {}, "root": {}}
+        if return_charts else None
+    )
+
     empty = [index for index, span in enumerate(spans) if not span]
     if empty:
         indices = torch.tensor(empty, dtype=torch.long, device=device)
@@ -114,6 +128,8 @@ def multi_depth_gap_log_likelihoods(
         for offset, gap_index in enumerate(empty):
             gap_exact[gap_index] = values[offset]
             gap_midpoint[gap_index] = values[offset]
+            if return_charts:
+                charts_out["root"][gap_index] = values[offset]
 
     records = []
     root_records: Dict[int, int] = {}
@@ -179,15 +195,21 @@ def multi_depth_gap_log_likelihoods(
             )
             for index, span in enumerate(spans) if span
         }
+        if return_charts:
+            for index, chart in charts.items():
+                charts_out["token"][index] = torch.zeros_like(chart)
+                charts_out["topology"][index] = torch.zeros_like(chart)
         cursor = 0
         for record_index, (gap_index, depth, lo, hi) in enumerate(records):
             width = hi - lo
             pivots = torch.arange(cursor, cursor + width, device=device)
             target_span = span_tensors[gap_index]
-            charts[gap_index][depth, lo, hi, lo:hi] = (
-                token_logp[record_index, token_index[target_span[lo:hi]]]
-                + topology[pivots, targets[pivots]]
-            )
+            token_term = token_logp[record_index, token_index[target_span[lo:hi]]]
+            topology_term = topology[pivots, targets[pivots]]
+            charts[gap_index][depth, lo, hi, lo:hi] = token_term + topology_term
+            if return_charts:
+                charts_out["token"][gap_index][depth, lo, hi, lo:hi] = token_term
+                charts_out["topology"][gap_index][depth, lo, hi, lo:hi] = topology_term
             cursor += width
         for length in range(1, 9):
             group = [index for index, span in enumerate(spans) if len(span) == length]
@@ -202,6 +224,9 @@ def multi_depth_gap_log_likelihoods(
             for offset, gap_index in enumerate(group):
                 gap_exact[gap_index] = exact[offset]
                 gap_midpoint[gap_index] = midpoint[offset]
+                if return_charts:
+                    charts_out["combined"][gap_index] = charts[gap_index]
+                    charts_out["root"][gap_index] = roots_open[offset]
 
     flat_exact = torch.stack(gap_exact)
     flat_midpoint = torch.stack(gap_midpoint)
@@ -210,6 +235,9 @@ def multi_depth_gap_log_likelihoods(
     owner = torch.tensor([root[0] for root in roots], dtype=torch.long, device=device)
     example_exact.index_add_(0, owner, flat_exact)
     example_midpoint.index_add_(0, owner, flat_midpoint)
+    if return_charts:
+        charts_out["owner"] = owner
+        return example_exact, example_midpoint, flat_exact, charts_out
     return example_exact, example_midpoint, flat_exact
 
 
