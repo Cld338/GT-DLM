@@ -373,6 +373,65 @@ the one place where the tree model did lead on oracle-structure accuracy
 two-gap checkpoint is the natural next test, and it is the one that decides
 whether the objective is worth scaling.
 
+## Does pretraining move the top-1 deficit?
+
+That was the gating question, since the pretrained single-gap study is the one
+place the tree model has been reported ahead on oracle-structure accuracy.
+Everything needed to answer it was already on disk across earlier studies;
+`analyze_oracle_top1.py` consolidates it so the comparison can be audited
+rather than assembled from prose. Every row is the same measurement: gold
+length and balanced midpoint tree supplied, greedy decoding, token accuracy at
+matched length.
+
+| Model | Oracle top-1 | Per seed |
+|---|---:|---|
+| Depth exact, distilroberta backbone (87M) | **5.66%** | 4.7%, 6.7%, 5.6% |
+| Same architecture, random-init backbone *(capacity-matched control)* | 3.95% | -- |
+| Depth exact, 10M from scratch *(control)* | 1.94% | 2.6%, 1.2%, 2.1% |
+| Oracle-length masked baseline, 10M from scratch *(control)* | 3.72% | -- |
+
+**Pretraining does move it.** Against the capacity-matched random-init control
+the gain is `3.95% -> 5.66%`, `+1.7` points. Free-sample accuracy moves further
+in relative terms, `0.50% -> 2.33%`. So the top-1 deficit measured on the
+from-scratch two-gap checkpoints is not an intrinsic property of the objective;
+a pretrained backbone changes it, and the from-scratch pilot-scale result
+should not be generalized as if it were a statement about the method.
+
+**The cross-model claim is still confounded, and the project has been
+overstating it.** `research/PRETRAINED_CONTEXT_DEPTH.md` and the README record
+`5.7%` as "passing the oracle-length masked baseline's `3.7%` for the first
+time". That masked baseline is a 10M from-scratch model with neither the
+pretraining nor the capacity of the 87M pretrained tree model, so the
+comparison does not isolate the objective — the two differ in three ways at
+once. The tree model's `5.66%` should be read against its own `3.95%`
+capacity-matched control, which is a real and well-controlled `+1.7` points,
+and not against `3.72%`.
+
+The missing control is a masked baseline on the same pretrained backbone. It
+has never been built, and it is what a generation-quality claim would require.
+
+## Where this leaves the scale-up decision
+
+The picture is genuinely mixed and should not be collapsed either way.
+
+Against scaling: on matched two-gap checkpoints the likelihood advantage is
+large and the top-1 advantage is zero, and five mechanisms for the generation
+gap have been tested and rejected. Nothing yet demonstrates that better
+likelihood under this objective yields better text.
+
+For scaling: the from-scratch pilot is not the regime the method is proposed
+for, and the one lever tested — a pretrained backbone — moves top-1 accuracy by
+`+1.7` points against its own control. That is the only intervention so far
+that has moved this metric at all.
+
+What settles it is the missing control above, and it is a bounded piece of work
+rather than another exploratory screen: put the masked baseline on the same
+pretrained backbone, train both on the same two-gap corruptions at a matched
+budget, and measure oracle-structure top-1 accuracy. If the tree model leads
+there, the objective earns the scale-up. If it ties, the likelihood advantage
+is confirmed as decorative for generation purposes and the project's claim
+should be finalized as a likelihood-and-calibration result.
+
 ## Limits of this measurement
 
 The topology prior still peeks at the answer in one place. Its topology head is

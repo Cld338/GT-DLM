@@ -91,6 +91,7 @@ python measure_multigap_wallclock.py --device cuda --calibration-epochs 3 --arti
 python experiment_multigap_matched_training.py --device cuda --models sequential_filler,length_masked --epochs-per-model "sequential_filler=361,length_masked=212" --exact-checkpoint artifacts/text_multigap_matched_training/factorized_depth_exact.pt --artifact-dir artifacts/text_multigap_wallclock_matched
 python decompose_multigap_likelihood.py --device cuda --artifact-dir artifacts/text_multigap_decomposition
 python evaluate_multigap_generation.py --device cuda --artifact-dir artifacts/text_multigap_generation
+python analyze_oracle_top1.py --output-dir artifacts/text_oracle_top1_summary
 ```
 
 The experiment writes its metrics and checkpoints to `artifacts/`.
@@ -312,9 +313,12 @@ the exact depth-inside recurrence untouched, lowers test exact NLL to
 `21.658+/-0.051` across three training seeds, against `25.367` for the identical
 architecture trained from random backbone weights on the same budget. The paired
 gain over that capacity-matched control is `-3.709+/-0.051` nats with every
-interval excluding zero, and oracle-structure token accuracy rises to `5.7%`,
-passing the oracle-length masked baseline's `3.7%` for the first time. Two
-findings limit it: length calibration does not improve at all (raw TV
+interval excluding zero, and oracle-structure token accuracy rises to `5.7%`
+against its own capacity-matched control's `3.95%`. That comparison was
+previously stated as passing the oracle-length masked baseline's `3.7%`; it is
+withdrawn, because that baseline is a 10M from-scratch model differing from the
+87M pretrained tree model in pretraining and capacity as well as objective. Two
+further findings limit it: length calibration does not improve at all (raw TV
 `0.122+/-0.002` against the control's `0.121`, so the `TV < 0.20` gate is
 saturated rather than passed more convincingly), and the Wikipedia-derived pilot
 corpus overlaps the backbone's pretraining lineage, so held-out here does not
@@ -481,5 +485,13 @@ likelihood advantage produces no top-1 advantage at all. The gain is
 distributional rather than modal, which is why neither greedy decoding, which
 reads only the top token, nor sampling, which spreads across the distribution,
 converts it into better text. On current evidence this objective improves
-likelihood without improving generation. See
+likelihood without improving generation.
+
+Pretraining is the one intervention that moves top-1 accuracy. Consolidating
+every checkpoint's oracle-structure accuracy, the `distilroberta` backbone
+reaches `5.66%` against its capacity-matched random-init control's `3.95%`, a
+well-controlled `+1.7` points, so the from-scratch top-1 deficit is not
+intrinsic to the objective. The tree model has still never been compared with
+a *comparably pretrained* baseline, so no generation claim follows; building
+that baseline is the gating experiment. See
 `research/LIKELIHOOD_DECOMPOSITION.md`.

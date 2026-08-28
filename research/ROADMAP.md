@@ -58,8 +58,15 @@ with the exact depth-inside objective unchanged, gives test exact NLL
 `21.658+/-0.051` across three training seeds against `25.367` for the same
 architecture with randomly initialized backbone weights. The paired gain over
 that capacity-matched control is `-3.709+/-0.051` nats with all three intervals
-excluding zero. Oracle-structure token accuracy reaches `5.7%`, above the
-oracle-length masked baseline's `3.7%` for the first time.
+excluding zero. Oracle-structure token accuracy reaches `5.7%` against its own
+capacity-matched control's `3.95%`, a well-controlled `+1.7` points.
+
+This was previously recorded here as "above the oracle-length masked
+baseline's `3.7%` for the first time". That comparison is withdrawn: the
+masked baseline is a 10M from-scratch model with neither the pretraining nor
+the capacity of the 87M pretrained tree model, so it differs in three ways at
+once and does not isolate the objective. See
+`research/LIKELIHOOD_DECOMPOSITION.md`.
 
 The corpus-overlap objection has since been answered. On BBC News published
 five years after the backbone's pretraining lineage, the same control gives
@@ -295,15 +302,19 @@ The `research/PROPOSAL.md` hold on scaling to 50--100M therefore stands.
 10. **Completed:** oracle-structure against free generation for all three
    models. Compounding is rejected; the likelihood advantage is shown to be
    distributional rather than top-1 (`research/LIKELIHOOD_DECOMPOSITION.md`).
-11. **Next, and gating:** repeat that oracle-structure accuracy measurement on
-   a *pretrained* two-gap checkpoint. The pretrained single-gap study is the
-   only place the tree model has led on this metric (`5.7%` against `3.7%`),
-   so this decides whether the top-1 deficit is a property of the objective or
-   of training from scratch at pilot scale. If the lead does not appear, the
-   objective improves likelihood without improving generation and scaling it
-   is not warranted on current evidence.
-12. Re-evaluate the scale-up gate (below).
-13. Optional: a genuine top-down rollout, closing the residual gap between
+11. **Completed:** consolidated oracle-structure top-1 accuracy across every
+   checkpoint (`analyze_oracle_top1.py`). Pretraining moves the metric by
+   `+1.7` points against its capacity-matched control (`3.95% -> 5.66%`), so
+   the top-1 deficit is not intrinsic to the objective. The tree model's lead
+   over the masked baseline is withdrawn as confounded.
+12. **Next, and gating:** build the missing control — a masked baseline on the
+   same pretrained backbone, trained on the same two-gap corruptions at a
+   matched budget — and compare oracle-structure top-1 accuracy. This is the
+   only comparison that isolates the objective from pretraining and capacity,
+   and it decides the scale-up: a lead earns it, a tie finalizes the project
+   as a likelihood-and-calibration result.
+13. Re-evaluate the scale-up gate (below).
+14. Optional: a genuine top-down rollout, closing the residual gap between
    gold-token and self-generated-token conditioning in the topology head.
 
 ## Currently claimable
@@ -344,6 +355,11 @@ two-gap checkpoints the likelihood advantage is distributional, not modal:
 under oracle structure the exact model's token accuracy (`4.0%`) is no better
 than the masked baseline's (`4.2%`) despite a `1.36` nat per token likelihood
 lead. Five candidate explanations for poor generation have been tested and
-rejected, including compounding. On current evidence this objective improves
-likelihood without improving generation, and item 11 is the test that decides
-whether a pretrained backbone changes that.
+rejected, including compounding.
+
+Pretraining is the one intervention that moves top-1 accuracy: `+1.7` points
+against its capacity-matched control (`3.95% -> 5.66%`), so the from-scratch
+deficit is not intrinsic to the objective. But the tree model has never been
+compared against a *comparably pretrained* baseline, so no generation claim
+follows from that either. Item 12 is that missing control, and it decides the
+scale-up.
