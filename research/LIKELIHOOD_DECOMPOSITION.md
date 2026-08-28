@@ -465,19 +465,63 @@ that decides the scale-up, with "a tie finalizes the project as a
 likelihood-and-calibration result". It is not a tie; it is a loss, so the
 conclusion is stronger than the one that was prepared for.
 
-One asymmetry should be stated plainly rather than used as a defence. Filling
-masks is precisely the task `distilroberta` was pretrained on, so the baseline
-draws more from the backbone than the tree model can while adapting it to an
-interval chart. That is real. It is also the finding: where a pretrained masked
-encoder is available, using it directly beats adapting it to this objective, on
-this task at this scale.
+## What this comparison is, and is not, evidence about
+
+The reading above was that the *objective* loses. Inspecting how each model
+actually reaches the backbone shows that is too strong, and names a confound
+large enough to plausibly account for the whole gap.
+
+The two arms use the pretrained encoder in completely different ways:
+
+| | Masked baseline | Depth exact tree |
+|---|---|---|
+| Prompt rendered as | `left + <mask> x n + right` | `left + <mask> + right` |
+| Backbone output used | every mask position's state | **one** vector, `hidden[mask_position]` |
+| Per-prediction compute | all 6 transformer layers, full attention | one `Linear(2304 -> 768)` + norm |
+| Conditioning per node | contextualized, position-aware, sees `n` | shared summary vector, two *static* boundary embeddings, depth |
+
+`PretrainedIntervalEncoder.forward` collapses the prompt to
+`context_norm(hidden[rows, mask_positions])` — a single 768-dimensional vector
+— and `interval_hidden` then scores every one of the `O(D n^3)` chart cells
+from that vector plus static embeddings of the two boundary tokens. The
+backbone is effectively demoted to a sentence encoder. This is deliberate (its
+docstring notes the backbone "runs once per observed prompt", since running it
+per chart cell is intractable), but the cost is severe.
+
+Three observations are consistent with that being the dominant cause rather
+than the objective:
+
+1. **Pretraining barely reaches the tree model.** Its oracle-structure accuracy
+   moves only `3.95% -> 5.66%`, `+1.7` points, while the same backbone carries
+   the masked baseline to `12.56%`. A model that were genuinely exploiting the
+   encoder would gain far more from pretraining it.
+2. **The likelihood gain was large where the accuracy gain was not**
+   (`-3.709` nats). A good summary vector fixes global properties — length,
+   register, topic — which is what NLL rewards, while choosing the exact token
+   at one position needs fine-grained positional context, which is what the
+   bottleneck destroys. This is the same distributional-not-modal dissociation
+   found earlier, now with a mechanism.
+3. **The tree context carries no within-span position at all.** Position enters
+   only through depth and boundary token *identity*, so two intervals with the
+   same boundary tokens at the same depth are indistinguishable wherever they
+   sit. The masked baseline additionally sees the span length directly, since
+   it renders `n` masks; the tree encoder always renders one and is invariant
+   to `n`.
+
+So what was measured is **"exact tree objective plus a single-vector encoder
+bottleneck" against "masked objective with the full encoder"**, not objective
+against objective. The result stands as an implementation-level comparison —
+the tree model as currently built does lose, and by a wide margin — but it is
+weak evidence about the objective itself.
+
+The confound is testable and the test is cheap; it is set out at the end of
+this document.
 
 Limits. Both arms are three seeds with non-overlapping ranges, so seed noise
 is excluded. The comparison is single-gap; the two-gap
 setting would need the same treatment. And it says nothing about the likelihood
 result, which stands — the exact model's NLL advantage is real, replicated and
-compute-matched. What it removes is the inference from that advantage to better
-text.
+compute-matched.
 
 ## Where this leaves the project
 
@@ -486,17 +530,22 @@ contribution: exact latent-tree marginalization, a `-5.9` to `-7.5` nat
 two-gap advantage that holds under wall-clock matching and under scoring by the
 model's own tree head, and passing length calibration.
 
-The generation claim is now closed negatively. On the metric that matters for
-text, a matched pretrained baseline is roughly twice as good. Scaling this
-objective to 50--100M should be expected to widen the likelihood advantage
-while leaving generation behind that baseline, because likelihood and top-1
-accuracy have been shown decoupled here and the one matched cross-model
-comparison goes the wrong way.
+The generation claim is closed negatively **for the current architecture**. On
+the metric that matters for text a matched pretrained baseline is roughly twice
+as good, and the scale-up hold stands: there is no point scaling a
+configuration that loses to a plain masked model on generation.
 
-The honest framing for a writeup is a method that buys exact, well-calibrated
-joint probability over variable-length spans, with a negative result attached:
-on this task that probability does not convert into better generation than
-using a pretrained masked encoder directly.
+What is *not* established is that the objective is responsible. The encoder
+integration compresses the entire prompt into one vector before the chart ever
+runs, so the measured gap confounds the objective with that bottleneck. Until
+the matched-encoder test below is run, the defensible statement is about this
+implementation, not about exact latent-tree marginalization as such.
+
+The honest framing for a writeup, pending that test, is a method that buys
+exact, well-calibrated joint probability over variable-length spans, with a
+negative result attached: as currently integrated with a pretrained encoder,
+that probability does not convert into better generation than using the
+encoder directly for mask filling.
 
 ## Limits of this measurement
 
@@ -508,9 +557,30 @@ on the token the model just generated. The bracket has narrowed from
 between gold-token and self-generated-token conditioning in the topology head.
 
 Closing it needs a genuine top-down rollout, which is sampling-based and
-noisier than any arm here. That is worth doing only if the structural
-hypothesis above needs further discrimination; the cheaper and more directly
-useful next step is to attack the structural deficit itself.
+noisier than any arm here.
+
+## The matched-encoder test
+
+The generation comparison confounds the objective with the single-vector
+encoder bottleneck described above, and the fix is small.
+
+Render the span with `n` masks exactly as the baseline does, keep the `n`
+contextualized states, and let chart cell `(d, lo, hi, pivot)` read
+`state[pivot]` instead of the shared summary vector. The backbone still runs
+once per example; the encoder returns `n` vectors instead of one; the inside
+recurrence is untouched. That equalizes how much of the pretrained encoder each
+arm gets to use, and turns the comparison into objective against objective.
+
+One scope note. At scoring time the length is known — teacher-forced
+likelihood and oracle-structure decoding both supply it — so rendering `n`
+masks is legitimate there, and oracle-structure accuracy is precisely where the
+deficit was measured. Free generation, where `n` is unknown, would need a
+separate treatment and is not required to answer this question.
+
+If the tree model closes most of the gap under matched encoder usage, the
+negative result is about this integration and the objective is still open. If
+it does not, the objective itself is implicated and the current conclusion
+stands on firmer ground.
 
 Evaluator: `decompose_multigap_likelihood.py`. Artifacts:
 `artifacts/text_multigap_decomposition`.

@@ -25,11 +25,16 @@ rejected, compounding in recursive decoding included. What replaces them is a
 dissociation: the likelihood advantage is distributional, not top-1, so under
 oracle structure the exact model is no more accurate than the masked baseline.
 
-The generation question is now closed, negatively. Against a masked baseline
-given the *same* pretrained backbone, stream, split and budget, the tree model
-reaches `5.66%` oracle-structure token accuracy to the baseline's `12.56%`.
-The likelihood result stands; the inference from it to better text does not,
-and scaling on generation grounds is not warranted.
+The generation question is closed negatively **for the current architecture**.
+Against a masked baseline given the *same* pretrained backbone, stream, split
+and budget, the tree model reaches `5.66%` oracle-structure token accuracy to
+the baseline's `12.56%`. But the two arms use that backbone very differently:
+the tree encoder collapses the whole prompt into a single vector before the
+chart runs, while the baseline keeps a contextualized state per masked
+position. The measured gap therefore confounds the objective with that
+bottleneck. Scaling the current configuration is not warranted; whether the
+objective is at fault is open, and the matched-encoder test in
+`research/LIKELIHOOD_DECOMPOSITION.md` decides it.
 
 ## What is established
 
@@ -282,13 +287,17 @@ compute. The oracle-length gap must be reported either way.
 | Gap-composition slice | Synthetic passes; text has likelihood plus per-gap and total-length calibration evidence, but exact ordered-pair calibration remains weak |
 | Compute-matched AR competitiveness | **Passed on likelihood.** The sequential filler is this project's autoregressive baseline (`research/NATURAL_LANGUAGE_PILOT.md`). Retrained for a wall-clock budget matching the exact model's own training cost (361 vs 30 epochs), it loses two-gap joint NLL by `-5.916 [-6.594,-5.248]`, and the advantage survives scoring under the model's own tree head at `-5.557 [-6.194,-4.950]`. Not compared on standard LM perplexity or against an external AR implementation, and the gate's "without material edit-similarity loss" clause is failed separately under generation quality |
 
-The `research/PROPOSAL.md` hold on scaling to 50--100M therefore stands, and it
-should now be read as a settled decision rather than a pending one. The gate
-asks for improvement "without material IID edit-similarity loss"; the matched
-pretrained control shows the tree model at roughly half the masked baseline's
-oracle-structure token accuracy (`5.66%` against `12.56%`), so the clause is
-failed by a clear margin, not by a narrow one awaiting more evidence. Scaling
-this objective for generation quality is not warranted on the current record.
+The `research/PROPOSAL.md` hold on scaling to 50--100M therefore stands. The
+gate asks for improvement "without material IID edit-similarity loss"; the
+matched pretrained control shows the tree model at roughly half the masked
+baseline's oracle-structure token accuracy (`5.66%` against `12.56%`), so the
+clause is failed by a clear margin. Scaling the current configuration is not
+warranted.
+
+The hold should not yet be read as a settled verdict on the objective. The two
+arms use the pretrained encoder very differently, and the matched-encoder test
+(recommended order item 13) is what would convert this into a settled
+decision either way.
 
 ## Recommended order
 
@@ -337,16 +346,21 @@ this objective for generation quality is not warranted on the current record.
    `+1.7` points against its capacity-matched control (`3.95% -> 5.66%`), so
    the top-1 deficit is not intrinsic to the objective. The tree model's lead
    over the masked baseline is withdrawn as confounded.
-12. **Completed, and decisive against the objective:** the masked baseline on
-   the same pretrained backbone (85.2M against 87.0M), same stream, split and
-   budget, reaches `12.56%` oracle-structure top-1 accuracy against the tree
-   model's `5.66%` in 3/3 seeds with non-overlapping ranges, and token NLL
-   `5.872+/-0.027` against `6.161`. The preregistered
-   reading was that a tie would finalize the project as a
-   likelihood-and-calibration result; this is a loss, so that conclusion holds
-   more strongly (`research/LIKELIHOOD_DECOMPOSITION.md`).
-13. Re-evaluate the scale-up gate (below).
-14. Optional: a genuine top-down rollout, closing the residual gap between
+12. **Completed, decisive about the implementation rather than the objective:**
+   the masked baseline on the same pretrained backbone (85.2M against 87.0M),
+   same stream, split and budget, reaches `12.56%` oracle-structure top-1
+   accuracy against the tree model's `5.66%` in 3/3 non-overlapping seeds, with
+   token NLL `5.872+/-0.027` against `6.161`. The two arms do not use the
+   encoder comparably, so this does not isolate the objective
+   (`research/LIKELIHOOD_DECOMPOSITION.md`).
+13. **Next, and gating:** the matched-encoder test. Give the chart one
+   contextualized state per span position instead of a single shared summary
+   vector, so both arms exploit the backbone equally. One backbone pass per
+   example either way and the inside recurrence is unchanged. If the tree model
+   closes most of the gap, the negative result is about the integration and the
+   objective is still open; if not, the objective is implicated.
+14. Re-evaluate the scale-up gate (below).
+15. Optional: a genuine top-down rollout, closing the residual gap between
    gold-token and self-generated-token conditioning in the topology head.
 
 ## Currently claimable
@@ -389,15 +403,28 @@ than the masked baseline's (`4.2%`) despite a `1.36` nat per token likelihood
 lead. Five candidate explanations for poor generation have been tested and
 rejected, including compounding.
 
+The matched pretrained control shows the current configuration losing to a
+plain masked model by roughly a factor of two. That is a fact about this
+implementation. Whether the objective is responsible is unresolved: the tree
+encoder hands the chart one summary vector where the baseline gets the full
+transformer stack per prediction, so the two are not comparable uses of the
+same backbone.
+
 Pretraining is the one intervention that moves top-1 accuracy: `+1.7` points
 against its capacity-matched control (`3.95% -> 5.66%`), so the from-scratch
 deficit is not intrinsic to the objective.
 
-The matched cross-model control has since been built and settles it against the
-objective. Given the same backbone, stream, split and budget, the masked
-baseline reaches `12.56%` oracle-structure accuracy against the tree model's
-`5.66%` in 3/3 seeds with non-overlapping ranges, and token NLL `5.872` against
-`6.161`. The tree model's earlier lead
+The matched cross-model control has since been built. Given the same backbone,
+stream, split and budget, the masked baseline reaches `12.56%` oracle-structure
+accuracy against the tree model's `5.66%` in 3/3 seeds with non-overlapping
+ranges, and token NLL `5.872` against `6.161`. The tree model's earlier lead
 over a `3.72%` baseline was an artifact of that baseline lacking pretraining
-and capacity. Where a pretrained masked encoder exists, using it directly beats
-adapting it to this objective on this task.
+and capacity.
+
+That control is decisive about the current implementation and weak about the
+objective. `PretrainedIntervalEncoder` compresses the prompt into one
+768-dimensional vector, and a single linear layer then scores every one of the
+`O(D n^3)` chart cells from it plus static boundary embeddings, while the
+baseline runs all six transformer layers per prediction. Pretraining moves the
+tree model only `+1.7` points while carrying the baseline to `12.56%`, which is
+what an unused encoder looks like. The matched-encoder test is now gating.

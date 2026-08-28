@@ -496,18 +496,21 @@ reaches `5.66%` against its capacity-matched random-init control's `3.95%`, a
 well-controlled `+1.7` points, so the from-scratch top-1 deficit is not
 intrinsic to the objective.
 
-The matched cross-model control then settles the generation question against
-the objective. Giving the learned-length-plus-masks baseline the *same*
+The matched cross-model control then settles the generation question for the
+current architecture. Giving the learned-length-plus-masks baseline the *same*
 backbone (85.2M against 87.0M), the same corruption stream, splits and budget,
 it reaches `12.56%` oracle-structure token accuracy to the tree model's
 `5.66%` in 3/3 seeds whose ranges do not overlap, with held-out token NLL
-`5.872+/-0.027` against `6.161`. The tree model's
-previously reported lead over a `3.72%` baseline was an artifact of that
-baseline lacking both pretraining and capacity. Filling masks is the task the
-backbone was pretrained on, so the baseline draws more from it -- which is the
-finding rather than a defence: where a pretrained masked encoder is available,
-using it directly beats adapting it to this objective on this task.
+`5.872+/-0.027` against `6.161`. The tree model's previously reported lead over
+a `3.72%` baseline was an artifact of that baseline lacking both pretraining
+and capacity.
 
-The likelihood results stand and are the project's contribution; the inference
-from them to better generation does not. See
-`research/LIKELIHOOD_DECOMPOSITION.md`.
+That result is decisive about the implementation and weak about the objective.
+The two arms reach the backbone very differently: `PretrainedIntervalEncoder`
+collapses the prompt into a single 768-dimensional vector, from which one
+linear layer scores every `O(D n^3)` chart cell over static boundary
+embeddings, while the baseline runs all six transformer layers for every
+prediction. Pretraining moves the tree model only `+1.7` points while carrying
+the baseline to `12.56%` -- what an unused encoder looks like. The measured gap
+therefore confounds the objective with that bottleneck, and a matched-encoder
+test is the gating experiment. See `research/LIKELIHOOD_DECOMPOSITION.md`.
