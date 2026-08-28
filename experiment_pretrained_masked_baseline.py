@@ -161,6 +161,12 @@ def main():
     parser.add_argument("--max-validation-examples", type=int, default=128)
     parser.add_argument("--seed", type=int, default=-1)
     parser.add_argument("--random-init-backbone", action="store_true")
+    parser.add_argument(
+        "--bottleneck-context", action="store_true",
+        help="restrict the token pass to the single mask-token summary vector "
+             "the interval chart is limited to, isolating encoder access from "
+             "the objective (research/LIKELIHOOD_DECOMPOSITION.md)",
+    )
     parser.add_argument("--local-files-only", action="store_true")
     args = parser.parse_args()
 
@@ -213,8 +219,10 @@ def main():
         model_name=args.model_name, cache_dir=args.cache_dir,
         max_length=args.max_length, local_files_only=args.local_files_only,
         random_init_backbone=args.random_init_backbone,
+        bottleneck_context=args.bottleneck_context,
     ).to(device)
-    print("pretrained masked baseline: {:,} parameters, {} train documents".format(
+    print("pretrained masked baseline{}: {:,} parameters, {} train documents".format(
+        " [bottleneck context]" if args.bottleneck_context else "",
         parameter_count(model), len(source)))
 
     backbone_ids = {id(p) for p in model.encoder.backbone.parameters()}

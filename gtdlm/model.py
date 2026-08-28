@@ -860,6 +860,7 @@ class PretrainedLengthMaskedModel(nn.Module):
         pretrained_tokenizer=None,
         initialize_custom_embeddings: bool = True,
         tie_token_embeddings: bool = True,
+        bottleneck_context: bool = False,
     ) -> None:
         super().__init__()
         self.encoder = PretrainedIntervalEncoder(
@@ -884,6 +885,16 @@ class PretrainedLengthMaskedModel(nn.Module):
         self.token_head = nn.Linear(d_model, vocab_size)
         if tie_token_embeddings:
             self.token_head.weight = self.encoder.token_embedding.weight
+        # Diagnostic arm. With bottleneck_context the token pass reads the same
+        # single mask-token summary vector the interval chart is restricted to,
+        # plus a within-span position embedding, instead of one contextualized
+        # state per masked position. The objective is unchanged, so comparing
+        # the two isolates how much of the tree model's generation deficit is
+        # its encoder integration rather than its objective.
+        self.bottleneck_context = bottleneck_context
+        self.span_position = (
+            nn.Embedding(max_span, d_model) if bottleneck_context else None
+        )
 
     @property
     def d_model(self) -> int:
@@ -953,6 +964,19 @@ class PretrainedLengthMaskedModel(nn.Module):
         padding_mask: Optional[torch.Tensor] = None,
         mask_counts: Optional[Sequence[int]] = None,
     ):
+        if self.bottleneck_context:
+            # One mask, one summary vector, every span token predicted from it.
+            summary, _ = self._encode_with_masks(tokens, padding_mask, None)
+            width = max(1, max(int(c) for c in mask_counts)) if mask_counts else 1
+            width = min(width, int(self.span_position.num_embeddings))
+            positions = torch.arange(width, device=summary.device)
+            states = summary[:, :1] + self.span_position(positions).unsqueeze(0)
+            valid = torch.zeros(
+                (states.size(0), width), dtype=torch.bool, device=states.device
+            )
+            for row, count in enumerate(mask_counts or [width] * states.size(0)):
+                valid[row, :min(int(count), width)] = True
+            return self.token_head(states), valid
         states, valid = self._encode_with_masks(tokens, padding_mask, mask_counts)
         return self.token_head(states), valid
 

@@ -582,5 +582,63 @@ negative result is about this integration and the objective is still open. If
 it does not, the objective itself is implicated and the current conclusion
 stands on firmer ground.
 
+### The test as actually run, and its result
+
+Giving the *tree* model per-position states turns out to be the wrong way to
+run it: those states depend on the number of masks rendered, so the model
+becomes `p(x | n)` and stops predicting length jointly — the objective changes
+and the comparison is confounded again.
+
+The clean version runs in the other direction. Hold the objective fixed at
+*masked* and cut the baseline's encoder access down to the tree model's:
+render one mask, take the single summary vector, and predict every span token
+from it plus a within-span position embedding
+(`--bottleneck-context`). Encoder access is then the only variable.
+
+| Arm | Oracle top-1 | Per seed | Token NLL |
+|---|---:|---|---:|
+| Masked, full encoder | **12.56%** | 11.9 / 13.0 / 12.8 | **5.873+/-0.027** |
+| Masked, bottlenecked encoder | 6.74% | 6.7 / 7.0 / 6.5 | 6.814+/-0.046 |
+| Depth exact tree | 5.66% | 4.7 / 6.7 / 5.6 | 6.161 |
+
+**Roughly 84% of the generation gap is encoder access, not the objective.** The
+gap to explain was `6.90` points; bottlenecking the encoder removes `5.81` of
+them with the objective untouched, leaving a residual of `1.09` points between
+the bottlenecked masked model and the tree model. Three seeds, standard
+deviation `0.23` points.
+
+The comparison is tilted *against* this conclusion, which strengthens it: the
+bottlenecked baseline is handed an explicit within-span position embedding,
+where the tree model gets only depth and boundary-token identity. It collapses
+to near the tree model's level anyway.
+
+Token NLL points the same way and slightly further. At comparable encoder
+access the tree objective is *ahead* — `6.161` against `6.814` — consistent
+with every other likelihood comparison in this project. Read that with care:
+the tree figure is scored along the midpoint tree with gold boundary tokens,
+so it enjoys conditioning the parallel masked pass does not, and the two are
+not as cleanly matched as the accuracy column.
+
+### What this changes
+
+The generation result is largely an artifact of how the pretrained encoder was
+attached, not evidence against exact latent-tree marginalization. The
+project's earlier framing — "using a pretrained masked encoder directly beats
+adapting it to this objective" — should be read as a statement about
+`PretrainedIntervalEncoder`, which pools the prompt to one vector before the
+chart runs.
+
+A residual of `1.09` points remains and should not be explained away. It is
+the honest upper bound on what the objective itself might cost at this scale,
+and it is small next to the `5.81` points attributable to the encoder.
+
+The forward path is an encoder integration that keeps per-node context without
+presupposing the span length. Two candidates, neither yet tried: render a
+fixed number of masks (`max_span`) regardless of the true length, so the chart
+can read `state[pivot]` without `n` leaking; or keep the backbone's states over
+the observed left and right segments and let the interval head attend over
+them instead of consuming a single pooled vector. The second is the more
+principled, since it never presupposes anything about the span.
+
 Evaluator: `decompose_multigap_likelihood.py`. Artifacts:
 `artifacts/text_multigap_decomposition`.

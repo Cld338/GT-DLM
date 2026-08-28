@@ -92,6 +92,7 @@ python experiment_multigap_matched_training.py --device cuda --models sequential
 python decompose_multigap_likelihood.py --device cuda --artifact-dir artifacts/text_multigap_decomposition
 python evaluate_multigap_generation.py --device cuda --artifact-dir artifacts/text_multigap_generation
 python experiment_pretrained_masked_baseline.py --device cuda --artifact-dir artifacts/text_pretrained_masked_baseline
+python experiment_pretrained_masked_baseline.py --device cuda --bottleneck-context --artifact-dir artifacts/text_pretrained_masked_bottleneck
 python analyze_oracle_top1.py --output-dir artifacts/text_oracle_top1_summary
 ```
 
@@ -505,12 +506,24 @@ it reaches `12.56%` oracle-structure token accuracy to the tree model's
 a `3.72%` baseline was an artifact of that baseline lacking both pretraining
 and capacity.
 
-That result is decisive about the implementation and weak about the objective.
+That result turns out to be about the implementation rather than the objective.
 The two arms reach the backbone very differently: `PretrainedIntervalEncoder`
 collapses the prompt into a single 768-dimensional vector, from which one
 linear layer scores every `O(D n^3)` chart cell over static boundary
 embeddings, while the baseline runs all six transformer layers for every
-prediction. Pretraining moves the tree model only `+1.7` points while carrying
-the baseline to `12.56%` -- what an unused encoder looks like. The measured gap
-therefore confounds the objective with that bottleneck, and a matched-encoder
-test is the gating experiment. See `research/LIKELIHOOD_DECOMPOSITION.md`.
+prediction.
+
+Holding the objective fixed at masked and cutting the baseline's encoder access
+down to that same single pooled vector drops it from `12.56%` to
+`6.74%+/-0.23` -- removing `5.81` of the `6.90` point gap, about `84%`, in 3/3
+seeds. The residual between the bottlenecked baseline and the tree model is
+`1.09` points. At comparable encoder access the tree objective is ahead on
+token NLL (`6.161` against `6.814+/-0.046`). The comparison is tilted against
+this conclusion, since the bottlenecked baseline is handed an explicit
+within-span position embedding where the tree model gets only depth and
+boundary-token identity, and it collapses anyway.
+
+So the generation deficit is mostly how the pretrained encoder was attached,
+not exact latent-tree marginalization. What needs fixing is an integration that
+gives the chart per-node context without presupposing the span length. See
+`research/LIKELIHOOD_DECOMPOSITION.md`.

@@ -25,16 +25,16 @@ rejected, compounding in recursive decoding included. What replaces them is a
 dissociation: the likelihood advantage is distributional, not top-1, so under
 oracle structure the exact model is no more accurate than the masked baseline.
 
-The generation question is closed negatively **for the current architecture**.
-Against a masked baseline given the *same* pretrained backbone, stream, split
-and budget, the tree model reaches `5.66%` oracle-structure token accuracy to
-the baseline's `12.56%`. But the two arms use that backbone very differently:
-the tree encoder collapses the whole prompt into a single vector before the
-chart runs, while the baseline keeps a contextualized state per masked
-position. The measured gap therefore confounds the objective with that
-bottleneck. Scaling the current configuration is not warranted; whether the
-objective is at fault is open, and the matched-encoder test in
-`research/LIKELIHOOD_DECOMPOSITION.md` decides it.
+The generation gap has since been attributed, and it is mostly **not** the
+objective. Against a masked baseline on the same pretrained backbone the tree
+model reaches `5.66%` oracle-structure token accuracy to the baseline's
+`12.56%` — but cutting that baseline's encoder access down to the tree model's
+single pooled vector, with its objective untouched, drops it to `6.74%`. That
+removes `5.81` of the `6.90` point gap, about `84%`, leaving a `1.09` point
+residual. At comparable encoder access the tree objective is ahead on token
+NLL. Scaling the current configuration is still not warranted, but what needs
+fixing is the encoder integration, not the objective. See
+`research/LIKELIHOOD_DECOMPOSITION.md`.
 
 ## What is established
 
@@ -294,10 +294,11 @@ baseline's oracle-structure token accuracy (`5.66%` against `12.56%`), so the
 clause is failed by a clear margin. Scaling the current configuration is not
 warranted.
 
-The hold should not yet be read as a settled verdict on the objective. The two
-arms use the pretrained encoder very differently, and the matched-encoder test
-(recommended order item 13) is what would convert this into a settled
-decision either way.
+The hold is not a verdict on the objective. The encoder-access test attributes
+`84%` of the generation gap to how the pretrained encoder is attached, so what
+the hold blocks is scaling *this integration*. An encoder integration that
+gives the chart per-node context without presupposing span length (recommended
+order item 14) is the thing to try before the gate is re-run.
 
 ## Recommended order
 
@@ -353,14 +354,19 @@ decision either way.
    token NLL `5.872+/-0.027` against `6.161`. The two arms do not use the
    encoder comparably, so this does not isolate the objective
    (`research/LIKELIHOOD_DECOMPOSITION.md`).
-13. **Next, and gating:** the matched-encoder test. Give the chart one
-   contextualized state per span position instead of a single shared summary
-   vector, so both arms exploit the backbone equally. One backbone pass per
-   example either way and the inside recurrence is unchanged. If the tree model
-   closes most of the gap, the negative result is about the integration and the
-   objective is still open; if not, the objective is implicated.
-14. Re-evaluate the scale-up gate (below).
-15. Optional: a genuine top-down rollout, closing the residual gap between
+13. **Completed:** the encoder-access test, run by bottlenecking the *masked*
+   baseline rather than enriching the tree model (per-position states would
+   have made the tree model `p(x|n)` and changed the objective). Holding the
+   objective fixed, cutting encoder access to one pooled vector drops the
+   baseline `12.56% -> 6.74%`, explaining `84%` of the gap in 3/3 seeds
+   (sd `0.23` points) (`research/LIKELIHOOD_DECOMPOSITION.md`).
+14. **Next:** an encoder integration that gives the chart per-node context
+   without presupposing the span length — either a fixed `max_span` mask
+   canvas so `state[pivot]` carries no length information, or an interval head
+   that attends over the backbone's states for the observed segments instead
+   of consuming one pooled vector. The second is the more principled.
+15. Re-evaluate the scale-up gate (below).
+16. Optional: a genuine top-down rollout, closing the residual gap between
    gold-token and self-generated-token conditioning in the topology head.
 
 ## Currently claimable
@@ -404,11 +410,10 @@ lead. Five candidate explanations for poor generation have been tested and
 rejected, including compounding.
 
 The matched pretrained control shows the current configuration losing to a
-plain masked model by roughly a factor of two. That is a fact about this
-implementation. Whether the objective is responsible is unresolved: the tree
-encoder hands the chart one summary vector where the baseline gets the full
-transformer stack per prediction, so the two are not comparable uses of the
-same backbone.
+plain masked model by roughly a factor of two, but that is attributable to the
+encoder integration rather than the objective: bottlenecking the baseline's
+encoder to the tree model's single pooled vector, objective untouched, removes
+`84%` of the gap.
 
 Pretraining is the one intervention that moves top-1 accuracy: `+1.7` points
 against its capacity-matched control (`3.95% -> 5.66%`), so the from-scratch
@@ -421,10 +426,13 @@ ranges, and token NLL `5.872` against `6.161`. The tree model's earlier lead
 over a `3.72%` baseline was an artifact of that baseline lacking pretraining
 and capacity.
 
-That control is decisive about the current implementation and weak about the
+That control turned out to be decisive about the implementation, not the
 objective. `PretrainedIntervalEncoder` compresses the prompt into one
 768-dimensional vector, and a single linear layer then scores every one of the
 `O(D n^3)` chart cells from it plus static boundary embeddings, while the
-baseline runs all six transformer layers per prediction. Pretraining moves the
-tree model only `+1.7` points while carrying the baseline to `12.56%`, which is
-what an unused encoder looks like. The matched-encoder test is now gating.
+baseline runs all six transformer layers per prediction. Cutting the baseline's
+encoder access to that same single vector, with its objective unchanged, drops
+it from `12.56%` to `6.74%` — `84%` of the gap, in 3/3 seeds. At comparable
+encoder access the tree objective is ahead on token NLL (`6.161` against
+`6.814`). The `1.09` point residual is the honest upper bound on what the
+objective itself costs here.
