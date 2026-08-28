@@ -50,7 +50,10 @@ from evaluate_text_sequence_likelihoods import (
 )
 from experiment import choose_device
 from experiment_text_depth_inside_multigap import multi_depth_gap_log_likelihoods
-from gtdlm.inside import batched_depth_inside_log_partition
+from gtdlm.inside import (
+    batched_depth_inside_log_partition,
+    batched_depth_midpoint_tree_log_weight,
+)
 from gtdlm.model import (
     GapTreeFactorizedBoundaryModel,
     IntervalInsideBoundaryModel,
@@ -65,6 +68,12 @@ from gtdlm.text_data import (
 from gtdlm.text_tokenizer import vocabulary_from_tokenizer
 
 COMPONENTS = ("lexical", "structure", "tree_entropy")
+REPORT_ORDER = (
+    "factorized_depth_exact",
+    "factorized_depth_exact_midpoint_tree",
+    "sequential_filler",
+    "length_masked",
+)
 
 
 def decompose_exact_batch(
@@ -72,12 +81,35 @@ def decompose_exact_batch(
     examples: Sequence[TextInfillingExample],
     vocab: TextVocabulary,
     device: torch.device,
+    tree: str = "posterior",
 ) -> Dict[str, torch.Tensor]:
-    """Return per-example lexical/structure/tree-entropy parts for one batch."""
+    """Return per-example lexical/structure/tree-entropy parts for one batch.
+
+    ``tree`` selects which distribution over trees the token and topology
+    expectations are taken under.
+
+    ``"posterior"`` uses ``q(T | x)``, the gold-conditioned tree posterior. Its
+    edge marginals are the gradient of the inside log partition. This is the
+    split of the reported exact likelihood.
+
+    ``"midpoint"`` uses the deterministic midpoint tree, whose pivots are
+    ``(lo + hi) // 2`` and therefore depend on the span length alone, never on
+    which tokens the span contains. Its "marginals" are the gradient of a plain
+    sum, so they are 0/1 indicators of the single tree's edges, and the entropy
+    term is identically zero. Comparing the two isolates how much of the
+    lexical advantage requires choosing the tree with knowledge of the answer.
+    """
+    if tree not in ("posterior", "midpoint"):
+        raise ValueError("tree must be 'posterior' or 'midpoint'")
+    partition_fn = (
+        batched_depth_inside_log_partition if tree == "posterior"
+        else batched_depth_midpoint_tree_log_weight
+    )
     with torch.no_grad():
-        exact, _, _, charts = multi_depth_gap_log_likelihoods(
+        exact, midpoint, _, charts = multi_depth_gap_log_likelihoods(
             model, examples, vocab, device, return_charts=True
         )
+    reference = exact if tree == "posterior" else midpoint
     owner = charts["owner"]
     gap_count = int(owner.numel())
     lexical = torch.zeros(gap_count, device=device)
@@ -107,7 +139,7 @@ def decompose_exact_batch(
             [charts["combined"][index] for index in group]
         ).detach().requires_grad_(True)
         with torch.enable_grad():
-            log_partition = batched_depth_inside_log_partition(stacked)
+            log_partition = partition_fn(stacked)
             marginals, = torch.autograd.grad(log_partition.sum(), stacked)
         token_part = torch.stack([charts["token"][index] for index in group])
         topology_part = torch.stack([charts["topology"][index] for index in group])
@@ -138,7 +170,7 @@ def decompose_exact_batch(
         totals = torch.zeros(len(examples), device=device)
         totals.index_add_(0, owner, values)
         per_example[name] = totals.cpu()
-    per_example["total"] = exact.cpu()
+    per_example["total"] = reference.cpu()
     per_example["depth_lexical"] = depth_lexical.cpu()
     per_example["depth_count"] = depth_count.cpu()
     reconstructed = sum(per_example[name] for name in COMPONENTS)
@@ -151,9 +183,11 @@ def decompose_exact_batch(
     return per_example
 
 
-def decompose_exact(model, examples, vocab, device, batch_size):
+def decompose_exact(model, examples, vocab, device, batch_size, tree="posterior"):
     parts = [
-        decompose_exact_batch(model, examples[start:start + batch_size], vocab, device)
+        decompose_exact_batch(
+            model, examples[start:start + batch_size], vocab, device, tree
+        )
         for start in range(0, len(examples), batch_size)
     ]
     result = {
@@ -271,6 +305,10 @@ def main():
         "factorized_depth_exact": decompose_exact(
             exact_model, test, vocab, device, args.batch_size
         ),
+        # Same model, same tokens, but the tree is fixed by span length alone.
+        "factorized_depth_exact_midpoint_tree": decompose_exact(
+            exact_model, test, vocab, device, args.batch_size, tree="midpoint"
+        ),
         "sequential_filler": decompose_sequential(
             sequential_model, test, vocab, device, args.batch_size
         ),
@@ -290,10 +328,23 @@ def main():
         for name, parts in nll.items()
     }
     comparisons = {}
-    for other in ("sequential_filler", "length_masked"):
+    contrasts = (
+        "sequential_filler", "length_masked",
+        # Same model and tokens, tree chosen without seeing them: the
+        # difference is exactly the posterior-selection benefit.
+        "factorized_depth_exact_midpoint_tree",
+    )
+    for other in contrasts:
         for key in list(COMPONENTS) + ["total"]:
             comparisons["exact_vs_{}_{}".format(other, key)] = paired_bootstrap(
                 nll["factorized_depth_exact"][key], nll[other][key]
+            )
+    # The generation-relevant contrast: an x-independent tree against the
+    # baselines, which never get to choose a tree using the answer either.
+    for other in ("sequential_filler", "length_masked"):
+        for key in list(COMPONENTS) + ["total"]:
+            comparisons["midpoint_vs_{}_{}".format(other, key)] = paired_bootstrap(
+                nll["factorized_depth_exact_midpoint_tree"][key], nll[other][key]
             )
 
     # Per-token nats by tree depth. The exact model's token head sees the gold
@@ -319,15 +370,8 @@ def main():
     # alone, so its per-token cost is the fair reference for the root.
     masked_tokens = float(sum(len(span) for e in test for span in e.spans))
     baseline_per_token = {
-        "length_masked": float(
-            nll["length_masked"]["lexical"].sum()
-        ) / masked_tokens,
-        "sequential_filler": float(
-            nll["sequential_filler"]["lexical"].sum()
-        ) / masked_tokens,
-        "factorized_depth_exact": float(
-            nll["factorized_depth_exact"]["lexical"].sum()
-        ) / total_tokens,
+        name: float(nll[name]["lexical"].sum()) / masked_tokens
+        for name in nll
     }
 
     result = {
@@ -358,7 +402,7 @@ def main():
         "| Model | Lexical | Structure | Tree entropy | Total |",
         "|---|---:|---:|---:|---:|",
     ]
-    for name in ("factorized_depth_exact", "sequential_filler", "length_masked"):
+    for name in REPORT_ORDER:
         row = means[name]
         lines.append("| `{}` | {:.3f} | {:.3f} | {:.3f} | {:.3f} |".format(
             name, row["lexical"], row["structure"], row["tree_entropy"],
@@ -369,13 +413,19 @@ def main():
         "| Comparison | Component | Mean NLL difference | Paired 95% CI |",
         "|---|---|---:|---:|",
     ])
-    for other in ("sequential_filler", "length_masked"):
-        for key in list(COMPONENTS) + ["total"]:
-            entry = comparisons["exact_vs_{}_{}".format(other, key)]
-            lines.append("| exact vs `{}` | {} | {:+.3f} | [{:+.3f},{:+.3f}] |".format(
-                other, key, entry["mean_nll_difference"],
-                entry["bootstrap_95_low"], entry["bootstrap_95_high"],
-            ))
+    for prefix, others in (
+        ("exact", contrasts),
+        ("midpoint", ("sequential_filler", "length_masked")),
+    ):
+        for other in others:
+            for key in list(COMPONENTS) + ["total"]:
+                entry = comparisons["{}_vs_{}_{}".format(prefix, other, key)]
+                lines.append(
+                    "| {} vs `{}` | {} | {:+.3f} | [{:+.3f},{:+.3f}] |".format(
+                        prefix, other, key, entry["mean_nll_difference"],
+                        entry["bootstrap_95_low"], entry["bootstrap_95_high"],
+                    )
+                )
     lines.extend([
         "",
         "## Exact lexical term by tree depth", "",
@@ -397,7 +447,7 @@ def main():
         "",
         "| Model | Lexical nats / token |", "|---|---:|",
     ])
-    for name in ("factorized_depth_exact", "sequential_filler", "length_masked"):
+    for name in REPORT_ORDER:
         lines.append("| `{}` | {:.3f} |".format(name, baseline_per_token[name]))
     with open(
         os.path.join(args.artifact_dir, "DECOMPOSITION.md"), "w", encoding="utf-8"

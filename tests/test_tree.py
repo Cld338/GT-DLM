@@ -248,6 +248,22 @@ class FrontierTest(unittest.TestCase):
             float(single_parts["tree_entropy"][0]), 0.0, places=5
         )
 
+        # The midpoint arm scores one fixed tree, so it must reconstruct the
+        # midpoint joint weight, carry exactly zero entropy, and -- since a
+        # single tree cannot beat the sum over all of them -- never score
+        # better than the posterior arm.
+        midpoint = decompose_exact_batch(
+            model, examples, vocab, torch.device("cpu"), tree="midpoint"
+        )
+        self.assertTrue(torch.allclose(
+            midpoint["lexical"] + midpoint["structure"] + midpoint["tree_entropy"],
+            midpoint["total"], atol=1e-5,
+        ))
+        self.assertTrue(
+            torch.allclose(midpoint["tree_entropy"], torch.zeros(2), atol=1e-6)
+        )
+        self.assertTrue(bool((midpoint["total"] <= parts["total"] + 1e-5).all()))
+
     def test_shared_latent_exactly_marginalizes_and_nests_factorized_model(self):
         vocab = TextVocabulary(
             vocab_size=12, PAD=0, GAP=1, MASK=2, LEFT=3, RIGHT=4

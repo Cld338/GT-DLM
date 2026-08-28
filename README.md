@@ -440,6 +440,21 @@ The lexical term is also flat across tree depth (`5.571` nats/token at the
 root against `5.4--5.8` deeper), so it is not an artifact of the tighter
 two-sided gold context that deep chart nodes enjoy; at the root the exact
 model sees no more than the masked baseline and still costs `5.571` against
-`6.933` nats/token. The load-bearing caveat is that every lexical number is an
-expectation under the gold-conditioned tree posterior, which free generation
-cannot access. See `research/LIKELIHOOD_DECOMPOSITION.md`.
+`6.933` nats/token.
+
+Re-scoring along the midpoint tree — answer-independent, since its pivots
+depend only on span length — then reverses the headline. The token advantage
+survives at about half strength (`6.366` against `6.933` and `6.976`
+nats/token), but the structural deficit widens from `+3.7` to `+6.1` nats and
+the exact model *loses* overall by `+1.946 [+1.152,+2.738]` against the
+sequential filler and `+2.246 [+1.476,+3.024]` against the masked baseline.
+The `-7.9` nat advantage is therefore substantially an artifact of scoring
+under a tree posterior conditioned on the gold span, which free generation
+cannot access. This explains the generation metrics, and explains why length
+calibration has never improved anywhere in the project: the structural term is
+a large real deficit, not a calibration detail. The midpoint tree is one
+answer-independent tree rather than the distribution generation actually
+follows, so the honest reading is a bracket — the generation-time comparison
+lies between the posterior-scored `-7.9` and the midpoint-scored `+1.9`, and
+locating it inside that bracket is the next measurement. See
+`research/LIKELIHOOD_DECOMPOSITION.md`.

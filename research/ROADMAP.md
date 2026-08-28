@@ -15,6 +15,12 @@ pretrained context encoder now supplies the largest single-gap likelihood gain
 so far. The natural-text claims remain likelihood-and-calibration claims, not
 generation claims, and the preregistered scale-up gate has not been passed.
 
+The two-gap likelihood advantage has since been decomposed, and it depends
+substantially on scoring under a tree posterior conditioned on the gold span:
+along an answer-independent tree it reverses. The identified bottleneck is the
+structural term, not the token head. Any writeup must carry that
+qualification.
+
 ## What is established
 
 ### Synthetic range-infilling (closed)
@@ -179,15 +185,23 @@ edit similarity `2.3%`, so the item stays open. What has changed is its
 diagnosis: the bottleneck is no longer missing context in the encoder. See
 `research/PRETRAINED_CONTEXT_DEPTH.md`.
 
-An exact decomposition of the two-gap likelihood now narrows the diagnosis
-further. Splitting `log p(x)` into lexical, structural, and tree-entropy parts
-shows the advantage is `-9.2` to `-9.5` nats lexical, `+3.7` nats *against* the
-exact model on structure, and only `-2.2` nats of tree entropy. Two mechanical
-explanations are ruled out: tree multiplicity accounts for just `27%` of the
-gap, and the lexical advantage is flat across tree depth (`5.571` nats/token at
-the root against `5.4--5.8` deeper), so it is not bought with tighter gold
-context. The remaining caveat is that all lexical numbers are expectations
-under the gold-conditioned tree posterior. See
+An exact decomposition of the two-gap likelihood has now resolved this, and
+the answer is unfavorable to the headline claim. Splitting `log p(x)` into
+lexical, structural, and tree-entropy parts shows the advantage is `-9.2` to
+`-9.5` nats lexical, `+3.7` nats *against* the exact model on structure, and
+only `-2.2` nats of tree entropy, so tree multiplicity is not the explanation
+and neither is tighter gold context at depth.
+
+Re-scoring along the midpoint tree — an answer-independent tree, since its
+pivots depend only on span length — then reverses the total. The token
+advantage survives at roughly half strength (`6.366` against `6.933` and
+`6.976` nats/token), but the structural deficit widens to `+6.1` nats and the
+exact model *loses* overall by `+1.946 [+1.152,+2.738]` and
+`+2.246 [+1.476,+3.024]` nats. The `-7.9` nat advantage is therefore
+substantially an artifact of scoring under a gold-conditioned tree posterior,
+which free generation cannot access. This explains the generation metrics and
+explains why length calibration has never improved: the structural term is a
+real, large deficit rather than a calibration detail. See
 `research/LIKELIHOOD_DECOMPOSITION.md`.
 
 ### 4. Cross-gap dependence, if pursued again
@@ -210,7 +224,7 @@ compute. The oracle-length gap must be reported either way.
 |---|---|
 | Length-extrapolation slice | Copy-specific attribution and corpus overlap are now controlled, but at flattened lengths neither arm beats the uniform prior per example, so `anchored_copy` is not usable as a long-span slice on this corpus |
 | Gap-composition slice | Synthetic passes; text has likelihood plus per-gap and total-length calibration evidence, but exact ordered-pair calibration remains weak |
-| Compute-matched AR competitiveness | **Passed, with a scope limit.** The sequential filler is this project's autoregressive baseline (`research/NATURAL_LANGUAGE_PILOT.md`). Retrained for a wall-clock budget matching the exact model's own training cost (361 vs 30 epochs), it still loses two-gap joint NLL by `-5.916 [-6.594,-5.248]`. The exact model is compute-competitive-to-superior on this joint likelihood metric; it has not been compared on standard LM perplexity or against an external AR implementation |
+| Compute-matched AR competitiveness | **Passed under posterior-scored likelihood; reverses under answer-independent tree scoring.** The sequential filler is this project's autoregressive baseline (`research/NATURAL_LANGUAGE_PILOT.md`). Retrained for a wall-clock budget matching the exact model's own training cost (361 vs 30 epochs), it loses two-gap joint NLL by `-5.916 [-6.594,-5.248]`. But scored along a tree chosen without the gold span, the exact model loses to it by `+1.946 [+1.152,+2.738]`. Since the gate is about competitiveness in use, this cannot be recorded as cleanly passed until item 9 locates the generation-time comparison inside that bracket |
 
 The `research/PROPOSAL.md` hold on scaling to 50--100M therefore stands.
 
@@ -246,12 +260,18 @@ The `research/PROPOSAL.md` hold on scaling to 50--100M therefore stands.
    lexical, structural, and tree-entropy terms. The advantage is lexical, not
    tree multiplicity, and the exact model is measurably *worse* at structure
    (`research/LIKELIHOOD_DECOMPOSITION.md`).
-8. **Next:** re-score the lexical term under the model's own tree prior
-   `E_{p(T|prompt)}[log p(x|T)]` instead of the gold-conditioned posterior.
-   This is the generation-relevant quantity and needs no retraining. It
-   decides whether the bottleneck is decoding or scoring, and should run
-   before any scale-up decision.
-9. Re-evaluate the scale-up gate (below).
+8. **Completed:** re-score along an answer-independent tree. The total
+   advantage reverses to `+1.9`/`+2.2` nats against the exact model; the
+   structural deficit, not the token head, is the bottleneck
+   (`research/LIKELIHOOD_DECOMPOSITION.md`).
+9. **Next:** close the bracket by scoring along trees rolled out top-down from
+   the model's own topology head — the actual generation distribution, which
+   lies somewhere between the posterior-scored `-7.9` and the midpoint-scored
+   `+1.9`. Sampling-based, so it needs several rollout seeds with paired
+   intervals.
+10. Fix the structural model, which is now the identified bottleneck, or
+   restate the two-gap likelihood claim as a posterior-scored result.
+11. Re-evaluate the scale-up gate (below).
 
 ## Currently claimable
 
@@ -270,13 +290,26 @@ calibration, and it is a single-gap result on pilot-scale corpora. The overlap
 objection is answered on post-lineage text.
 
 The two-gap factorized exact model's likelihood advantage over both proper
-baselines is now claimable as compute-matched, not just update-matched: giving
-each baseline a wall-clock budget equal to the exact model's own training cost
-(12x for the sequential/autoregressive filler, 7x for the learned-length
-model) still leaves the exact model ahead by `5.9`-`7.5` nats with paired
-intervals excluding zero. This also satisfies the scale-up gate's
-compute-matched autoregressive-competitiveness condition on this project's
-joint-likelihood metric, though not against an external AR implementation or
-on standard LM perplexity.
+baselines is compute-matched, not just update-matched: giving each baseline a
+wall-clock budget equal to the exact model's own training cost (12x for the
+sequential/autoregressive filler, 7x for the learned-length model) still
+leaves the exact model ahead by `5.9`-`7.5` nats with paired intervals
+excluding zero.
 
-A natural-text generation-quality advantage is **not** claimable.
+That claim now carries a required qualification, and it must travel with the
+number. The advantage is measured under the tree posterior conditioned on the
+gold span. Scored along an answer-independent tree instead, it reverses: the
+exact model loses by `+1.9` to `+2.2` nats, because a surviving token
+advantage of roughly `0.57` nats/token is outweighed by a `+6.1` nat
+structural deficit. The defensible statement is therefore "a large two-gap
+likelihood advantage under posterior-scored exact marginalization", not "a
+better two-gap model of text". Where the generation-time comparison actually
+falls inside that bracket is measured by item 9 above and is currently
+unknown.
+
+The scale-up gate's compute-matched autoregressive-competitiveness condition
+should be read against the qualified claim, not the raw one.
+
+A natural-text generation-quality advantage is **not** claimable, and the
+decomposition now supplies a mechanism for why: the structural term, not the
+token head.
