@@ -26,7 +26,13 @@ dissociation: the likelihood advantage is distributional, not top-1, so under
 oracle structure the exact model is no more accurate than the masked baseline.
 
 The generation gap has since been attributed, and it is mostly **not** the
-objective. Against a masked baseline on the same pretrained backbone the tree
+objective. A second, shared handicap sits underneath it: the project discards
+`distilroberta`'s MLM head and predicts over a 4,000-token custom vocabulary,
+and the untouched pretrained model matches our finetuned baseline on decoded
+text (`4.1%` exact match and `0.319` character similarity against `4.1%` and
+`0.316`, 244 spans). Five epochs of finetuning buy no text quality over the
+pretrained model as it comes, so every accuracy figure here sits on a
+handicapped output side. Against a masked baseline on the same pretrained backbone the tree
 model reaches `5.66%` oracle-structure token accuracy to the baseline's
 `12.56%` — but cutting that baseline's encoder access down to the tree model's
 single pooled vector, with its objective untouched, drops it to `6.74%`. That
@@ -192,7 +198,8 @@ matched intervention isolating the surviving twin. See
 | Comparison by training FLOPs or wall-clock, not epoch count | `JOINT_LEXICAL_OBJECTIVE.md` item 4 | **Done:** exact costs 12.05x (sequential) / 7.09x (masked) more wall-clock per epoch; retraining both baselines for a matched wall-clock budget (361 / 212 epochs) still loses by `-5.916 [-6.594,-5.248]` and `-7.486 [-8.265,-6.728]` nats |
 | Insertion/blank baselines and the selected two-block frontier model | `DEPTH_INSIDE.md` control 4 | Partial: sequential and masked are done |
 | Corpus not seen by the pretrained backbone | `PRETRAINED_CONTEXT_DEPTH.md` limit 1 | **Done:** gain is larger on post-lineage text (`-6.136` vs `-4.879`); see `CORPUS_OVERLAP_CONTROL.md` |
-| Baseline on the same pretrained backbone | `LIKELIHOOD_DECOMPOSITION.md` | **Done, against the objective:** matched on backbone, stream, split and budget, the masked baseline reaches `12.56%` oracle-structure accuracy to the tree model's `5.66%` in 3/3 non-overlapping seeds |
+| Baseline on the same pretrained backbone | `LIKELIHOOD_DECOMPOSITION.md` | **Done:** matched on backbone, stream, split and budget, the masked baseline reaches `12.56%` oracle-structure accuracy to the tree model's `5.66%` in 3/3 non-overlapping seeds; `84%` of that gap is encoder access, not the objective |
+| Native pretrained vocabulary and MLM head | `LIKELIHOOD_DECOMPOSITION.md` | **Open, and it caps everything:** the untouched pretrained model ties our finetuned baseline on decoded text, so the custom 4,000-token vocabulary and discarded MLM head currently cancel the benefit of finetuning |
 
 ### 3. Generation quality (deficit attributed to the encoder, not the objective)
 
@@ -299,6 +306,12 @@ baseline's oracle-structure token accuracy (`5.66%` against `12.56%`), so the
 clause is failed by a clear margin. Scaling the current configuration is not
 warranted.
 
+Read the gate's generation clause with the vocabulary handicap in mind. Every
+arm predicts over a 4,000-token custom BPE with a relearned output head, and in
+that regime finetuning buys no text quality over the untouched pretrained
+model. The clause is being evaluated on models that are all weak for a reason
+that has nothing to do with the objective.
+
 The hold is not a verdict on the objective. The encoder-access test attributes
 `84%` of the generation gap to how the pretrained encoder is attached, so what
 the hold blocks is scaling *this integration*. An encoder integration that
@@ -365,13 +378,21 @@ order item 14) is the thing to try before the gate is re-run.
    objective fixed, cutting encoder access to one pooled vector drops the
    baseline `12.56% -> 6.74%`, explaining `84%` of the gap in 3/3 seeds
    (sd `0.23` points) (`research/LIKELIHOOD_DECOMPOSITION.md`).
-14. **Next:** an encoder integration that gives the chart per-node context
-   without presupposing the span length — either a fixed `max_span` mask
-   canvas so `state[pivot]` carries no length information, or an interval head
-   that attends over the backbone's states for the observed segments instead
-   of consuming one pooled vector. The second is the more principled.
-15. Re-evaluate the scale-up gate (below).
-16. Optional: a genuine top-down rollout, closing the residual gap between
+14. **In progress:** an encoder integration that gives the chart per-node
+   context without presupposing the span length. Implemented as
+   `--prompt-attention`: each interval record queries the backbone's sequence
+   output, batched per example, at `O(D n^2 L)`. Addresses the tree-specific
+   bottleneck only.
+15. **Next, and larger:** keep RoBERTa's native vocabulary and MLM head instead
+   of a 4,000-token custom BPE with a head relearned from averaged input
+   embeddings. This is the shared handicap, and the diagnostic above shows it
+   currently cancels the entire benefit of finetuning. It needs the corpus
+   re-tokenized and the vocabulary threaded through corruption, chart and
+   evaluation, so it is the largest remaining change — but without it the
+   absolute generation numbers, and any comparison drawn between weak models
+   inside them, stay hard to interpret.
+16. Re-evaluate the scale-up gate (below).
+17. Optional: a genuine top-down rollout, closing the residual gap between
    gold-token and self-generated-token conditioning in the topology head.
 
 ## Currently claimable

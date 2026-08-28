@@ -64,6 +64,12 @@ def depth_batch_log_likelihoods(
     tokens, padding, positions, roots_left, roots_right = collate_prompt_contexts(
         examples, vocab, device
     )
+    # Only prompt-attention models accept per-record owner indices; the
+    # from-scratch model's signature has no such argument.
+    prompt_attention = bool(getattr(model, "prompt_attention", False))
+    if prompt_attention:
+        model.encoder.keep_prompt_states(True)
+    owners_for = (lambda index: (index,)) if prompt_attention else (lambda index: ())
     encoded = model.encode(tokens, padding)
     contexts = encoded[torch.arange(len(examples), device=device), positions]
     exact: List[torch.Tensor] = [contexts.new_zeros(()) for _ in examples]
@@ -76,7 +82,8 @@ def depth_batch_log_likelihoods(
         indices = torch.tensor(empty_indices, dtype=torch.long, device=device)
         depths = torch.zeros_like(indices)
         _, stop_logits, _ = model.interval_logits(
-            contexts[indices], roots_left[indices], roots_right[indices], depths
+            contexts[indices], roots_left[indices], roots_right[indices], depths,
+            *owners_for(indices),
         )
         values = F.logsigmoid(stop_logits)
         for offset, example_index in enumerate(empty_indices):
@@ -118,7 +125,8 @@ def depth_batch_log_likelihoods(
             for example_index, _, _, hi in records
         ])
         token_logits, stop_logits, hidden = model.interval_logits(
-            contexts[context_indices], left, right, depths
+            contexts[context_indices], left, right, depths,
+            *owners_for(context_indices),
         )
         generated_ids = torch.tensor(
             vocab.generated_token_ids, dtype=torch.long, device=device

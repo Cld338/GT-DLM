@@ -1324,6 +1324,139 @@ class SpanPolicyTests(unittest.TestCase):
             tuple(model.predict_length(tokens, padding).shape), (2, 9)
         )
 
+    def test_prompt_attention_gives_each_interval_its_own_context(self):
+        """Interval records must read the backbone sequence, not one pooled vector.
+
+        The chart's only link to the prompt is otherwise a single summary
+        vector plus two static boundary embeddings, which
+        research/LIKELIHOOD_DECOMPOSITION.md attributes 84% of the generation
+        deficit to. This pins the three properties the fix must have: records
+        of the same example with different boundaries get different attended
+        context, attention never crosses examples, and padded key positions are
+        excluded.
+        """
+        from gtdlm.model import PretrainedIntervalInsideModel
+
+        hidden_size = 8
+
+        class StubConfig:
+            hidden_size = 8
+
+        class StubBackbone(torch.nn.Module):
+            config = StubConfig()
+
+            def __init__(self):
+                super().__init__()
+                self.embeddings = torch.nn.Embedding(32, hidden_size)
+
+            def get_input_embeddings(self):
+                return self.embeddings
+
+            def forward(self, input_ids=None, attention_mask=None, **kwargs):
+                del attention_mask, kwargs
+                return type(
+                    "Output", (), {"last_hidden_state": self.embeddings(input_ids)}
+                )()
+
+        class StubPretrainedTokenizer:
+            mask_token = "<m>"
+            mask_token_id = 9
+
+            def __call__(self, texts, **kwargs):
+                del kwargs
+                rows = []
+                for text in texts:
+                    row, index = [], 0
+                    while index < len(text):
+                        if text.startswith(self.mask_token, index):
+                            row.append(self.mask_token_id)
+                            index += len(self.mask_token)
+                        else:
+                            row.append(1 + (ord(text[index]) % 7))
+                            index += 1
+                    rows.append(row)
+                width = max(len(row) for row in rows)
+                return {
+                    "input_ids": torch.tensor(
+                        [r + [0] * (width - len(r)) for r in rows]
+                    ),
+                    "attention_mask": torch.tensor(
+                        [[1] * len(r) + [0] * (width - len(r)) for r in rows]
+                    ),
+                }
+
+        class StubSourceTokenizer:
+            def decode(self, token_ids, skip_special_tokens=False):
+                del skip_special_tokens
+                return "".join(chr(t) for t in token_ids)
+
+        vocab = TextVocabulary(
+            vocab_size=12, PAD=0, GAP=1, MASK=2, LEFT=3, RIGHT=4
+        )
+        model = PretrainedIntervalInsideModel(
+            vocab.vocab_size, vocab.GAP, vocab.PAD, StubSourceTokenizer(),
+            backbone=StubBackbone(), pretrained_tokenizer=StubPretrainedTokenizer(),
+            initialize_custom_embeddings=False, tie_token_embeddings=False,
+            prompt_attention=True, dropout=0.0,
+        ).eval()
+        self.assertTrue(model.prompt_attention)
+
+        # Two examples with different observed text, so cross-example leakage
+        # would be visible.
+        examples = [
+            TextInfillingExample(((5, 6, 7), (8,)), ((10, 11),)),
+            TextInfillingExample(((9,), (6,)), ((11,),)),
+        ]
+        rows = [e.prompt(vocab) for e in examples]
+        width = max(len(r) for r in rows)
+        tokens = torch.full((2, width), vocab.PAD, dtype=torch.long)
+        padding = torch.ones_like(tokens, dtype=torch.bool)
+        for i, r in enumerate(rows):
+            tokens[i, :len(r)] = torch.tensor(r)
+            padding[i, :len(r)] = False
+
+        model.encoder.keep_prompt_states(True)
+        encoded = model.encode(tokens, padding)
+        self.assertIsNotNone(model.encoder.prompt_states)
+        positions = [r.index(vocab.GAP) for r in rows]
+        contexts = torch.stack([encoded[i, p] for i, p in enumerate(positions)])
+
+        # Three records: two from example 0 with different boundaries, one
+        # from example 1.
+        owners = torch.tensor([0, 0, 1])
+        left = torch.tensor([7, 10, 9])
+        right = torch.tensor([8, 8, 6])
+        depths = torch.tensor([0, 1, 0])
+        hidden = model.interval_hidden(
+            contexts[owners], left, right, depths, owners
+        )
+        self.assertEqual(tuple(hidden.shape), (3, hidden_size))
+        # Same example, different boundaries -> different representation.
+        self.assertFalse(torch.allclose(hidden[0], hidden[1], atol=1e-6))
+
+        # Attention must not read another example's prompt: re-running with
+        # example 1's states replaced must leave example 0's records intact.
+        baseline = hidden.clone()
+        model.encoder.prompt_states = model.encoder.prompt_states.clone()
+        model.encoder.prompt_states[1] += 5.0
+        shifted = model.interval_hidden(
+            contexts[owners], left, right, depths, owners
+        )
+        self.assertTrue(torch.allclose(baseline[:2], shifted[:2], atol=1e-6))
+        self.assertFalse(torch.allclose(baseline[2], shifted[2], atol=1e-6))
+
+        # Positions that are already padding must carry no weight at all.
+        model.encoder.keep_prompt_states(True)
+        model.encode(tokens, padding)
+        padded = (~model.encoder.prompt_mask[1]).nonzero().flatten()
+        self.assertTrue(padded.numel(), "example 1 should be shorter than example 0")
+        model.encoder.prompt_states = model.encoder.prompt_states.clone()
+        model.encoder.prompt_states[1, padded[0]] += 100.0
+        padded_shift = model.interval_hidden(
+            contexts[owners], left, right, depths, owners
+        )
+        self.assertTrue(torch.allclose(baseline, padded_shift, atol=1e-5))
+
     def test_unique_mask_positions_rejects_missing_or_duplicate_masks(self):
         input_ids = torch.tensor([[1, 9, 2], [9, 3, 4]])
         self.assertTrue(torch.equal(unique_token_positions(input_ids, 9), torch.tensor([1, 0])))

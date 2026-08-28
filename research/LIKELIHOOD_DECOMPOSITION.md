@@ -620,6 +620,52 @@ the tree figure is scored along the midpoint tree with gold boundary tokens,
 so it enjoys conditioning the parallel masked pass does not, and the two are
 not as cleanly matched as the accuracy column.
 
+### A second, shared handicap: the discarded output side
+
+The encoder-access finding explains why the tree model trails the masked
+baseline. It says nothing about why *both* are weak in absolute terms, and a
+separate measurement shows that ceiling is set by the formulation itself.
+
+The project keeps only `AutoModel`, so `distilroberta`'s masked-language-model
+head is discarded, and every arm predicts over a 4,000-token custom BPE
+vocabulary rather than RoBERTa's 50,265. The token head is a fresh
+`Linear(768 -> 4000)` tied to embeddings averaged from RoBERTa's *input*
+embeddings. The single most valuable part of a pretrained model for filling a
+blank -- the output side -- is thrown away and relearned.
+
+`measure_pretrain_task_mismatch.py` measures what that costs by scoring the
+untouched pretrained model on the same held-out spans with **no finetuning at
+all**: its own tokenizer, its own MLM head, the same oracle length. Scoring is
+on decoded text, since the arms do not share a vocabulary.
+
+| Arm | Exact match | Character similarity |
+|---|---:|---:|
+| `distilroberta` MLM, no finetuning | 4.1% | 0.319 |
+| Our pretrained masked baseline, finetuned | 4.1% | 0.316 |
+
+They are **tied**, on 244 spans. Five epochs of finetuning on 2,652 documents,
+applied to the project's strongest arm, produce text indistinguishable from the
+pretrained model out of the box.
+
+A first run on 128 spans read `4.1%` against `1.0%` and appeared to show the
+finetuned model doing *worse*. That was four hits against one; widening the
+sample removed it. The exact-match column needs several hundred spans before it
+carries any weight, and the earlier reading should not be cited.
+
+Two consequences, and they are separate from everything above.
+
+**Every accuracy figure in this project sits on that handicap.** The `12.56%`,
+`5.66%` and `4.19%` floor are all measured over a crippled output head and a
+vocabulary one twelfth the size. It is the same regime in which the
+from-scratch models failed to clear frequency guessing, and comparisons between
+badly handicapped models are exactly the ones this document has repeatedly
+found unreliable.
+
+**It does not explain the tree-versus-masked gap.** Both arms carry it equally.
+The two causes stack rather than compete: a shared vocabulary-and-head handicap
+that caps everyone, and a tree-specific encoder bottleneck that accounts for
+`84%` of the remaining difference.
+
 ### What this changes
 
 The generation result is largely an artifact of how the pretrained encoder was

@@ -190,6 +190,12 @@ def main() -> None:
     parser.add_argument("--freeze-backbone", action="store_true")
     parser.add_argument("--gradient-checkpointing", action="store_true")
     parser.add_argument("--random-init-backbone", action="store_true")
+    parser.add_argument(
+        "--prompt-attention", action="store_true",
+        help="let each interval record attend over the backbone's sequence "
+             "output instead of sharing one pooled vector "
+             "(research/LIKELIHOOD_DECOMPOSITION.md)",
+    )
     parser.add_argument("--local-files-only", action="store_true")
     parser.add_argument("--no-mixed-precision", action="store_false", dest="mixed_precision")
     parser.set_defaults(mixed_precision=True)
@@ -264,6 +270,7 @@ def main() -> None:
         gradient_checkpointing=args.gradient_checkpointing,
         local_files_only=args.local_files_only,
         random_init_backbone=args.random_init_backbone,
+        prompt_attention=args.prompt_attention,
     ).to(device)
     if args.checkpoint:
         model.load_state_dict(

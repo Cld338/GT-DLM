@@ -561,6 +561,9 @@ class PretrainedIntervalEncoder(nn.Module):
         self.token_embedding = nn.Embedding(vocab_size, d_model)
         self.step_embedding = nn.Embedding(max_steps, d_model)
         self.context_norm = nn.LayerNorm(d_model)
+        self._keep_prompt_states = False
+        self.prompt_states = None
+        self.prompt_mask = None
         if initialize_custom_embeddings:
             self.initialize_custom_token_embeddings()
         if gradient_checkpointing:
@@ -661,7 +664,20 @@ class PretrainedIntervalEncoder(nn.Module):
         rows = torch.arange(len(tokens), device=tokens.device)
         context = self.context_norm(hidden[rows, mask_positions])
         custom_gaps = tokens.eq(self.gap_id).unsqueeze(-1).to(context.dtype)
+        if self._keep_prompt_states:
+            # Stash the full sequence for interval heads that attend over it.
+            # Pooling to the mask state alone discards most of what the
+            # backbone computed; see research/LIKELIHOOD_DECOMPOSITION.md.
+            self.prompt_states = hidden
+            self.prompt_mask = model_inputs["attention_mask"].bool()
         return context.unsqueeze(1) * custom_gaps
+
+    def keep_prompt_states(self, enabled: bool = True) -> None:
+        """Retain the backbone's full sequence output from the next encode."""
+        self._keep_prompt_states = enabled
+        if not enabled:
+            self.prompt_states = None
+            self.prompt_mask = None
 
 
 class PretrainedIntervalInsideModel(nn.Module):
@@ -686,6 +702,7 @@ class PretrainedIntervalInsideModel(nn.Module):
         pretrained_tokenizer=None,
         initialize_custom_embeddings: bool = True,
         tie_token_embeddings: bool = True,
+        prompt_attention: bool = False,
     ) -> None:
         super().__init__()
         self.encoder = PretrainedIntervalEncoder(
@@ -706,7 +723,20 @@ class PretrainedIntervalInsideModel(nn.Module):
             initialize_custom_embeddings=initialize_custom_embeddings,
         )
         d_model = self.encoder.hidden_size
-        self.interval_projection = nn.Linear(3 * d_model, d_model)
+        # With prompt_attention each interval builds a query from its own
+        # boundary tokens and depth and attends over the backbone's sequence
+        # output, instead of every node in the chart sharing one pooled vector.
+        # Cost is O(D n^2 L): the token head runs per interval record, not per
+        # chart cell, and all records of an example share the same keys.
+        self.prompt_attention = prompt_attention
+        self.interval_projection = nn.Linear(
+            (4 if prompt_attention else 3) * d_model, d_model
+        )
+        if prompt_attention:
+            self.prompt_query = nn.Linear(3 * d_model, d_model)
+            self.prompt_key = nn.Linear(d_model, d_model)
+            self.prompt_value = nn.Linear(d_model, d_model)
+            self.prompt_norm = nn.LayerNorm(d_model)
         self.interval_norm = nn.LayerNorm(d_model)
         self.interval_dropout = nn.Dropout(dropout)
         self.token_head = nn.Linear(d_model, vocab_size)
@@ -726,20 +756,75 @@ class PretrainedIntervalInsideModel(nn.Module):
     ) -> torch.Tensor:
         return self.encoder(tokens, padding_mask)
 
+    def _attend_prompt(self, features: torch.Tensor, owners: torch.Tensor):
+        """Let each interval record read the backbone's own sequence output.
+
+        ``features`` is the per-record ``[context, left, right]`` concatenation
+        and ``owners`` maps each record to its example. Records of one example
+        share keys, so the attention is padded per example and batched, which
+        keeps it at a few tens of thousands of scores rather than materializing
+        one key matrix per record.
+        """
+        states = self.encoder.prompt_states
+        mask = self.encoder.prompt_mask
+        if states is None:
+            raise ValueError(
+                "prompt attention needs encoder.keep_prompt_states() before encode"
+            )
+        if int(owners.max()) >= states.size(0):
+            # Callers that encode in chunks must accumulate the states too, or
+            # the stashed batch silently belongs to a different set of prompts.
+            raise ValueError(
+                "owner index {} exceeds the {} stashed prompts; accumulate "
+                "prompt states across chunks before attending".format(
+                    int(owners.max()), states.size(0)
+                )
+            )
+        queries = self.prompt_query(features)
+        keys = self.prompt_key(states)
+        values = self.prompt_value(states)
+
+        batch = states.size(0)
+        counts = torch.bincount(owners, minlength=batch)
+        width = int(counts.max()) if counts.numel() else 0
+        if width == 0:
+            return torch.zeros_like(queries)
+        # Slot each record within its example so queries can be padded.
+        order = torch.argsort(owners, stable=True)
+        ranks = torch.empty_like(order)
+        starts = torch.cumsum(counts, 0) - counts
+        ranks[order] = (
+            torch.arange(owners.numel(), device=owners.device) - starts[owners[order]]
+        )
+        padded = queries.new_zeros((batch, width, queries.size(-1)))
+        padded[owners, ranks] = queries
+
+        scale = queries.size(-1) ** 0.5
+        scores = torch.bmm(padded, keys.transpose(1, 2)) / scale
+        scores = scores.masked_fill(~mask.unsqueeze(1), float("-inf"))
+        attended = torch.bmm(scores.softmax(dim=-1), values)
+        return self.prompt_norm(attended[owners, ranks])
+
     def interval_hidden(
         self,
         context_hidden: torch.Tensor,
         left_boundary: torch.Tensor,
         right_boundary: torch.Tensor,
         depths: Optional[torch.Tensor] = None,
+        owners: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if depths is not None:
             context_hidden = context_hidden + self.encoder.step_embedding(depths)
         left = self.encoder.token_embedding(left_boundary)
         right = self.encoder.token_embedding(right_boundary)
-        hidden = self.interval_projection(
-            torch.cat((context_hidden, left, right), dim=-1)
-        )
+        features = torch.cat((context_hidden, left, right), dim=-1)
+        if self.prompt_attention:
+            if owners is None:
+                raise ValueError("prompt attention needs per-record owner indices")
+            features = torch.cat(
+                (features, self._attend_prompt(features, owners)), dim=-1
+            )
+        hidden = self.interval_projection(features)
         return self.interval_dropout(
             self.interval_norm(torch.nn.functional.gelu(hidden))
         )
@@ -750,9 +835,10 @@ class PretrainedIntervalInsideModel(nn.Module):
         left_boundary: torch.Tensor,
         right_boundary: torch.Tensor,
         depths: Optional[torch.Tensor] = None,
+        owners: Optional[torch.Tensor] = None,
     ):
         hidden = self.interval_hidden(
-            context_hidden, left_boundary, right_boundary, depths
+            context_hidden, left_boundary, right_boundary, depths, owners
         )
         return self.token_head(hidden), self.stop_head(hidden).squeeze(-1), hidden
 

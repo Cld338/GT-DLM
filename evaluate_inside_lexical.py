@@ -38,6 +38,11 @@ def decode_oracle_midpoint_sequences(
         tokens, padding, positions, left, right = collate_prompt_contexts(
             batch, vocab, device
         )
+        if getattr(model, "prompt_attention", False):
+            raise ValueError(
+                "prompt-attention models need per-batch prompt states; use "
+                "evaluate_prompt_attention.py rather than this decoder"
+            )
         encoded = model.encode(tokens, padding)
         contexts.append(encoded[torch.arange(len(batch), device=device), positions])
         roots_left.append(left)

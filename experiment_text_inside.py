@@ -418,19 +418,38 @@ def sample_inside_lengths(
     late_depth_child_penalty: float = 0.0,
 ) -> List[List[float]]:
     model.eval()
+    attends = bool(getattr(model, "prompt_attention", False))
     contexts, root_left, root_right = [], [], []
+    prompt_chunks, prompt_masks = [], []
     for start in range(0, len(examples), context_batch_size):
         batch = examples[start : start + context_batch_size]
         tokens, padding, positions, left, right = collate_prompt_contexts(
             batch, vocab, device
         )
+        if attends:
+            model.encoder.keep_prompt_states(True)
         encoded = model.encode(tokens, padding)
+        if attends:
+            prompt_chunks.append(model.encoder.prompt_states)
+            prompt_masks.append(model.encoder.prompt_mask)
         contexts.append(
             encoded[torch.arange(len(batch), device=device), positions]
         )
         root_left.append(left)
         root_right.append(right)
     contexts_tensor = torch.cat(contexts)
+    if attends:
+        # Chunks reach different lengths; pad to a common width so every
+        # prompt keeps the index its context has.
+        width = max(chunk.size(1) for chunk in prompt_chunks)
+        model.encoder.prompt_states = torch.cat([
+            torch.nn.functional.pad(chunk, (0, 0, 0, width - chunk.size(1)))
+            for chunk in prompt_chunks
+        ])
+        model.encoder.prompt_mask = torch.cat([
+            torch.nn.functional.pad(mask, (0, width - mask.size(1)))
+            for mask in prompt_masks
+        ])
     left_tensor = torch.cat(root_left)
     right_tensor = torch.cat(root_right)
     generated_ids = torch.tensor(vocab.generated_token_ids, device=device)
@@ -471,6 +490,7 @@ def sample_inside_lengths(
             left,
             right,
             depths if depth_conditioned else None,
+            *((prompt_ids,) if attends else ()),
         )
         # Topology bits suppress empty children, so every child gap that is
         # materialized is non-empty by construction. STOP is therefore a

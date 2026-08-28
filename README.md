@@ -94,6 +94,7 @@ python evaluate_multigap_generation.py --device cuda --artifact-dir artifacts/te
 python experiment_pretrained_masked_baseline.py --device cuda --artifact-dir artifacts/text_pretrained_masked_baseline
 python experiment_pretrained_masked_baseline.py --device cuda --bottleneck-context --artifact-dir artifacts/text_pretrained_masked_bottleneck
 python analyze_oracle_top1.py --output-dir artifacts/text_oracle_top1_summary
+python measure_pretrain_task_mismatch.py --device cuda --examples 512 --artifact-dir artifacts/text_pretrain_task_mismatch
 ```
 
 The experiment writes its metrics and checkpoints to `artifacts/`.
@@ -525,5 +526,19 @@ boundary-token identity, and it collapses anyway.
 
 So the generation deficit is mostly how the pretrained encoder was attached,
 not exact latent-tree marginalization. What needs fixing is an integration that
-gives the chart per-node context without presupposing the span length. See
+gives the chart per-node context without presupposing the span length.
+
+A second handicap sits underneath that one and is shared by every arm. The
+project keeps only `AutoModel`, so `distilroberta`'s masked-language-model head
+is discarded and predictions run over a 4,000-token custom BPE vocabulary
+rather than RoBERTa's 50,265, with the token head relearned from averaged input
+embeddings. Scoring the untouched pretrained model on the same spans with no
+finetuning at all gives `4.1%` exact match and `0.319` character similarity on
+decoded text, against `4.1%` and `0.316` for our finetuned masked baseline --
+a tie on 244 spans. Five epochs of finetuning buy no text quality over the
+pretrained model as it comes. Every accuracy figure in this project therefore
+sits on a crippled output side, which is the same regime in which the
+from-scratch models failed to clear frequency guessing. The two causes stack:
+a shared vocabulary-and-head handicap that caps everyone, and a tree-specific
+encoder bottleneck that accounts for `84%` of the remaining difference. See
 `research/LIKELIHOOD_DECOMPOSITION.md`.
