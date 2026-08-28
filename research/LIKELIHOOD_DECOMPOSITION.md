@@ -530,22 +530,23 @@ contribution: exact latent-tree marginalization, a `-5.9` to `-7.5` nat
 two-gap advantage that holds under wall-clock matching and under scoring by the
 model's own tree head, and passing length calibration.
 
-The generation claim is closed negatively **for the current architecture**. On
-the metric that matters for text a matched pretrained baseline is roughly twice
-as good, and the scale-up hold stands: there is no point scaling a
-configuration that loses to a plain masked model on generation.
+The generation claim fails **for the current architecture**: on the metric that
+matters for text a matched pretrained baseline is roughly twice as good, and
+the scale-up hold stands, since there is no case for scaling a configuration
+that loses to a plain masked model.
 
-What is *not* established is that the objective is responsible. The encoder
-integration compresses the entire prompt into one vector before the chart ever
-runs, so the measured gap confounds the objective with that bottleneck. Until
-the matched-encoder test below is run, the defensible statement is about this
-implementation, not about exact latent-tree marginalization as such.
+The encoder-access test then attributes that failure. Holding the objective
+fixed and cutting the baseline's encoder access to the tree model's single
+pooled vector removes `84%` of the gap, leaving `1.09` points. The deficit is
+mostly how the pretrained encoder was attached, not exact latent-tree
+marginalization, and at comparable encoder access the tree objective is ahead
+on token NLL.
 
-The honest framing for a writeup, pending that test, is a method that buys
-exact, well-calibrated joint probability over variable-length spans, with a
-negative result attached: as currently integrated with a pretrained encoder,
-that probability does not convert into better generation than using the
-encoder directly for mask filling.
+The honest framing for a writeup is therefore a method that buys exact,
+well-calibrated joint probability over variable-length spans, whose generation
+deficit against a pretrained masked encoder is mostly attributable to how that
+encoder was attached. That is a more useful negative than a flat one: it names
+the part to fix.
 
 ## Limits of this measurement
 

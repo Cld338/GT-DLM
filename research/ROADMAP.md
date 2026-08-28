@@ -194,7 +194,7 @@ matched intervention isolating the surviving twin. See
 | Corpus not seen by the pretrained backbone | `PRETRAINED_CONTEXT_DEPTH.md` limit 1 | **Done:** gain is larger on post-lineage text (`-6.136` vs `-4.879`); see `CORPUS_OVERLAP_CONTROL.md` |
 | Baseline on the same pretrained backbone | `LIKELIHOOD_DECOMPOSITION.md` | **Done, against the objective:** matched on backbone, stream, split and budget, the masked baseline reaches `12.56%` oracle-structure accuracy to the tree model's `5.66%` in 3/3 non-overlapping seeds |
 
-### 3. Generation quality (CLOSED, negatively)
+### 3. Generation quality (deficit attributed to the encoder, not the objective)
 
 Source: named independently by `research/LEXICAL_EVALUATION.md` and
 `research/JOINT_LEXICAL_OBJECTIVE.md` item 5.
@@ -209,7 +209,8 @@ pretraining from capacity: the capacity-matched random-init control stays at
 Generation itself remains unusable. Free-sample exact match is `0.2--0.5%` and
 edit similarity `2.3%`. The diagnosis changed first -- the bottleneck is not
 missing context in the encoder (`research/PRETRAINED_CONTEXT_DEPTH.md`) -- and
-the item has since been closed negatively by the chain below.
+the deficit has since been attributed, by the chain below, mostly to the
+encoder integration rather than to the objective.
 
 An exact decomposition of the two-gap likelihood has now resolved this, and
 the answer is unfavorable to the headline claim. Splitting `log p(x)` into
@@ -256,14 +257,18 @@ token scores `4.35%` on these two-gap targets, so none of the three from-scratch
 models clears it: they are tied at not beating frequency guessing, and no
 conclusion about the objective can rest on differences between them.
 
-The matched control then closes the item. Given the *same* pretrained backbone,
-stream, split and budget, the masked baseline reaches `12.56%`
+The matched control then measures the gap. Given the *same* pretrained
+backbone, stream, split and budget, the masked baseline reaches `12.56%`
 oracle-structure accuracy against the tree model's `5.66%` in 3/3 seeds with
-non-overlapping ranges, and token NLL `5.872+/-0.027` against `6.161`. Where a
-pretrained masked encoder is available, using it directly beats adapting it to
-this objective on this task. The likelihood results are unaffected; the
-inference from them to better generation is refuted. See
-`research/LIKELIHOOD_DECOMPOSITION.md`.
+non-overlapping ranges, and token NLL `5.872+/-0.027` against `6.161`.
+
+The encoder-access test then attributes it. Cutting that baseline's encoder
+access down to the tree model's single pooled vector, objective untouched,
+drops it to `6.74%+/-0.23` — removing `5.81` of the `6.90` point gap, about
+`84%`, and leaving a `1.09` point residual. At comparable encoder access the
+tree objective is ahead on token NLL. So the deficit is mostly how the
+pretrained encoder was attached; the residual is the honest upper bound on the
+objective's own cost. See `research/LIKELIHOOD_DECOMPOSITION.md`.
 
 ### 4. Cross-gap dependence, if pursued again
 
