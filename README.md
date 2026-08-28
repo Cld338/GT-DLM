@@ -90,6 +90,7 @@ python measure_pretrained_span_identifiability.py --device cuda --epochs 5 --val
 python measure_multigap_wallclock.py --device cuda --calibration-epochs 3 --artifact-dir artifacts/text_multigap_wallclock_calibration
 python experiment_multigap_matched_training.py --device cuda --models sequential_filler,length_masked --epochs-per-model "sequential_filler=361,length_masked=212" --exact-checkpoint artifacts/text_multigap_matched_training/factorized_depth_exact.pt --artifact-dir artifacts/text_multigap_wallclock_matched
 python decompose_multigap_likelihood.py --device cuda --artifact-dir artifacts/text_multigap_decomposition
+python evaluate_multigap_generation.py --device cuda --artifact-dir artifacts/text_multigap_generation
 ```
 
 The experiment writes its metrics and checkpoints to `artifacts/`.
@@ -464,11 +465,21 @@ sequential filler and `+0.092 [-0.008,+0.197]` against the masked baseline,
 both intervals containing zero. Structural cost grows about linearly in span
 length, so nothing degrades with recursion depth either.
 
-Four explanations for poor generation have therefore been tested and rejected:
-tree multiplicity, tighter gold context at depth, posterior-conditioned tree
-selection, and a worse structural model. The surviving hypothesis is
-compounding in recursive decoding — the masked baseline emits every token in
-one parallel pass and cannot compound, while the tree model makes each emitted
-token the interval boundary conditioning its children. That is a decoding
-problem rather than an objective one, and testing it is the next step. See
+Compounding in recursive decoding was then tested and also fails. Greedy free
+decoding turns out to be uninformative — all three models collapse to the
+empty-length mode, the masked baseline's free length-match rate landing on
+exactly its empty-span rate — so the comparison is made under sampling, and
+restricted to the 304 gaps where both arms are comparable. There the free arm
+reaches `2.2%` token accuracy against oracle structure's `1.5%`, with every
+residual bias favouring the free arm. Five explanations for poor generation are
+now rejected.
+
+What replaces them comes from the oracle-structure arm, where all three models
+sit at `100%` length match on the same gaps. Token accuracy is `4.0%` for the
+exact model, `3.3%` sequential and `4.2%` masked: a `1.36` nat per token
+likelihood advantage produces no top-1 advantage at all. The gain is
+distributional rather than modal, which is why neither greedy decoding, which
+reads only the top token, nor sampling, which spreads across the distribution,
+converts it into better text. On current evidence this objective improves
+likelihood without improving generation. See
 `research/LIKELIHOOD_DECOMPOSITION.md`.

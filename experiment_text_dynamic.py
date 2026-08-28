@@ -124,7 +124,15 @@ def decode_sequential_model(
     device: torch.device,
     max_decode_span: int,
     stop_threshold: float,
+    oracle_lengths: Sequence[Sequence[int]] = None,
 ) -> DecodeOutput:
+    """Greedily fill every region left to right.
+
+    ``oracle_lengths`` supplies the target token count for each region, which
+    replaces the model's own STOP decision. This isolates lexical quality from
+    length prediction, giving the oracle-structure arm of the compounding
+    comparison in `evaluate_multigap_generation.py`.
+    """
     model.eval()
     canvases = [initial_region_canvas(example, vocab) for example in examples]
     nfes = [0 for _ in examples]
@@ -162,11 +170,19 @@ def decode_sequential_model(
         stops = (stop_logits.sigmoid() >= stop_threshold).cpu()
         for row, index in enumerate(active):
             expanded: List[Tuple[int, int]] = []
+            emitted: Dict[int, int] = {}
+            for token, region in canvases[index]:
+                if region >= 0 and token != vocab.GAP:
+                    emitted[region] = emitted.get(region, 0) + 1
             for position, (token, region) in enumerate(canvases[index]):
                 if token != vocab.GAP:
                     expanded.append((token, region))
                     continue
-                if bool(stops[row, position]):
+                if oracle_lengths is not None:
+                    stop = emitted.get(region, 0) >= oracle_lengths[index][region]
+                else:
+                    stop = bool(stops[row, position])
+                if stop:
                     continue
                 expanded.append((int(actions[row, position].item()), region))
                 expanded.append((vocab.GAP, region))
@@ -200,11 +216,14 @@ def decode_sequential_in_chunks(
     max_decode_span: int,
     stop_threshold: float,
     chunk_size: int = 64,
+    oracle_lengths: Sequence[Sequence[int]] = None,
 ) -> DecodeOutput:
     outputs = [
         decode_sequential_model(
             model, examples[start : start + chunk_size], vocab, device,
-            max_decode_span, stop_threshold
+            max_decode_span, stop_threshold,
+            None if oracle_lengths is None
+            else oracle_lengths[start : start + chunk_size],
         )
         for start in range(0, len(examples), chunk_size)
     ]

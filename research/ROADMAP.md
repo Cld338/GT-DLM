@@ -21,8 +21,9 @@ survives scoring under the model's own tree head at about 70% strength
 posterior. The structural term is *not* a deficit once tree shape is
 marginalized out: the exact model's length model ties both baselines
 (`+0.086 [-0.024,+0.200]`). Four explanations for poor generation are now
-rejected, and the surviving hypothesis is compounding in recursive decoding —
-a decoding problem rather than an objective one.
+rejected, compounding in recursive decoding included. What replaces them is a
+dissociation: the likelihood advantage is distributional, not top-1, so under
+oracle structure the exact model is no more accurate than the masked baseline.
 
 ## What is established
 
@@ -216,13 +217,17 @@ containing zero. The earlier `+3.65` reading was a units artifact. Structural
 cost also grows about linearly in span length, so nothing degrades with
 recursion depth.
 
-Four explanations for poor generation have now been tested and rejected: tree
-multiplicity, tighter gold context at depth, posterior-conditioned tree
-selection, and a worse structural model. The surviving hypothesis is
-compounding in recursive decoding — the masked baseline emits every token in
-one parallel pass and cannot compound, while the tree model makes each emitted
-token the interval boundary conditioning its children. See
-`research/LIKELIHOOD_DECOMPOSITION.md`.
+Compounding in recursive decoding has since been tested and also fails: on 304
+gaps where both arms are comparable, free-structure sampling reaches `2.2%`
+token accuracy against oracle structure's `1.5%`, and every residual bias
+favours the free arm. Five explanations for poor generation are now rejected.
+
+The oracle-structure arm supplies what replaces them. At `100%` length match
+for all three models on the same gaps, token accuracy is `4.0%` for the exact
+model, `3.3%` sequential and `4.2%` masked — the exact model's `1.36` nat per
+token likelihood advantage produces **no top-1 advantage at all**. The gain is
+distributional, not modal, which is why neither greedy nor sampled decoding can
+convert it. See `research/LIKELIHOOD_DECOMPOSITION.md`.
 
 ### 4. Cross-gap dependence, if pursued again
 
@@ -287,14 +292,16 @@ The `research/PROPOSAL.md` hold on scaling to 50--100M therefore stands.
 9. **Completed:** split the structural term. It is topology rather than root,
    and once tree shape is marginalized out the exact model ties both baselines,
    so it is not the bottleneck (`research/LIKELIHOOD_DECOMPOSITION.md`).
-10. **Next:** measure oracle-structure against free-sample token accuracy for
-   all three models on the matched two-gap checkpoint. This tests the surviving
-   hypothesis directly: the tree model should show a large gap between the two
-   and the masked model close to none. It needs no retraining.
-11. If that confirms, the responses are decoding-side — tree-marginalizing or
-   MBR decoding, or weakening how much each emitted token conditions its
-   descendants. Note this is a different class of fix from the six rejected
-   directions, all of which changed the objective or added structure to it.
+10. **Completed:** oracle-structure against free generation for all three
+   models. Compounding is rejected; the likelihood advantage is shown to be
+   distributional rather than top-1 (`research/LIKELIHOOD_DECOMPOSITION.md`).
+11. **Next, and gating:** repeat that oracle-structure accuracy measurement on
+   a *pretrained* two-gap checkpoint. The pretrained single-gap study is the
+   only place the tree model has led on this metric (`5.7%` against `3.7%`),
+   so this decides whether the top-1 deficit is a property of the objective or
+   of training from scratch at pilot scale. If the lead does not appear, the
+   objective improves likelihood without improving generation and scaling it
+   is not warranted on current evidence.
 12. Re-evaluate the scale-up gate (below).
 13. Optional: a genuine top-down rollout, closing the residual gap between
    gold-token and self-generated-token conditioning in the topology head.
@@ -331,7 +338,12 @@ about what the model can do rather than about the objective. The advantage is
 lexical in both cases, and it does not come at a structural cost: the exact
 model's length model ties both baselines once tree shape is marginalized out.
 
-A natural-text generation-quality advantage is **not** claimable. The
-decomposition has narrowed why to a decoding hypothesis — compounding in
-recursive expansion — with four alternative explanations rejected, but that
-hypothesis is not yet tested on this checkpoint.
+A natural-text generation-quality advantage is **not** claimable, and the
+decomposition now explains why in a way that bears on scaling. On matched
+two-gap checkpoints the likelihood advantage is distributional, not modal:
+under oracle structure the exact model's token accuracy (`4.0%`) is no better
+than the masked baseline's (`4.2%`) despite a `1.36` nat per token likelihood
+lead. Five candidate explanations for poor generation have been tested and
+rejected, including compounding. On current evidence this objective improves
+likelihood without improving generation, and item 11 is the test that decides
+whether a pretrained backbone changes that.

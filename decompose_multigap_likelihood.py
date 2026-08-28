@@ -287,23 +287,14 @@ def decompose_masked(model, examples, vocab, device, batch_size):
     }
 
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--trajectory-dir", default="artifacts/text_trajectory")
-    parser.add_argument(
-        "--checkpoint-dir", default="artifacts/text_multigap_matched_training",
-        help="directory holding the three from-scratch matched-training checkpoints",
-    )
-    parser.add_argument(
-        "--artifact-dir", default="artifacts/text_multigap_decomposition"
-    )
-    parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
-    parser.add_argument("--batch-size", type=int, default=16)
-    parser.add_argument("--test-examples", type=int, default=256)
-    parser.add_argument("--seed", type=int, default=17)
-    args = parser.parse_args()
+def load_matched_checkpoints(args, device):
+    """Load the three matched-training checkpoints and their shared test split.
 
-    device = choose_device(args.device)
+    Shared with `evaluate_multigap_generation.py` so that both evaluations read
+    exactly the same held-out examples as
+    `experiment_multigap_matched_training.py` wrote the checkpoints from.
+    Returns ``(vocab, test_examples, models_by_name, config)``.
+    """
     with open(
         os.path.join(args.trajectory_dir, "results.json"), encoding="utf-8"
     ) as handle:
@@ -355,6 +346,35 @@ def main():
         nhead=int(config["heads"]), layers=int(config["layers"]),
         max_positions=256,
     ))
+    return vocab, test, {
+        "factorized_depth_exact": exact_model,
+        "sequential_filler": sequential_model,
+        "length_masked": masked_model,
+    }, config
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--trajectory-dir", default="artifacts/text_trajectory")
+    parser.add_argument(
+        "--checkpoint-dir", default="artifacts/text_multigap_matched_training",
+        help="directory holding the three from-scratch matched-training checkpoints",
+    )
+    parser.add_argument(
+        "--artifact-dir", default="artifacts/text_multigap_decomposition"
+    )
+    parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
+    parser.add_argument("--batch-size", type=int, default=16)
+    parser.add_argument("--test-examples", type=int, default=256)
+    parser.add_argument("--seed", type=int, default=17)
+    args = parser.parse_args()
+
+    device = choose_device(args.device)
+    torch.set_float32_matmul_precision("high")
+    vocab, test, models, config = load_matched_checkpoints(args, device)
+    exact_model = models["factorized_depth_exact"]
+    sequential_model = models["sequential_filler"]
+    masked_model = models["length_masked"]
 
     print("decomposing {} two-gap test examples".format(len(test)))
     decompositions = {

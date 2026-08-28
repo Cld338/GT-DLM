@@ -292,6 +292,87 @@ compounding in recursive decoding, and the responses to try are decoding-side �
 tree-marginalizing or MBR decoding, or reducing how much each emitted token
 conditions its descendants.
 
+## Testing the compounding hypothesis: it fails
+
+The hypothesis above was that recursive decoding compounds errors while the
+masked baseline's single parallel pass cannot. `evaluate_multigap_generation.py`
+tests it by decoding the same 512 held-out gaps twice per model, once with the
+gold structure supplied and once with the model supplying its own.
+
+Two things had to be fixed before the comparison meant anything, and both are
+worth recording.
+
+**Greedy free decoding is uninformative.** All three models collapse to the
+empty-length mode. The masked baseline's free length-match rate is `23.6%`,
+which is exactly `121/512`, its empty-span rate — it predicts empty for
+essentially everything. This reproduces the collapse documented in
+`research/WINDOWED_SCREENING.md` on the matched two-gap checkpoints, and it
+means the free arm must be sampled.
+
+**Matched-length comparison is biased.** The free arm only contributes gaps
+whose sampled length came out right, and those are shorter and easier than the
+full set the oracle arm covers. Restricting both arms to exactly the gaps where
+the free arm produced at least one length match removes it.
+
+On those 304 shared gaps, at 16 samples per gap and temperature 1:
+
+| Arm | Token accuracy on shared gaps |
+|---|---:|
+| Oracle structure | 1.5% |
+| Free | 2.2% |
+
+The free arm is not worse. Every residual bias in this comparison favours the
+free arm, so it could fail to detect a drop, but the hypothesis predicted
+`free << oracle` and the measurement shows `free >= oracle`. **Compounding in
+recursive decoding is not the bottleneck.**
+
+## What is the bottleneck: the likelihood advantage is not a top-1 advantage
+
+The oracle-structure arm supplies the clean cross-model comparison this project
+was missing. All three models are at `100%` length match there, decoding the
+same gaps with the same greedy rule, so nothing is selected or biased:
+
+| Model | Oracle-structure token accuracy | Lexical nats / token |
+|---|---:|---:|
+| Factorized depth exact | 4.0% | **5.572** |
+| Sequential filler | 3.3% | 6.976 |
+| Learned lengths + masks | **4.2%** | 6.933 |
+
+The exact model holds a `1.36` nat per token likelihood advantage over the
+masked baseline and is nonetheless **not more accurate at all** — nominally
+slightly behind. The advantage is distributional: it assigns better-calibrated
+probability across the whole vocabulary without changing which token is on top.
+
+That dissociation explains the generation record better than anything tested so
+far, and it explains it for both decoding rules at once. Greedy generation
+depends only on the top-1 token, where there is no advantage to collect.
+Sampling draws from the full distribution, where the advantage is real but is
+spread over many tokens, so individual samples are not better. A model can hold
+a large and genuine likelihood advantage that generation cannot convert either
+way.
+
+Two caveats. The `5.7%` against `3.7%` oracle-structure figures quoted earlier
+in this project come from the pretrained single-gap study; these matched
+two-gap checkpoints have no pretrained backbone and do not reproduce the tree
+model's lead. And absolute accuracies of `3--4%` are low enough that these
+models are weak in absolute terms, so the comparison is between weak models.
+
+## Consequences
+
+This is the most decision-relevant result in the decomposition, and it is
+unfavourable. Scaling this objective should be expected to keep improving
+likelihood metrics while leaving generation where it is, because the two have
+been shown to be decoupled on this task. The scale-up gate's requirement of
+competitiveness "without material edit-similarity loss" is not merely unmet;
+the mechanism by which it would be met is now absent.
+
+What would change that is a reason to believe the top-1 prediction improves
+with scale or with a pretrained backbone. The pretrained single-gap study is
+the one place where the tree model did lead on oracle-structure accuracy
+(`5.7%` against `3.7%`), so repeating this exact measurement on a pretrained
+two-gap checkpoint is the natural next test, and it is the one that decides
+whether the objective is worth scaling.
+
 ## Limits of this measurement
 
 The topology prior still peeks at the answer in one place. Its topology head is
