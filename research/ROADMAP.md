@@ -27,7 +27,7 @@ oracle structure the exact model is no more accurate than the masked baseline.
 
 The generation question is now closed, negatively. Against a masked baseline
 given the *same* pretrained backbone, stream, split and budget, the tree model
-reaches `5.66%` oracle-structure token accuracy to the baseline's `11.86%`.
+reaches `5.66%` oracle-structure token accuracy to the baseline's `12.56%`.
 The likelihood result stands; the inference from it to better text does not,
 and scaling on generation grounds is not warranted.
 
@@ -268,7 +268,7 @@ The `research/PROPOSAL.md` hold on scaling to 50--100M therefore stands, and it
 should now be read as a settled decision rather than a pending one. The gate
 asks for improvement "without material IID edit-similarity loss"; the matched
 pretrained control shows the tree model at roughly half the masked baseline's
-oracle-structure token accuracy (`5.66%` against `11.86%`), so the clause is
+oracle-structure token accuracy (`5.66%` against `12.56%`), so the clause is
 failed by a clear margin, not by a narrow one awaiting more evidence. Scaling
 this objective for generation quality is not warranted on the current record.
 
@@ -321,8 +321,9 @@ this objective for generation quality is not warranted on the current record.
    over the masked baseline is withdrawn as confounded.
 12. **Completed, and decisive against the objective:** the masked baseline on
    the same pretrained backbone (85.2M against 87.0M), same stream, split and
-   budget, reaches `11.86%` oracle-structure top-1 accuracy against the tree
-   model's `5.66%`, with token NLL `5.880` against `6.161`. The preregistered
+   budget, reaches `12.56%` oracle-structure top-1 accuracy against the tree
+   model's `5.66%` in 3/3 seeds with non-overlapping ranges, and token NLL
+   `5.872+/-0.027` against `6.161`. The preregistered
    reading was that a tie would finalize the project as a
    likelihood-and-calibration result; this is a loss, so that conclusion holds
    more strongly (`research/LIKELIHOOD_DECOMPOSITION.md`).
@@ -376,8 +377,9 @@ deficit is not intrinsic to the objective.
 
 The matched cross-model control has since been built and settles it against the
 objective. Given the same backbone, stream, split and budget, the masked
-baseline reaches `11.86%` oracle-structure accuracy against the tree model's
-`5.66%`, and token NLL `5.880` against `6.161`. The tree model's earlier lead
+baseline reaches `12.56%` oracle-structure accuracy against the tree model's
+`5.66%` in 3/3 seeds with non-overlapping ranges, and token NLL `5.872` against
+`6.161`. The tree model's earlier lead
 over a `3.72%` baseline was an artifact of that baseline lacking pretraining
 and capacity. Where a pretrained masked encoder exists, using it directly beats
 adapting it to this objective on this task.

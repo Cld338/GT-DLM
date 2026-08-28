@@ -354,8 +354,18 @@ way.
 Two caveats. The `5.7%` against `3.7%` oracle-structure figures quoted earlier
 in this project come from the pretrained single-gap study; these matched
 two-gap checkpoints have no pretrained backbone and do not reproduce the tree
-model's lead. And absolute accuracies of `3--4%` are low enough that these
-models are weak in absolute terms, so the comparison is between weak models.
+model's lead.
+
+The second caveat is sharper than "these are weak models", and it was only
+found by adding a trivial floor. Always emitting the training corpus's most
+frequent token scores `4.35%` on these 1,723 two-gap target tokens. The three
+models score `4.00%`, `3.31%` and `4.18%`: **none of them clears the floor.**
+At pilot scale, trained from scratch, none of these models is doing lexical
+prediction that beats guessing the most frequent token. The reading that they
+are tied is correct but badly understated — they are tied at not working, and
+no conclusion about the objective can rest on differences between them at this
+level. The likelihood comparison is unaffected, since NLL is scored against the
+whole distribution rather than the argmax.
 
 ## Consequences
 
@@ -420,17 +430,27 @@ stream, the same splits and the same budget (5 epochs, batch 4, backbone lr
 `2e-5`, head lr `3e-4`), scored with the same evaluator on the same 128 test
 examples.
 
-| Model | Oracle-structure top-1 |
-|---|---:|
-| Masked baseline, same pretrained backbone (85M) | **11.86%** |
-| Depth exact, distilroberta backbone (87M, 3 seeds) | 5.66% |
-| Depth exact, random-init backbone *(capacity-matched control)* | 3.95% |
-| Oracle-length masked baseline, 10M from scratch | 3.72% |
+| Model | Oracle-structure top-1 | Per seed | Above trivial floor |
+|---|---:|---|---:|
+| Masked baseline, same pretrained backbone (85M) | **12.56%** | 11.9%, 13.0%, 12.8% | **+8.4** |
+| Depth exact, distilroberta backbone (87M) | 5.66% | 4.7%, 6.7%, 5.6% | +1.5 |
+| Depth exact, random-init backbone *(capacity-matched control)* | 3.95% | -- | -0.2 |
+| Oracle-length masked baseline, 10M from scratch | 3.72% | -- | -0.5 |
+
+The floor is the accuracy of always emitting the training corpus's most
+frequent token, `4.19%` on these 430 target tokens. It matters here: only the
+matched pretrained baseline is clearly doing lexical prediction at all, the
+pretrained tree model barely clears the floor, and both of the un-pretrained
+rows sit below it. The identical `sample_pairs`, `matched_nonempty_pairs` and
+`mean_generated_length` across these rows confirm they are scored on exactly
+the same gaps with the same gold lengths.
 
 **The result goes against the tree objective, and not narrowly.** Given the
 same backbone, the masked baseline more than doubles the tree model's
-oracle-structure accuracy, `11.86%` against `5.66%`. Held-out token NLL agrees:
-`5.880` for the baseline against the tree model's `6.161`. The tree model's
+oracle-structure accuracy, `12.56%` against `5.66%`, in three seeds each whose
+ranges do not overlap: the baseline's worst seed (`11.86%`) is above the tree
+model's best (`6.74%`). Held-out token NLL agrees: `5.872+/-0.027` for the
+baseline against the tree model's `6.161`. The tree model's
 previously reported lead over a `3.72%` baseline was an artifact of that
 baseline lacking both pretraining and capacity — all three differences were
 being credited to the objective.
@@ -447,9 +467,8 @@ interval chart. That is real. It is also the finding: where a pretrained masked
 encoder is available, using it directly beats adapting it to this objective, on
 this task at this scale.
 
-Limits. The baseline is one seed against the tree model's three, though the
-tree model's seed range (`4.7--6.7%`) sits far below `11.86%`, so seed noise is
-unlikely to account for the gap. The comparison is single-gap; the two-gap
+Limits. Both arms are three seeds with non-overlapping ranges, so seed noise
+is excluded. The comparison is single-gap; the two-gap
 setting would need the same treatment. And it says nothing about the likelihood
 result, which stands — the exact model's NLL advantage is real, replicated and
 compute-matched. What it removes is the inference from that advantage to better

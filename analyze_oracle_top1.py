@@ -123,22 +123,91 @@ def collect(root: str) -> List[Dict]:
         ),
         True, "10M, from scratch -- NOT pretrained, NOT capacity-matched",
     )
-    add(
-        "single_gap_pretrained", "Masked baseline, same pretrained backbone",
-        dig(
+    baseline_seeds = []
+    for suffix in ("", "_seed23", "_seed41"):
+        value = dig(
             read(os.path.join(
-                root, "text_pretrained_masked_baseline", "results.json",
+                root, "text_pretrained_masked_baseline" + suffix, "results.json",
             )),
             "oracle_metrics", ORACLE_KEY,
-        ),
-        True, "85M, same backbone, stream, split and budget -- the matched control",
+        )
+        if value is not None:
+            baseline_seeds.append(value)
+    add(
+        "single_gap_pretrained", "Masked baseline, same pretrained backbone",
+        statistics.mean(baseline_seeds) if baseline_seeds else None,
+        True,
+        "85M, same backbone, stream, split and budget -- the matched control",
+        baseline_seeds,
     )
     return rows
+
+
+def unigram_floor(
+    trajectory_dir: str,
+    examples_limit: int = 128,
+    gap_count: int = 1,
+) -> Optional[dict]:
+    """Accuracy of always emitting the training corpus's most frequent token.
+
+    Every accuracy in this file is a small percentage, and small percentages
+    are only interpretable against the trivial policy. A model that has learned
+    nothing but token frequency already scores something here, and any claim
+    about one model beating another has to clear that floor first.
+    """
+    try:
+        import torch
+        from tokenizers import Tokenizer
+        from gtdlm.text_data import (
+            random_length_windows, sample_text_infilling_examples,
+        )
+        from gtdlm.text_tokenizer import vocabulary_from_tokenizer
+    except Exception:
+        return None
+    base = read(os.path.join(trajectory_dir, "results.json"))
+    config = dig(base, "config")
+    if not config:
+        return None
+    data_dir = str(config["data_dir"])
+    if not os.path.exists(os.path.join(data_dir, "corpus.pt")):
+        return None
+    vocab = vocabulary_from_tokenizer(
+        Tokenizer.from_file(os.path.join(data_dir, "tokenizer.json"))
+    )
+    corpus = torch.load(
+        os.path.join(data_dir, "corpus.pt"), map_location="cpu", weights_only=True
+    )
+    data_seed = int(config["seed"])
+    counts: Dict[int, int] = {}
+    allowed = set(vocab.generated_token_ids)
+    for document in corpus["train"]:
+        for token in document.tolist() if hasattr(document, "tolist") else document:
+            if token in allowed:
+                counts[token] = counts.get(token, 0) + 1
+    if not counts:
+        return None
+    modal = max(counts, key=counts.get)
+    examples = sample_text_infilling_examples(
+        random_length_windows(
+            corpus["test"], data_seed + 403,
+            int(config["random_window_min"]), int(config["random_window_max"]),
+        ),
+        data_seed + 101, gap_counts=(gap_count,), min_span=1, max_span=8,
+    )[:examples_limit]
+    tokens = [token for e in examples for span in e.spans for token in span]
+    if not tokens:
+        return None
+    return {
+        "modal_token_id": modal,
+        "modal_token_accuracy": sum(t == modal for t in tokens) / len(tokens),
+        "target_tokens": len(tokens),
+    }
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--artifact-root", default="artifacts")
+    parser.add_argument("--trajectory-dir", default="artifacts/text_trajectory")
     parser.add_argument(
         "--output-dir", default="artifacts/text_oracle_top1_summary"
     )
@@ -215,18 +284,67 @@ def main():
                 100 * delta),
             "an unpretrained baseline was an artifact of that baseline's missing",
             "pretraining and capacity, not evidence for the objective.", "",
+            "Both arms are three seeds and their ranges do not overlap: the",
+            "baseline's worst seed ({:.2%}) is above the tree model's best".format(
+                min(matched_baseline["seed_values"] or [0])),
+            "({:.2%}), so this is not seed noise.".format(
+                max(pretrained["seed_values"] or [0])), "",
             "Filling masks is the task the backbone was pretrained on, so the",
             "baseline draws more from it than the tree model can. That asymmetry",
             "is real, and it is also the point: where a pretrained masked encoder",
             "is available, using it directly beats adapting it to an interval",
             "chart on this task at this scale.", "",
         ])
+    floor = unigram_floor(args.trajectory_dir)
+    two_gap_floor = unigram_floor(args.trajectory_dir, 256, gap_count=2)
+    if floor is not None:
+        lines.extend([
+            "## Trivial floor", "",
+            "Always emitting the training corpus's most frequent token scores",
+            "{:.2%} on the {} single-gap target tokens{}. Every accuracy above".format(
+                floor["modal_token_accuracy"], floor["target_tokens"],
+                "" if two_gap_floor is None else
+                ", and {:.2%} on the {} two-gap ones".format(
+                    two_gap_floor["modal_token_accuracy"],
+                    two_gap_floor["target_tokens"])),
+            "is measured against that floor, not against zero.", "",
+        ])
+        if two_gap_floor is not None:
+            lines.extend([
+                "This reframes the matched two-gap group above, where the three",
+                "models score {}. None of them clears the {:.2%} floor: at pilot".format(
+                    ", ".join(
+                        "{:.2%}".format(r["oracle_top1"])
+                        for r in by_group.get("two_gap_matched_from_scratch", [])
+                    ),
+                    two_gap_floor["modal_token_accuracy"]),
+                "scale and trained from scratch, none of them is doing lexical",
+                "prediction that beats guessing the most frequent token. The",
+                "earlier reading that they are tied is right but understated.", "",
+            ])
+        if matched_baseline is not None and pretrained is not None:
+            lines.append(
+                "Above the floor, the matched baseline gains {:+.1f} points and the".format(
+                    100 * (matched_baseline["oracle_top1"]
+                           - floor["modal_token_accuracy"]))
+            )
+            lines.append(
+                "tree model {:+.1f}, so the gap between them is not an artifact of".format(
+                    100 * (pretrained["oracle_top1"]
+                           - floor["modal_token_accuracy"]))
+            )
+            lines.extend(["both sitting near a high trivial baseline.", ""])
+
     os.makedirs(args.output_dir, exist_ok=True)
     with open(
         os.path.join(args.output_dir, "oracle_top1.json"), "w", encoding="utf-8"
     ) as handle:
         json.dump(
-            {"rows": rows, "pretraining_gain": pretraining_gain}, handle, indent=2
+            {
+                "rows": rows, "pretraining_gain": pretraining_gain,
+                "unigram_floor": floor,
+            },
+            handle, indent=2,
         )
     with open(
         os.path.join(args.output_dir, "ORACLE_TOP1.md"), "w", encoding="utf-8"

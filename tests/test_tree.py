@@ -232,12 +232,19 @@ class FrontierTest(unittest.TestCase):
         parts = decompose_exact_batch(
             model, examples, vocab, torch.device("cpu")
         )
+        # `total` is built as the sum of the three components, so checking it
+        # against them would be a tautology. The claim worth pinning is that
+        # the components reconstruct the likelihood the model actually reports.
+        likelihood, _, _ = multi_depth_gap_log_likelihoods(
+            model, examples, vocab, torch.device("cpu")
+        )
         reconstructed = (
             parts["lexical"] + parts["structure"] + parts["tree_entropy"]
         )
         self.assertTrue(
-            torch.allclose(reconstructed, parts["total"], atol=1e-5)
+            torch.allclose(reconstructed, likelihood.detach(), atol=1e-5)
         )
+        self.assertTrue(bool((parts["tree_entropy"] > 0).any()))
         self.assertTrue(bool((parts["tree_entropy"] >= -1e-6).all()))
 
         single = [TextInfillingExample(segments=((5,), (6,)), spans=((8,),))]

@@ -497,8 +497,9 @@ intrinsic to the objective.
 The matched cross-model control then settles the generation question against
 the objective. Giving the learned-length-plus-masks baseline the *same*
 backbone (85.2M against 87.0M), the same corruption stream, splits and budget,
-it reaches `11.86%` oracle-structure token accuracy to the tree model's
-`5.66%`, with held-out token NLL `5.880` against `6.161`. The tree model's
+it reaches `12.56%` oracle-structure token accuracy to the tree model's
+`5.66%` in 3/3 seeds whose ranges do not overlap, with held-out token NLL
+`5.872+/-0.027` against `6.161`. The tree model's
 previously reported lead over a `3.72%` baseline was an artifact of that
 baseline lacking both pretraining and capacity. Filling masks is the task the
 backbone was pretrained on, so the baseline draws more from it -- which is the
