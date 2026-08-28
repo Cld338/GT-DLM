@@ -123,6 +123,16 @@ def collect(root: str) -> List[Dict]:
         ),
         True, "10M, from scratch -- NOT pretrained, NOT capacity-matched",
     )
+    add(
+        "single_gap_pretrained", "Masked baseline, same pretrained backbone",
+        dig(
+            read(os.path.join(
+                root, "text_pretrained_masked_baseline", "results.json",
+            )),
+            "oracle_metrics", ORACLE_KEY,
+        ),
+        True, "85M, same backbone, stream, split and budget -- the matched control",
+    )
     return rows
 
 
@@ -180,22 +190,36 @@ def main():
             ))
         lines.append("")
 
+    matched_baseline = next(
+        (r for r in rows if "same pretrained backbone" in r["model"]), None
+    )
     if pretraining_gain is not None:
         lines.extend([
             "## Reading", "",
             "Against its capacity-matched random-init control, pretraining raises",
-            "oracle-structure top-1 accuracy from {:.2%} to {:.2%}, a gain of".format(
+            "the tree model's oracle-structure top-1 accuracy from {:.2%} to {:.2%},".format(
                 matched_control["oracle_top1"], pretrained["oracle_top1"]),
-            "{:+.1f} points. The top-1 deficit measured on the from-scratch".format(
+            "a gain of {:+.1f} points. The top-1 deficit measured on the".format(
                 100 * pretraining_gain),
-            "two-gap checkpoints is therefore **not** an intrinsic property of the",
-            "objective: a pretrained backbone moves it.", "",
-            "The cross-model claim is a different matter and remains confounded.",
-            "The masked baseline in the pretrained group is a 10M from-scratch",
-            "model with neither the pretraining nor the capacity of the 87M",
-            "pretrained tree model, so the tree model's lead over it does not",
-            "isolate the objective. The missing control is a masked baseline on",
-            "the same pretrained backbone, which has never been built.", "",
+            "from-scratch two-gap checkpoints is therefore **not** an intrinsic",
+            "property of the objective: a pretrained backbone moves it.", "",
+        ])
+    if matched_baseline is not None and pretrained is not None:
+        delta = matched_baseline["oracle_top1"] - pretrained["oracle_top1"]
+        lines.extend([
+            "The matched cross-model comparison, however, goes against the tree",
+            "objective. Given the same backbone, stream, split and budget, the",
+            "masked baseline reaches {:.2%} against the tree model's {:.2%},".format(
+                matched_baseline["oracle_top1"], pretrained["oracle_top1"]),
+            "a difference of {:+.1f} points. The tree model's earlier lead over".format(
+                100 * delta),
+            "an unpretrained baseline was an artifact of that baseline's missing",
+            "pretraining and capacity, not evidence for the objective.", "",
+            "Filling masks is the task the backbone was pretrained on, so the",
+            "baseline draws more from it than the tree model can. That asymmetry",
+            "is real, and it is also the point: where a pretrained masked encoder",
+            "is available, using it directly beats adapting it to an interval",
+            "chart on this task at this scale.", "",
         ])
     os.makedirs(args.output_dir, exist_ok=True)
     with open(

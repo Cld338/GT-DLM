@@ -410,27 +410,69 @@ and not against `3.72%`.
 The missing control is a masked baseline on the same pretrained backbone. It
 has never been built, and it is what a generation-quality claim would require.
 
-## Where this leaves the scale-up decision
+## The matched control, and what it decides
 
-The picture is genuinely mixed and should not be collapsed either way.
+That control has now been built and run. `PretrainedLengthMaskedModel` gives
+the learned-length-plus-masks baseline the same `distilroberta-base` backbone
+the tree model gets — 85.2M parameters against 87.0M — and
+`experiment_pretrained_masked_baseline.py` trains it on the same corruption
+stream, the same splits and the same budget (5 epochs, batch 4, backbone lr
+`2e-5`, head lr `3e-4`), scored with the same evaluator on the same 128 test
+examples.
 
-Against scaling: on matched two-gap checkpoints the likelihood advantage is
-large and the top-1 advantage is zero, and five mechanisms for the generation
-gap have been tested and rejected. Nothing yet demonstrates that better
-likelihood under this objective yields better text.
+| Model | Oracle-structure top-1 |
+|---|---:|
+| Masked baseline, same pretrained backbone (85M) | **11.86%** |
+| Depth exact, distilroberta backbone (87M, 3 seeds) | 5.66% |
+| Depth exact, random-init backbone *(capacity-matched control)* | 3.95% |
+| Oracle-length masked baseline, 10M from scratch | 3.72% |
 
-For scaling: the from-scratch pilot is not the regime the method is proposed
-for, and the one lever tested — a pretrained backbone — moves top-1 accuracy by
-`+1.7` points against its own control. That is the only intervention so far
-that has moved this metric at all.
+**The result goes against the tree objective, and not narrowly.** Given the
+same backbone, the masked baseline more than doubles the tree model's
+oracle-structure accuracy, `11.86%` against `5.66%`. Held-out token NLL agrees:
+`5.880` for the baseline against the tree model's `6.161`. The tree model's
+previously reported lead over a `3.72%` baseline was an artifact of that
+baseline lacking both pretraining and capacity — all three differences were
+being credited to the objective.
 
-What settles it is the missing control above, and it is a bounded piece of work
-rather than another exploratory screen: put the masked baseline on the same
-pretrained backbone, train both on the same two-gap corruptions at a matched
-budget, and measure oracle-structure top-1 accuracy. If the tree model leads
-there, the objective earns the scale-up. If it ties, the likelihood advantage
-is confirmed as decorative for generation purposes and the project's claim
-should be finalized as a likelihood-and-calibration result.
+This was preregistered in the previous revision of this document as the test
+that decides the scale-up, with "a tie finalizes the project as a
+likelihood-and-calibration result". It is not a tie; it is a loss, so the
+conclusion is stronger than the one that was prepared for.
+
+One asymmetry should be stated plainly rather than used as a defence. Filling
+masks is precisely the task `distilroberta` was pretrained on, so the baseline
+draws more from the backbone than the tree model can while adapting it to an
+interval chart. That is real. It is also the finding: where a pretrained masked
+encoder is available, using it directly beats adapting it to this objective, on
+this task at this scale.
+
+Limits. The baseline is one seed against the tree model's three, though the
+tree model's seed range (`4.7--6.7%`) sits far below `11.86%`, so seed noise is
+unlikely to account for the gap. The comparison is single-gap; the two-gap
+setting would need the same treatment. And it says nothing about the likelihood
+result, which stands — the exact model's NLL advantage is real, replicated and
+compute-matched. What it removes is the inference from that advantage to better
+text.
+
+## Where this leaves the project
+
+The likelihood claims survive intact and are the project's genuine
+contribution: exact latent-tree marginalization, a `-5.9` to `-7.5` nat
+two-gap advantage that holds under wall-clock matching and under scoring by the
+model's own tree head, and passing length calibration.
+
+The generation claim is now closed negatively. On the metric that matters for
+text, a matched pretrained baseline is roughly twice as good. Scaling this
+objective to 50--100M should be expected to widen the likelihood advantage
+while leaving generation behind that baseline, because likelihood and top-1
+accuracy have been shown decoupled here and the one matched cross-model
+comparison goes the wrong way.
+
+The honest framing for a writeup is a method that buys exact, well-calibrated
+joint probability over variable-length spans, with a negative result attached:
+on this task that probability does not convert into better generation than
+using a pretrained masked encoder directly.
 
 ## Limits of this measurement
 

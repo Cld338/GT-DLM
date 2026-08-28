@@ -1,7 +1,7 @@
 """Small bidirectional Transformer models for the mechanism experiment."""
 
 import math
-from typing import Optional
+from typing import Optional, Sequence
 
 import torch
 from torch import nn
@@ -822,6 +822,139 @@ class GapTreeSharedRegimeBoundaryModel(nn.Module):
         return self.topology_head(
             torch.cat((hidden, token_features, regime_features), dim=-1)
         )
+
+
+class PretrainedLengthMaskedModel(nn.Module):
+    """Learned length plus mask filling on the same pretrained backbone.
+
+    The control `research/LIKELIHOOD_DECOMPOSITION.md` identifies as missing.
+    Every published comparison of the exact tree objective against learned
+    lengths plus masks has pitted a pretrained tree model against a 10M
+    from-scratch baseline, so it differs in pretraining and capacity as well as
+    objective. This class removes the first two differences by giving the
+    baseline exactly the backbone the tree model gets.
+
+    Both passes reuse `PretrainedIntervalEncoder.render_prompts`, so the two
+    models see identical prompt text. Length prediction reads the single
+    mask-token state, exactly as the tree model's root gap context does. Token
+    prediction re-renders the prompt with the span's own number of mask tokens
+    and reads each of their states, which is the masked-language-model task the
+    backbone was pretrained on.
+    """
+
+    def __init__(
+        self,
+        vocab_size: int,
+        max_span: int,
+        gap_id: int,
+        pad_id: int,
+        source_tokenizer,
+        model_name: str = "distilroberta-base",
+        cache_dir: str = ".hf_cache/hub",
+        max_length: int = 256,
+        freeze_backbone: bool = False,
+        gradient_checkpointing: bool = False,
+        local_files_only: bool = False,
+        random_init_backbone: bool = False,
+        backbone=None,
+        pretrained_tokenizer=None,
+        initialize_custom_embeddings: bool = True,
+        tie_token_embeddings: bool = True,
+    ) -> None:
+        super().__init__()
+        self.encoder = PretrainedIntervalEncoder(
+            vocab_size,
+            gap_id,
+            pad_id,
+            source_tokenizer,
+            model_name,
+            cache_dir,
+            max_length=max_length,
+            freeze_backbone=freeze_backbone,
+            gradient_checkpointing=gradient_checkpointing,
+            local_files_only=local_files_only,
+            random_init_backbone=random_init_backbone,
+            backbone=backbone,
+            pretrained_tokenizer=pretrained_tokenizer,
+            initialize_custom_embeddings=initialize_custom_embeddings,
+        )
+        d_model = self.encoder.hidden_size
+        self.max_span = max_span
+        self.length_head = nn.Linear(d_model, max_span + 1)
+        self.token_head = nn.Linear(d_model, vocab_size)
+        if tie_token_embeddings:
+            self.token_head.weight = self.encoder.token_embedding.weight
+
+    @property
+    def d_model(self) -> int:
+        return self.encoder.hidden_size
+
+    def _encode_with_masks(
+        self,
+        tokens: torch.Tensor,
+        padding_mask: Optional[torch.Tensor],
+        mask_counts: Optional[Sequence[int]],
+    ):
+        """Encode each prompt with ``mask_counts[i]`` mask tokens in its gap.
+
+        Returns the backbone states at those mask positions, left-padded into a
+        ``[batch, max_count, hidden]`` tensor, with a boolean validity mask.
+        """
+        encoder = self.encoder
+        texts, _ = encoder.render_prompts(tokens, padding_mask)
+        mask_token = encoder.pretrained_tokenizer.mask_token
+        if mask_counts is not None:
+            rendered = []
+            for text, count in zip(texts, mask_counts):
+                # One mask is already present from render_prompts; a zero-length
+                # span still needs a position to read, so keep at least one.
+                rendered.append(text.replace(mask_token, mask_token * max(1, int(count))))
+            texts = rendered
+        encoded = encoder.pretrained_tokenizer(
+            texts,
+            padding=True,
+            truncation=True,
+            max_length=encoder.max_length,
+            return_tensors="pt",
+        )
+        model_inputs = {
+            key: value.to(tokens.device) for key, value in encoded.items()
+        }
+        hidden = encoder.backbone(**model_inputs).last_hidden_state
+        matches = model_inputs["input_ids"].eq(
+            int(encoder.pretrained_tokenizer.mask_token_id)
+        )
+        width = int(matches.sum(dim=1).max().clamp_min(1))
+        states = hidden.new_zeros((len(texts), width, hidden.size(-1)))
+        valid = torch.zeros(
+            (len(texts), width), dtype=torch.bool, device=hidden.device
+        )
+        for row in range(len(texts)):
+            positions = matches[row].nonzero().flatten()
+            if not positions.numel():
+                # Truncation removed the gap; leave the row invalid.
+                continue
+            positions = positions[:width]
+            states[row, : positions.numel()] = hidden[row, positions]
+            valid[row, : positions.numel()] = True
+        return encoder.context_norm(states), valid
+
+    def predict_length(
+        self,
+        tokens: torch.Tensor,
+        padding_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        states, _ = self._encode_with_masks(tokens, padding_mask, None)
+        return self.length_head(states[:, 0])
+
+    def predict_tokens(
+        self,
+        tokens: torch.Tensor,
+        padding_mask: Optional[torch.Tensor] = None,
+        mask_counts: Optional[Sequence[int]] = None,
+    ):
+        states, valid = self._encode_with_masks(tokens, padding_mask, mask_counts)
+        return self.token_head(states), valid
 
 
 class LengthMaskedModel(nn.Module):

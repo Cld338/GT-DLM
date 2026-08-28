@@ -91,6 +91,7 @@ python measure_multigap_wallclock.py --device cuda --calibration-epochs 3 --arti
 python experiment_multigap_matched_training.py --device cuda --models sequential_filler,length_masked --epochs-per-model "sequential_filler=361,length_masked=212" --exact-checkpoint artifacts/text_multigap_matched_training/factorized_depth_exact.pt --artifact-dir artifacts/text_multigap_wallclock_matched
 python decompose_multigap_likelihood.py --device cuda --artifact-dir artifacts/text_multigap_decomposition
 python evaluate_multigap_generation.py --device cuda --artifact-dir artifacts/text_multigap_generation
+python experiment_pretrained_masked_baseline.py --device cuda --artifact-dir artifacts/text_pretrained_masked_baseline
 python analyze_oracle_top1.py --output-dir artifacts/text_oracle_top1_summary
 ```
 
@@ -491,7 +492,19 @@ Pretraining is the one intervention that moves top-1 accuracy. Consolidating
 every checkpoint's oracle-structure accuracy, the `distilroberta` backbone
 reaches `5.66%` against its capacity-matched random-init control's `3.95%`, a
 well-controlled `+1.7` points, so the from-scratch top-1 deficit is not
-intrinsic to the objective. The tree model has still never been compared with
-a *comparably pretrained* baseline, so no generation claim follows; building
-that baseline is the gating experiment. See
+intrinsic to the objective.
+
+The matched cross-model control then settles the generation question against
+the objective. Giving the learned-length-plus-masks baseline the *same*
+backbone (85.2M against 87.0M), the same corruption stream, splits and budget,
+it reaches `11.86%` oracle-structure token accuracy to the tree model's
+`5.66%`, with held-out token NLL `5.880` against `6.161`. The tree model's
+previously reported lead over a `3.72%` baseline was an artifact of that
+baseline lacking both pretraining and capacity. Filling masks is the task the
+backbone was pretrained on, so the baseline draws more from it -- which is the
+finding rather than a defence: where a pretrained masked encoder is available,
+using it directly beats adapting it to this objective on this task.
+
+The likelihood results stand and are the project's contribution; the inference
+from them to better generation does not. See
 `research/LIKELIHOOD_DECOMPOSITION.md`.

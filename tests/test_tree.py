@@ -1221,6 +1221,102 @@ class SpanPolicyTests(unittest.TestCase):
             "AB<mask>D",
         )
 
+    def test_pretrained_masked_baseline_reads_one_state_per_span_token(self):
+        """The baseline must expose exactly as many mask states as span tokens.
+
+        Its whole purpose is to be capacity- and pretraining-matched to the
+        tree model, so the token pass has to read one backbone state per
+        target token; a zero-length span still needs one readable position for
+        the length head. Stubs stand in for the backbone so the contract is
+        checked without downloading weights.
+        """
+        from gtdlm.model import PretrainedLengthMaskedModel
+
+        hidden_size = 6
+
+        class StubConfig:
+            hidden_size = 6
+
+        class StubBackbone(torch.nn.Module):
+            config = StubConfig()
+
+            def __init__(self):
+                super().__init__()
+                self.embeddings = torch.nn.Embedding(32, hidden_size)
+
+            def get_input_embeddings(self):
+                return self.embeddings
+
+            def forward(self, input_ids=None, attention_mask=None, **kwargs):
+                del attention_mask, kwargs
+                return type(
+                    "Output", (), {"last_hidden_state": self.embeddings(input_ids)}
+                )()
+
+        class StubPretrainedTokenizer:
+            mask_token = "<m>"
+            mask_token_id = 9
+
+            def __call__(self, texts, **kwargs):
+                del kwargs
+                rows = []
+                for text in texts:
+                    row = []
+                    index = 0
+                    while index < len(text):
+                        if text.startswith(self.mask_token, index):
+                            row.append(self.mask_token_id)
+                            index += len(self.mask_token)
+                        else:
+                            row.append(1)
+                            index += 1
+                    rows.append(row)
+                width = max(len(row) for row in rows)
+                ids = [row + [0] * (width - len(row)) for row in rows]
+                attention = [
+                    [1] * len(row) + [0] * (width - len(row)) for row in rows
+                ]
+                return {
+                    "input_ids": torch.tensor(ids),
+                    "attention_mask": torch.tensor(attention),
+                }
+
+        class StubSourceTokenizer:
+            def decode(self, token_ids, skip_special_tokens=False):
+                del skip_special_tokens
+                return "".join(chr(token_id) for token_id in token_ids)
+
+        vocab = TextVocabulary(
+            vocab_size=12, PAD=0, GAP=1, MASK=2, LEFT=3, RIGHT=4
+        )
+        model = PretrainedLengthMaskedModel(
+            vocab.vocab_size, 8, vocab.GAP, vocab.PAD, StubSourceTokenizer(),
+            backbone=StubBackbone(),
+            pretrained_tokenizer=StubPretrainedTokenizer(),
+            initialize_custom_embeddings=False,
+            tie_token_embeddings=False,
+        )
+        examples = [
+            TextInfillingExample(((65, 66), (68,)), ((67, 67, 67),)),
+            TextInfillingExample(((65,), (68,)), ((),)),
+        ]
+        rows = [example.prompt(vocab) for example in examples]
+        width = max(len(row) for row in rows)
+        tokens = torch.full((2, width), vocab.PAD, dtype=torch.long)
+        padding = torch.ones_like(tokens, dtype=torch.bool)
+        for index, row in enumerate(rows):
+            tokens[index, :len(row)] = torch.tensor(row)
+            padding[index, :len(row)] = False
+
+        logits, valid = model.predict_tokens(tokens, padding, [3, 0])
+        self.assertEqual(int(valid[0].sum()), 3)
+        # An empty span keeps one readable position rather than none.
+        self.assertEqual(int(valid[1].sum()), 1)
+        self.assertEqual(logits.shape[-1], vocab.vocab_size)
+        self.assertEqual(
+            tuple(model.predict_length(tokens, padding).shape), (2, 9)
+        )
+
     def test_unique_mask_positions_rejects_missing_or_duplicate_masks(self):
         input_ids = torch.tensor([[1, 9, 2], [9, 3, 4]])
         self.assertTrue(torch.equal(unique_token_positions(input_ids, 9), torch.tensor([1, 0])))
