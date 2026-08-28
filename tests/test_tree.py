@@ -32,6 +32,7 @@ from experiment_text_depth_inside import (
     depth_batch_log_likelihoods,
     reachable_depth_intervals,
 )
+from decompose_multigap_likelihood import decompose_exact_batch
 from experiment_text_depth_inside_multigap import (
     collate_multi_prompt_contexts,
     multi_depth_gap_log_likelihoods,
@@ -113,6 +114,7 @@ from gtdlm.text_tokenizer import (
     SPECIAL_TOKENS,
     split_documents,
     train_bpe_tokenizer,
+    vocabulary_from_pretrained_tokenizer,
     vocabulary_from_tokenizer,
 )
 from gtdlm.tree import (
@@ -204,6 +206,84 @@ class FrontierTest(unittest.TestCase):
         self.assertTrue(torch.allclose(joint[0], individual.sum(), atol=1e-6))
         (-joint.mean()).backward()
         self.assertGreater(float(model.token_head.weight.grad.abs().sum()), 0.0)
+
+    def test_likelihood_decomposition_reconstructs_the_exact_value(self):
+        """lexical + structure + tree entropy must equal the exact likelihood.
+
+        The whole point of the decomposition diagnostic is that the split is
+        exact rather than approximate, so the identity is pinned here. The
+        entropy term must also be non-negative and must vanish for a
+        single-token span, whose interval admits exactly one pivot tree.
+        """
+        vocab = TextVocabulary(
+            vocab_size=12, PAD=0, GAP=1, MASK=2, LEFT=3, RIGHT=4
+        )
+        model = IntervalInsideBoundaryModel(
+            vocab_size=vocab.vocab_size, gap_id=vocab.GAP, pad_id=vocab.PAD,
+            d_model=24, nhead=4, layers=1, max_positions=32, max_steps=8,
+            dropout=0.0,
+        )
+        model.eval()
+        examples = [
+            TextInfillingExample(
+                segments=((5,), (6,), (7,)), spans=((8, 9, 10, 11), (10,))
+            ),
+            TextInfillingExample(segments=((6,), (8,), (7,)), spans=((), (9, 5))),
+        ]
+        parts = decompose_exact_batch(
+            model, examples, vocab, torch.device("cpu")
+        )
+        # `total` is built as the sum of the three components, so checking it
+        # against them would be a tautology. The claim worth pinning is that
+        # the components reconstruct the likelihood the model actually reports.
+        likelihood, _, _ = multi_depth_gap_log_likelihoods(
+            model, examples, vocab, torch.device("cpu")
+        )
+        reconstructed = (
+            parts["lexical"] + parts["structure"] + parts["tree_entropy"]
+        )
+        self.assertTrue(
+            torch.allclose(reconstructed, likelihood.detach(), atol=1e-5)
+        )
+        self.assertTrue(bool((parts["tree_entropy"] > 0).any()))
+        self.assertTrue(bool((parts["tree_entropy"] >= -1e-6).all()))
+
+        single = [TextInfillingExample(segments=((5,), (6,)), spans=((8,),))]
+        single_parts = decompose_exact_batch(
+            model, single, vocab, torch.device("cpu")
+        )
+        self.assertAlmostEqual(
+            float(single_parts["tree_entropy"][0]), 0.0, places=5
+        )
+
+        # The midpoint arm scores one fixed tree, so it must reconstruct the
+        # midpoint joint weight, carry exactly zero entropy, and -- since a
+        # single tree cannot beat the sum over all of them -- never score
+        # better than the posterior arm.
+        midpoint = decompose_exact_batch(
+            model, examples, vocab, torch.device("cpu"), tree="midpoint"
+        )
+        self.assertTrue(torch.allclose(
+            midpoint["lexical"] + midpoint["structure"] + midpoint["tree_entropy"],
+            midpoint["total"], atol=1e-5,
+        ))
+        self.assertTrue(
+            torch.allclose(midpoint["tree_entropy"], torch.zeros(2), atol=1e-6)
+        )
+        self.assertTrue(bool((midpoint["total"] <= parts["total"] + 1e-5).all()))
+
+        # The topology-prior arm is an ELBO under the model's own topology
+        # head: it must reconstruct, carry non-negative entropy, and sit at or
+        # below the posterior arm, which is the tight bound.
+        prior = decompose_exact_batch(
+            model, examples, vocab, torch.device("cpu"), tree="topology_prior"
+        )
+        self.assertTrue(torch.allclose(
+            prior["lexical"] + prior["structure"] + prior["tree_entropy"],
+            prior["total"], atol=1e-5,
+        ))
+        self.assertTrue(bool((prior["tree_entropy"] >= -1e-6).all()))
+        self.assertTrue(bool((prior["total"] <= parts["total"] + 1e-5).all()))
 
     def test_shared_latent_exactly_marginalizes_and_nests_factorized_model(self):
         vocab = TextVocabulary(
@@ -477,6 +557,185 @@ class FrontierTest(unittest.TestCase):
         (-exact.mean()).backward()
         self.assertIsNotNone(backbone.embedding.weight.grad)
         self.assertIsNotNone(model.encoder.step_embedding.weight.grad)
+
+    def test_native_pretrained_vocabulary_reuses_embeddings_and_mlm_head(self):
+        from gtdlm.model import PretrainedLengthMaskedModel
+
+        class StubNativeTokenizer:
+            pad_token_id = 1
+            mask_token_id = 9
+            bos_token_id = 0
+            eos_token_id = 2
+            cls_token_id = None
+            sep_token_id = None
+            all_special_ids = [0, 1, 2, 3, 9]
+            mask_token = "<mask>"
+
+            def __len__(self):
+                return 16
+
+        class StubBackbone(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.config = SimpleNamespace(hidden_size=8)
+                self.embedding = torch.nn.Embedding(16, 8)
+
+            def get_input_embeddings(self):
+                return self.embedding
+
+            def forward(self, input_ids, attention_mask):
+                del attention_mask
+                return SimpleNamespace(last_hidden_state=self.embedding(input_ids))
+
+        tokenizer = StubNativeTokenizer()
+        vocab = vocabulary_from_pretrained_tokenizer(tokenizer)
+        self.assertNotIn(3, vocab.generated_token_ids)
+        backbone = StubBackbone()
+        mlm_head = torch.nn.Sequential(
+            torch.nn.Linear(8, 8),
+            torch.nn.GELU(),
+            torch.nn.LayerNorm(8),
+            torch.nn.Linear(8, len(tokenizer)),
+        )
+        model = PretrainedIntervalInsideModel(
+            vocab.vocab_size,
+            vocab.GAP,
+            vocab.PAD,
+            tokenizer,
+            backbone=backbone,
+            pretrained_tokenizer=tokenizer,
+            pretrained_lm_head=mlm_head,
+            native_vocabulary=True,
+            initialize_custom_embeddings=False,
+        )
+        self.assertIs(model.encoder.token_embedding, backbone.embedding)
+        self.assertIs(model.token_head, mlm_head)
+        example = corrupt_token_sequence([5, 6, 7, 8, 10], [(1, 3)])
+        exact, midpoint = depth_batch_log_likelihoods(
+            model, [example], vocab, torch.device("cpu"), 4, 0.0
+        )
+        self.assertTrue(torch.isfinite(exact).all())
+        self.assertGreaterEqual(float(exact[0]), float(midpoint[0]))
+        (-exact.mean()).backward()
+        self.assertIsNotNone(backbone.embedding.weight.grad)
+        self.assertIsNotNone(mlm_head[-1].weight.grad)
+
+        baseline_backbone = StubBackbone()
+        baseline_head = torch.nn.Sequential(
+            torch.nn.Linear(8, 8), torch.nn.GELU(),
+            torch.nn.LayerNorm(8), torch.nn.Linear(8, len(tokenizer)),
+        )
+        baseline = PretrainedLengthMaskedModel(
+            vocab.vocab_size, 8, vocab.GAP, vocab.PAD, tokenizer,
+            backbone=baseline_backbone,
+            pretrained_tokenizer=tokenizer,
+            pretrained_lm_head=baseline_head,
+            native_vocabulary=True,
+            initialize_custom_embeddings=False,
+        )
+        prompts = torch.tensor([
+            [vocab.LEFT, 5, vocab.GAP, 8, vocab.RIGHT],
+            [vocab.LEFT, 6, vocab.GAP, vocab.RIGHT, vocab.PAD],
+        ])
+        padding = prompts.eq(vocab.PAD)
+        logits, valid = baseline.predict_tokens(prompts, padding, [2, 3])
+        self.assertEqual(tuple(logits.shape), (2, 3, len(tokenizer)))
+        self.assertEqual(valid.sum(dim=1).tolist(), [2, 3])
+        logits[valid].mean().backward()
+        self.assertIsNotNone(baseline_head[-1].weight.grad)
+
+    def test_fixed_mask_bank_is_length_blind_and_differentiable(self):
+        class StubTokenizer:
+            pad_token_id = 1
+            mask_token_id = 9
+            bos_token_id = 0
+            eos_token_id = 2
+            cls_token_id = None
+            sep_token_id = None
+            all_special_ids = [0, 1, 2, 3, 9]
+            mask_token = "<mask>"
+
+            def __len__(self):
+                return 16
+
+        class ContextualBackbone(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.config = SimpleNamespace(hidden_size=8)
+                self.embedding = torch.nn.Embedding(16, 8)
+
+            def get_input_embeddings(self):
+                return self.embedding
+
+            def forward(self, input_ids, attention_mask):
+                hidden = self.embedding(input_ids)
+                mask = attention_mask.unsqueeze(-1).to(hidden.dtype)
+                context = (hidden * mask).sum(1, keepdim=True) / mask.sum(
+                    1, keepdim=True
+                ).clamp_min(1)
+                positions = torch.arange(
+                    hidden.size(1), device=hidden.device, dtype=hidden.dtype
+                ).view(1, -1, 1)
+                return SimpleNamespace(
+                    last_hidden_state=hidden + context + positions / 10
+                )
+
+        tokenizer = StubTokenizer()
+        vocab = vocabulary_from_pretrained_tokenizer(tokenizer)
+        backbone = ContextualBackbone()
+        mlm_head = torch.nn.Sequential(
+            torch.nn.Linear(8, 8), torch.nn.GELU(),
+            torch.nn.LayerNorm(8), torch.nn.Linear(8, len(tokenizer)),
+        )
+        model = PretrainedIntervalInsideModel(
+            vocab.vocab_size, vocab.GAP, vocab.PAD, tokenizer,
+            backbone=backbone, pretrained_tokenizer=tokenizer,
+            pretrained_lm_head=mlm_head, native_vocabulary=True,
+            fixed_mask_count=4, initialize_custom_embeddings=False,
+            dropout=0.0,
+        )
+        # Same observed prompt, different hidden target lengths. Target length
+        # must not change encoder input or the fixed bank.
+        examples = [
+            TextInfillingExample(((5,), (8,)), ((6,),)),
+            TextInfillingExample(((5,), (8,)), ((6, 7, 10),)),
+        ]
+        rows = [example.prompt(vocab) for example in examples]
+        tokens = torch.tensor(rows)
+        padding = tokens.eq(vocab.PAD)
+        encoded = model.encode(tokens, padding)
+        self.assertEqual(tuple(model.encoder.mask_bank_states.shape), (2, 4, 8))
+        self.assertTrue(torch.allclose(
+            model.encoder.mask_bank_states[0],
+            model.encoder.mask_bank_states[1],
+        ))
+        self.assertFalse(torch.allclose(
+            model.encoder.mask_bank_states[0, 0],
+            model.encoder.mask_bank_states[0, 1],
+        ))
+        gap_positions = torch.tensor([row.index(vocab.GAP) for row in rows])
+        contexts = encoded[torch.arange(2), gap_positions]
+        hidden = model.interval_hidden(
+            contexts, torch.tensor([5, 5]), torch.tensor([8, 8]),
+            torch.tensor([0, 0]), torch.tensor([0, 1]),
+        )
+        self.assertTrue(torch.allclose(hidden[0], hidden[1], atol=1e-6))
+
+        exact, _, charts = depth_batch_log_likelihoods(
+            model, examples, vocab, torch.device("cpu"), 4, 0.0,
+            return_charts=True,
+        )
+        self.assertTrue(torch.isfinite(exact).all())
+        for index, combined in charts["combined"].items():
+            reachable = combined > float("-inf")
+            self.assertTrue(torch.allclose(
+                combined[reachable],
+                charts["token"][index][reachable]
+                + charts["topology"][index][reachable],
+            ))
+        (-exact.mean()).backward()
+        self.assertIsNotNone(model.mask_bank_query.weight.grad)
+        self.assertIsNotNone(model.mask_bank_residual_scale.grad)
 
     def test_lexical_metrics_condition_on_nonempty_length_matches(self):
         examples = [
@@ -1148,6 +1407,235 @@ class SpanPolicyTests(unittest.TestCase):
             render_masked_text(example, StubTokenizer(), "<mask>"),
             "AB<mask>D",
         )
+
+    def test_pretrained_masked_baseline_reads_one_state_per_span_token(self):
+        """The baseline must expose exactly as many mask states as span tokens.
+
+        Its whole purpose is to be capacity- and pretraining-matched to the
+        tree model, so the token pass has to read one backbone state per
+        target token; a zero-length span still needs one readable position for
+        the length head. Stubs stand in for the backbone so the contract is
+        checked without downloading weights.
+        """
+        from gtdlm.model import PretrainedLengthMaskedModel
+
+        hidden_size = 6
+
+        class StubConfig:
+            hidden_size = 6
+
+        class StubBackbone(torch.nn.Module):
+            config = StubConfig()
+
+            def __init__(self):
+                super().__init__()
+                self.embeddings = torch.nn.Embedding(32, hidden_size)
+
+            def get_input_embeddings(self):
+                return self.embeddings
+
+            def forward(self, input_ids=None, attention_mask=None, **kwargs):
+                del attention_mask, kwargs
+                return type(
+                    "Output", (), {"last_hidden_state": self.embeddings(input_ids)}
+                )()
+
+        class StubPretrainedTokenizer:
+            mask_token = "<m>"
+            mask_token_id = 9
+
+            def __call__(self, texts, **kwargs):
+                del kwargs
+                rows = []
+                for text in texts:
+                    row = []
+                    index = 0
+                    while index < len(text):
+                        if text.startswith(self.mask_token, index):
+                            row.append(self.mask_token_id)
+                            index += len(self.mask_token)
+                        else:
+                            row.append(1)
+                            index += 1
+                    rows.append(row)
+                width = max(len(row) for row in rows)
+                ids = [row + [0] * (width - len(row)) for row in rows]
+                attention = [
+                    [1] * len(row) + [0] * (width - len(row)) for row in rows
+                ]
+                return {
+                    "input_ids": torch.tensor(ids),
+                    "attention_mask": torch.tensor(attention),
+                }
+
+        class StubSourceTokenizer:
+            def decode(self, token_ids, skip_special_tokens=False):
+                del skip_special_tokens
+                return "".join(chr(token_id) for token_id in token_ids)
+
+        vocab = TextVocabulary(
+            vocab_size=12, PAD=0, GAP=1, MASK=2, LEFT=3, RIGHT=4
+        )
+        model = PretrainedLengthMaskedModel(
+            vocab.vocab_size, 8, vocab.GAP, vocab.PAD, StubSourceTokenizer(),
+            backbone=StubBackbone(),
+            pretrained_tokenizer=StubPretrainedTokenizer(),
+            initialize_custom_embeddings=False,
+            tie_token_embeddings=False,
+        )
+        examples = [
+            TextInfillingExample(((65, 66), (68,)), ((67, 67, 67),)),
+            TextInfillingExample(((65,), (68,)), ((),)),
+        ]
+        rows = [example.prompt(vocab) for example in examples]
+        width = max(len(row) for row in rows)
+        tokens = torch.full((2, width), vocab.PAD, dtype=torch.long)
+        padding = torch.ones_like(tokens, dtype=torch.bool)
+        for index, row in enumerate(rows):
+            tokens[index, :len(row)] = torch.tensor(row)
+            padding[index, :len(row)] = False
+
+        logits, valid = model.predict_tokens(tokens, padding, [3, 0])
+        self.assertEqual(int(valid[0].sum()), 3)
+        # An empty span keeps one readable position rather than none.
+        self.assertEqual(int(valid[1].sum()), 1)
+        self.assertEqual(logits.shape[-1], vocab.vocab_size)
+        self.assertEqual(
+            tuple(model.predict_length(tokens, padding).shape), (2, 9)
+        )
+
+    def test_prompt_attention_gives_each_interval_its_own_context(self):
+        """Interval records must read the backbone sequence, not one pooled vector.
+
+        The chart's only link to the prompt is otherwise a single summary
+        vector plus two static boundary embeddings, which
+        research/LIKELIHOOD_DECOMPOSITION.md attributes 84% of the generation
+        deficit to. This pins the three properties the fix must have: records
+        of the same example with different boundaries get different attended
+        context, attention never crosses examples, and padded key positions are
+        excluded.
+        """
+        from gtdlm.model import PretrainedIntervalInsideModel
+
+        hidden_size = 8
+
+        class StubConfig:
+            hidden_size = 8
+
+        class StubBackbone(torch.nn.Module):
+            config = StubConfig()
+
+            def __init__(self):
+                super().__init__()
+                self.embeddings = torch.nn.Embedding(32, hidden_size)
+
+            def get_input_embeddings(self):
+                return self.embeddings
+
+            def forward(self, input_ids=None, attention_mask=None, **kwargs):
+                del attention_mask, kwargs
+                return type(
+                    "Output", (), {"last_hidden_state": self.embeddings(input_ids)}
+                )()
+
+        class StubPretrainedTokenizer:
+            mask_token = "<m>"
+            mask_token_id = 9
+
+            def __call__(self, texts, **kwargs):
+                del kwargs
+                rows = []
+                for text in texts:
+                    row, index = [], 0
+                    while index < len(text):
+                        if text.startswith(self.mask_token, index):
+                            row.append(self.mask_token_id)
+                            index += len(self.mask_token)
+                        else:
+                            row.append(1 + (ord(text[index]) % 7))
+                            index += 1
+                    rows.append(row)
+                width = max(len(row) for row in rows)
+                return {
+                    "input_ids": torch.tensor(
+                        [r + [0] * (width - len(r)) for r in rows]
+                    ),
+                    "attention_mask": torch.tensor(
+                        [[1] * len(r) + [0] * (width - len(r)) for r in rows]
+                    ),
+                }
+
+        class StubSourceTokenizer:
+            def decode(self, token_ids, skip_special_tokens=False):
+                del skip_special_tokens
+                return "".join(chr(t) for t in token_ids)
+
+        vocab = TextVocabulary(
+            vocab_size=12, PAD=0, GAP=1, MASK=2, LEFT=3, RIGHT=4
+        )
+        model = PretrainedIntervalInsideModel(
+            vocab.vocab_size, vocab.GAP, vocab.PAD, StubSourceTokenizer(),
+            backbone=StubBackbone(), pretrained_tokenizer=StubPretrainedTokenizer(),
+            initialize_custom_embeddings=False, tie_token_embeddings=False,
+            prompt_attention=True, dropout=0.0,
+        ).eval()
+        self.assertTrue(model.prompt_attention)
+
+        # Two examples with different observed text, so cross-example leakage
+        # would be visible.
+        examples = [
+            TextInfillingExample(((5, 6, 7), (8,)), ((10, 11),)),
+            TextInfillingExample(((9,), (6,)), ((11,),)),
+        ]
+        rows = [e.prompt(vocab) for e in examples]
+        width = max(len(r) for r in rows)
+        tokens = torch.full((2, width), vocab.PAD, dtype=torch.long)
+        padding = torch.ones_like(tokens, dtype=torch.bool)
+        for i, r in enumerate(rows):
+            tokens[i, :len(r)] = torch.tensor(r)
+            padding[i, :len(r)] = False
+
+        model.encoder.keep_prompt_states(True)
+        encoded = model.encode(tokens, padding)
+        self.assertIsNotNone(model.encoder.prompt_states)
+        positions = [r.index(vocab.GAP) for r in rows]
+        contexts = torch.stack([encoded[i, p] for i, p in enumerate(positions)])
+
+        # Three records: two from example 0 with different boundaries, one
+        # from example 1.
+        owners = torch.tensor([0, 0, 1])
+        left = torch.tensor([7, 10, 9])
+        right = torch.tensor([8, 8, 6])
+        depths = torch.tensor([0, 1, 0])
+        hidden = model.interval_hidden(
+            contexts[owners], left, right, depths, owners
+        )
+        self.assertEqual(tuple(hidden.shape), (3, hidden_size))
+        # Same example, different boundaries -> different representation.
+        self.assertFalse(torch.allclose(hidden[0], hidden[1], atol=1e-6))
+
+        # Attention must not read another example's prompt: re-running with
+        # example 1's states replaced must leave example 0's records intact.
+        baseline = hidden.clone()
+        model.encoder.prompt_states = model.encoder.prompt_states.clone()
+        model.encoder.prompt_states[1] += 5.0
+        shifted = model.interval_hidden(
+            contexts[owners], left, right, depths, owners
+        )
+        self.assertTrue(torch.allclose(baseline[:2], shifted[:2], atol=1e-6))
+        self.assertFalse(torch.allclose(baseline[2], shifted[2], atol=1e-6))
+
+        # Positions that are already padding must carry no weight at all.
+        model.encoder.keep_prompt_states(True)
+        model.encode(tokens, padding)
+        padded = (~model.encoder.prompt_mask[1]).nonzero().flatten()
+        self.assertTrue(padded.numel(), "example 1 should be shorter than example 0")
+        model.encoder.prompt_states = model.encoder.prompt_states.clone()
+        model.encoder.prompt_states[1, padded[0]] += 100.0
+        padded_shift = model.interval_hidden(
+            contexts[owners], left, right, depths, owners
+        )
+        self.assertTrue(torch.allclose(baseline, padded_shift, atol=1e-5))
 
     def test_unique_mask_positions_rejects_missing_or_duplicate_masks(self):
         input_ids = torch.tensor([[1, 9, 2], [9, 3, 4]])

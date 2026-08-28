@@ -52,6 +52,8 @@ def lexical_batch_log_probabilities(
     tokens, padding, positions, roots_left, roots_right = collate_prompt_contexts(
         examples, vocab, device
     )
+    if getattr(model, "prompt_attention", False):
+        model.encoder.keep_prompt_states(True)
     encoded = model.encode(tokens, padding)
     contexts = encoded[torch.arange(len(examples), device=device), positions]
     records = []
@@ -90,8 +92,13 @@ def lexical_batch_log_probabilities(
         span_tensors[example_index][pivot]
         for example_index, _, _, _, pivot in records
     ])
+    owners = (
+        (example_ids,)
+        if getattr(model, "requires_record_owners", False)
+        else ()
+    )
     token_logits, _, _ = model.interval_logits(
-        contexts[example_ids], left, right, depths
+        contexts[example_ids], left, right, depths, *owners
     )
     generated_ids = torch.tensor(
         vocab.generated_token_ids, dtype=torch.long, device=device

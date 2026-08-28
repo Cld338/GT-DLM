@@ -35,7 +35,15 @@ def sequential_log_likelihoods(
     vocab: TextVocabulary,
     device: torch.device,
     batch_size: int,
+    return_components: bool = False,
 ) -> torch.Tensor:
+    """Sum every STOP/token term along the unique left-to-right trajectories.
+
+    ``return_components`` additionally returns the STOP (structural) and token
+    (lexical) parts separately, so that
+    `decompose_multigap_likelihood.py` can compare them against the exact
+    model's chart decomposition term by term.
+    """
     records = []
     for example_index, example in enumerate(examples):
         for level in range(max(len(span) for span in example.spans) + 1):
@@ -46,6 +54,8 @@ def sequential_log_likelihoods(
             ]
             records.append((example_index, level, target_positions, state))
     values = torch.zeros(len(examples), device=device)
+    stop_values = torch.zeros(len(examples), device=device)
+    token_values = torch.zeros(len(examples), device=device)
     generated_ids = torch.tensor(vocab.generated_token_ids, device=device)
     token_index = torch.full(
         (vocab.vocab_size,), -1, dtype=torch.long, device=device
@@ -75,13 +85,16 @@ def sequential_log_likelihoods(
             for position in target_positions:
                 target = int(state["targets"][position])
                 if target == vocab.stop_action:
-                    term = F.logsigmoid(stop_logits[row, position])
+                    stop_term = F.logsigmoid(stop_logits[row, position])
+                    token_term = stop_term.new_zeros(())
                 else:
-                    term = (
-                        F.logsigmoid(-stop_logits[row, position])
-                        + token_logp[row, position, token_index[target]]
-                    )
-                values[example_index] += term
+                    stop_term = F.logsigmoid(-stop_logits[row, position])
+                    token_term = token_logp[row, position, token_index[target]]
+                values[example_index] += stop_term + token_term
+                stop_values[example_index] += stop_term
+                token_values[example_index] += token_term
+    if return_components:
+        return values, stop_values, token_values
     return values
 
 

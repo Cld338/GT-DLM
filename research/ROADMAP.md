@@ -15,6 +15,52 @@ pretrained context encoder now supplies the largest single-gap likelihood gain
 so far. The natural-text claims remain likelihood-and-calibration claims, not
 generation claims, and the preregistered scale-up gate has not been passed.
 
+The two-gap likelihood advantage has since been decomposed. It is lexical, it
+survives scoring under the model's own tree head at about 70% strength
+(`-5.3`/`-5.6` nats), and it is not an artifact of the gold-conditioned tree
+posterior. The structural term is *not* a deficit once tree shape is
+marginalized out: the exact model's length model ties both baselines
+(`+0.086 [-0.024,+0.200]`). Five explanations for poor generation are now
+rejected, compounding in recursive decoding included. What replaces them is a
+dissociation: the likelihood advantage is distributional, not top-1, so under
+oracle structure the exact model is no more accurate than the masked baseline.
+
+The generation gap has since been attributed, and it is mostly **not** the
+objective. A second, shared handicap sits underneath it: the project discards
+`distilroberta`'s MLM head and predicts over a 4,000-token custom vocabulary,
+and the untouched pretrained model matches our finetuned baseline on decoded
+text (`4.1%` exact match and `0.319` character similarity against `4.1%` and
+`0.316`, 244 spans). Five epochs of finetuning buy no text quality over the
+pretrained model as it comes, so every accuracy figure here sits on a
+handicapped output side. Against a masked baseline on the same pretrained backbone the tree
+model reaches `5.66%` oracle-structure token accuracy to the baseline's
+`12.56%` — but cutting that baseline's encoder access down to the tree model's
+single pooled vector, with its objective untouched, drops it to `6.74%`. That
+removes `5.81` of the `6.90` point gap, about `84%`, leaving a `1.09` point
+residual. At comparable encoder access the tree objective is ahead on token
+NLL. Scaling the current configuration is still not warranted, but what needs
+fixing is the encoder integration, not the objective. See
+`research/LIKELIHOOD_DECOMPOSITION.md`.
+
+The native-vocabulary/MLM-head follow-up is now complete at seed 17. It removes
+the shared output-side handicap from both arms but does not remove the
+tree-specific deficit: on the same 128 native spans the masked baseline reaches
+`20.04%` oracle token accuracy, `0.410` decoded character similarity and
+`7.92%` exact match against the tree's `8.71%`, `0.281` and `0.99%`; token NLL
+is `4.921` against `6.786`. The tree retains passing length TV (`0.157`). See
+`research/NATIVE_VOCABULARY.md`.
+
+The first successful tree-side integration is now in hand at seed 17. A fixed
+bank of eight native mask states is independent of target length and feeds
+MLM-compatible states to each queried node. Test exact NLL improves
+`24.552 -> 20.026`, topology-prior ELBO NLL improves `25.829 -> 20.512`, and
+length TV improves `0.157 -> 0.126`. The gain survives answer-independent tree
+selection and is not posterior exploitation. Generation moves much less:
+oracle-midpoint accuracy is `9.80%`, and sampled top-down rollout reaches
+`12.24%` on length-matched pairs against the masked baseline's `20.04%`. The
+remaining blocker is gold-token/boundary exposure during topology training. See
+`research/FIXED_MASK_BANK.md`.
+
 ## What is established
 
 ### Synthetic range-infilling (closed)
@@ -48,8 +94,15 @@ with the exact depth-inside objective unchanged, gives test exact NLL
 `21.658+/-0.051` across three training seeds against `25.367` for the same
 architecture with randomly initialized backbone weights. The paired gain over
 that capacity-matched control is `-3.709+/-0.051` nats with all three intervals
-excluding zero. Oracle-structure token accuracy reaches `5.7%`, above the
-oracle-length masked baseline's `3.7%` for the first time.
+excluding zero. Oracle-structure token accuracy reaches `5.7%` against its own
+capacity-matched control's `3.95%`, a well-controlled `+1.7` points.
+
+This was previously recorded here as "above the oracle-length masked
+baseline's `3.7%` for the first time". That comparison is withdrawn: the
+masked baseline is a 10M from-scratch model with neither the pretraining nor
+the capacity of the 87M pretrained tree model, so it differs in three ways at
+once and does not isolate the objective. See
+`research/LIKELIHOOD_DECOMPOSITION.md`.
 
 The corpus-overlap objection has since been answered. On BBC News published
 five years after the backbone's pretraining lineage, the same control gives
@@ -72,7 +125,10 @@ TV in 3/3 seeds at a measured exact-NLL cost.
 
 The scope limit again matters: oracle-structure token accuracy is `2.1--3.5%`
 against `3.7%` for the oracle-length masked model, and free samples are weak.
-This is a joint structural likelihood result. See
+Both of those numbers are now known to sit at or below the `4.19%` trivial
+floor of always emitting the most frequent training token, so neither model is
+doing argmax lexical prediction at all and the ordering between them carries no
+weight. This is a joint structural likelihood result. See
 `research/LEXICAL_EVALUATION.md` and `research/JOINT_LEXICAL_OBJECTIVE.md`.
 
 ### Factorized multi-gap (training-matched likelihood result)
@@ -94,6 +150,18 @@ Parallel sampling control 3 is now complete. Raw per-gap TV is
 Exact ordered-pair TV does not improve (`0.293 -> 0.296`), so the result adds
 a marginal and aggregate-length calibration claim, not an exact-pair or fluent
 generation claim. See `research/MULTIGAP_EXACT_INSIDE.md`.
+
+The training-matching confound is now closed on wall-clock as well as update
+count. The exact chart costs 12.05x (sequential filler) and 7.09x (learned
+lengths + masks) more wall-clock per epoch, so the update-matched comparison
+above gave the exact model far more compute, not less. Retraining both
+baselines from scratch for an epoch budget that consumes the exact model's own
+30-epoch wall-clock cost (361 and 212 epochs respectively) still loses by
+`-5.916 [-6.594,-5.248]` and `-7.486 [-8.265,-6.728]` nats. The sequential
+filler used nearly its full budget and improved substantially, while the
+length-masked model plateaued after roughly 43 epochs, confirming it was
+already near convergence. See "Wall-clock-matched baseline retraining" in
+`research/MULTIGAP_EXACT_INSIDE.md`.
 
 ## Closed directions
 
@@ -146,11 +214,14 @@ matched intervention isolating the surviving twin. See
 |---|---|---|
 | From-scratch matched two-gap training of all three models | `MULTIGAP_EXACT_INSIDE.md` control 4 | **Done:** exact beats both baselines by `-7.947 [-8.711,-7.202]` and `-7.646 [-8.394,-6.926]` nats at matched updates; the multi-gap likelihood claim is unblocked |
 | Joint and per-gap length calibration under parallel sampling | `MULTIGAP_EXACT_INSIDE.md` control 3 | **Done:** per-gap TV is `0.131--0.134` raw and `0.119--0.121` calibrated; total length improves slightly, while exact ordered-pair calibration does not |
-| Comparison by training FLOPs or wall-clock, not epoch count | `JOINT_LEXICAL_OBJECTIVE.md` item 4 | Not started |
+| Comparison by training FLOPs or wall-clock, not epoch count | `JOINT_LEXICAL_OBJECTIVE.md` item 4 | **Done:** exact costs 12.05x (sequential) / 7.09x (masked) more wall-clock per epoch; retraining both baselines for a matched wall-clock budget (361 / 212 epochs) still loses by `-5.916 [-6.594,-5.248]` and `-7.486 [-8.265,-6.728]` nats |
 | Insertion/blank baselines and the selected two-block frontier model | `DEPTH_INSIDE.md` control 4 | Partial: sequential and masked are done |
 | Corpus not seen by the pretrained backbone | `PRETRAINED_CONTEXT_DEPTH.md` limit 1 | **Done:** gain is larger on post-lineage text (`-6.136` vs `-4.879`); see `CORPUS_OVERLAP_CONTROL.md` |
+| Baseline on the same pretrained backbone | `LIKELIHOOD_DECOMPOSITION.md` | **Done:** matched on backbone, stream, split and budget, the masked baseline reaches `12.56%` oracle-structure accuracy to the tree model's `5.66%` in 3/3 non-overlapping seeds; `84%` of that gap is encoder access, not the objective |
+| Native pretrained vocabulary and MLM head | `NATIVE_VOCABULARY.md` | **Done at seed 17:** the full native path is implemented for corpus, chart, baseline and evaluation. It raises the lexical floor but leaves the native masked baseline well ahead (`20.04%` vs `8.71%` token accuracy; `0.410` vs `0.281` decoded character similarity) |
+| Fixed length-blind native mask bank | `FIXED_MASK_BANK.md` | **Done at seed 17:** exact and topology-prior NLL improve by `4.526` and `5.317` nats, with TV `0.126`; generation improves only modestly and remains below the native masked baseline |
 
-### 3. Generation quality
+### 3. Generation quality (deficit attributed to the encoder, not the objective)
 
 Source: named independently by `research/LEXICAL_EVALUATION.md` and
 `research/JOINT_LEXICAL_OBJECTIVE.md` item 5.
@@ -163,9 +234,68 @@ pretraining from capacity: the capacity-matched random-init control stays at
 `0.5%`.
 
 Generation itself remains unusable. Free-sample exact match is `0.2--0.5%` and
-edit similarity `2.3%`, so the item stays open. What has changed is its
-diagnosis: the bottleneck is no longer missing context in the encoder. See
-`research/PRETRAINED_CONTEXT_DEPTH.md`.
+edit similarity `2.3%`. The diagnosis changed first -- the bottleneck is not
+missing context in the encoder (`research/PRETRAINED_CONTEXT_DEPTH.md`) -- and
+the deficit has since been attributed, by the chain below, mostly to the
+encoder integration rather than to the objective.
+
+An exact decomposition of the two-gap likelihood has now resolved this, and
+the answer is unfavorable to the headline claim. Splitting `log p(x)` into
+lexical, structural, and tree-entropy parts shows the advantage is `-9.2` to
+`-9.5` nats lexical, `+3.7` nats *against* the exact model on structure, and
+only `-2.2` nats of tree entropy, so tree multiplicity is not the explanation
+and neither is tighter gold context at depth.
+
+Re-scoring under tree distributions that do not select on token likelihood
+then locates the advantage. Every arm is an ELBO of the same family, so the
+totals stay comparable. Under the model's own topology head the advantage
+survives at `-5.557 [-6.194,-4.950]` and `-5.257 [-5.874,-4.663]` nats;
+dropping token-likelihood selection costs `2.389 [2.154,2.626]` nats, not the
+whole gap. Along the midpoint tree the total does reverse to `+1.9`/`+2.2`,
+but that is an artifact of midpoint being off-distribution for a model trained
+on the exact marginal: the structural term is unchanged between the posterior
+and the topology prior (`+0.030 [-0.057,+0.120]`) and blows up only under
+midpoint, which costs the model four times as much as the topology prior does.
+
+Splitting the structural term then removes it as a candidate bottleneck. The
+cost is almost entirely topology (`6.875`) rather than the root STOP decision
+(`1.087`, identical across arms), and the exact model's term describes a whole
+tree while both baselines describe only a length. Marginalizing shape out makes
+them comparable, and the exact model then ties: `+0.086 [-0.024,+0.200]` against
+sequential and `+0.092 [-0.008,+0.197]` against masked, both intervals
+containing zero. The earlier `+3.65` reading was a units artifact. Structural
+cost also grows about linearly in span length, so nothing degrades with
+recursion depth.
+
+Compounding in recursive decoding has since been tested and also fails: on 304
+gaps where both arms are comparable, free-structure sampling reaches `2.2%`
+token accuracy against oracle structure's `1.5%`, and every residual bias
+favours the free arm. Five explanations for poor generation are now rejected.
+
+The oracle-structure arm supplies what replaces them. At `100%` length match
+for all three models on the same gaps, token accuracy is `4.0%` for the exact
+model, `3.3%` sequential and `4.2%` masked — the exact model's `1.36` nat per
+token likelihood advantage produces **no top-1 advantage at all**. The gain is
+distributional, not modal, which is why neither greedy nor sampled decoding can
+convert it.
+
+A trivial floor makes that starker. Always emitting the most frequent training
+token scores `4.35%` on these two-gap targets, so none of the three from-scratch
+models clears it: they are tied at not beating frequency guessing, and no
+conclusion about the objective can rest on differences between them.
+
+The matched control then measures the gap. Given the *same* pretrained
+backbone, stream, split and budget, the masked baseline reaches `12.56%`
+oracle-structure accuracy against the tree model's `5.66%` in 3/3 seeds with
+non-overlapping ranges, and token NLL `5.872+/-0.027` against `6.161`.
+
+The encoder-access test then attributes it. Cutting that baseline's encoder
+access down to the tree model's single pooled vector, objective untouched,
+drops it to `6.74%+/-0.23` — removing `5.81` of the `6.90` point gap, about
+`84%`, and leaving a `1.09` point residual. At comparable encoder access the
+tree objective is ahead on token NLL. So the deficit is mostly how the
+pretrained encoder was attached; the residual is the honest upper bound on the
+objective's own cost. See `research/LIKELIHOOD_DECOMPOSITION.md`.
 
 ### 4. Cross-gap dependence, if pursued again
 
@@ -187,9 +317,27 @@ compute. The oracle-length gap must be reported either way.
 |---|---|
 | Length-extrapolation slice | Copy-specific attribution and corpus overlap are now controlled, but at flattened lengths neither arm beats the uniform prior per example, so `anchored_copy` is not usable as a long-span slice on this corpus |
 | Gap-composition slice | Synthetic passes; text has likelihood plus per-gap and total-length calibration evidence, but exact ordered-pair calibration remains weak |
-| Compute-matched AR competitiveness | Not attempted |
+| Compute-matched AR competitiveness | **Passed on likelihood.** The sequential filler is this project's autoregressive baseline (`research/NATURAL_LANGUAGE_PILOT.md`). Retrained for a wall-clock budget matching the exact model's own training cost (361 vs 30 epochs), it loses two-gap joint NLL by `-5.916 [-6.594,-5.248]`, and the advantage survives scoring under the model's own tree head at `-5.557 [-6.194,-4.950]`. Not compared on standard LM perplexity or against an external AR implementation, and the gate's "without material edit-similarity loss" clause is failed separately under generation quality |
 
-The `research/PROPOSAL.md` hold on scaling to 50--100M therefore stands.
+The `research/PROPOSAL.md` hold on scaling to 50--100M therefore stands. The
+gate asks for improvement "without material IID edit-similarity loss"; the
+matched pretrained control shows the tree model at roughly half the masked
+baseline's oracle-structure token accuracy (`5.66%` against `12.56%`), so the
+clause is failed by a clear margin. Scaling the current configuration is not
+warranted.
+
+The vocabulary handicap has now been removed in both arms. The native masked
+baseline improves to `20.04%` oracle token accuracy while the pooled tree reaches
+`8.71%`, confirming that the output side mattered but did not explain the
+tree-specific gap. The fixed mask bank then solves the encoder-likelihood part:
+topology-prior NLL improves by `5.317` nats with TV `0.126`. It still reaches
+only `12.24%` on length-matched sampled rollout pairs, so the gate remains held
+for generation rather than likelihood.
+
+The hold is not a verdict on the objective. It now blocks scaling a training
+path that uses gold pivot tokens and boundaries but rolls out with self-generated
+ones. Recommended order item 18 is the intervention to test before the gate is
+re-run.
 
 ## Recommended order
 
@@ -215,8 +363,64 @@ The `research/PROPOSAL.md` hold on scaling to 50--100M therefore stands.
 5. **Completed:** joint and per-gap parallel length calibration. Marginal and
    total-length calibration pass; ordered-pair calibration does not improve
    (`research/MULTIGAP_EXACT_INSIDE.md`).
-6. Complete the baseline table and the FLOP-matched comparison.
-7. Re-evaluate the scale-up gate.
+6. **Completed:** the baseline table and the wall-clock-matched comparison.
+   The exact model costs 12.05x / 7.09x more wall-clock per epoch than the
+   two baselines; retraining both for a matched wall-clock budget still loses
+   by `-5.916` and `-7.486` nats (`research/MULTIGAP_EXACT_INSIDE.md`).
+7. **Completed:** exact decomposition of the likelihood advantage into
+   lexical, structural, and tree-entropy terms. The advantage is lexical, not
+   tree multiplicity, and the exact model is measurably *worse* at structure
+   (`research/LIKELIHOOD_DECOMPOSITION.md`).
+8. **Completed:** re-score under tree distributions that do not select on
+   token likelihood. Under the model's own topology head the advantage
+   survives at `-5.3`/`-5.6` nats; the midpoint reversal is an
+   off-distribution artifact (`research/LIKELIHOOD_DECOMPOSITION.md`).
+9. **Completed:** split the structural term. It is topology rather than root,
+   and once tree shape is marginalized out the exact model ties both baselines,
+   so it is not the bottleneck (`research/LIKELIHOOD_DECOMPOSITION.md`).
+10. **Completed:** oracle-structure against free generation for all three
+   models. Compounding is rejected; the likelihood advantage is shown to be
+   distributional rather than top-1 (`research/LIKELIHOOD_DECOMPOSITION.md`).
+11. **Completed:** consolidated oracle-structure top-1 accuracy across every
+   checkpoint (`analyze_oracle_top1.py`). Pretraining moves the metric by
+   `+1.7` points against its capacity-matched control (`3.95% -> 5.66%`), so
+   the top-1 deficit is not intrinsic to the objective. The tree model's lead
+   over the masked baseline is withdrawn as confounded.
+12. **Completed, decisive about the implementation rather than the objective:**
+   the masked baseline on the same pretrained backbone (85.2M against 87.0M),
+   same stream, split and budget, reaches `12.56%` oracle-structure top-1
+   accuracy against the tree model's `5.66%` in 3/3 non-overlapping seeds, with
+   token NLL `5.872+/-0.027` against `6.161`. The two arms do not use the
+   encoder comparably, so this does not isolate the objective
+   (`research/LIKELIHOOD_DECOMPOSITION.md`).
+13. **Completed:** the encoder-access test, run by bottlenecking the *masked*
+   baseline rather than enriching the tree model (per-position states would
+   have made the tree model `p(x|n)` and changed the objective). Holding the
+   objective fixed, cutting encoder access to one pooled vector drops the
+   baseline `12.56% -> 6.74%`, explaining `84%` of the gap in 3/3 seeds
+   (sd `0.23` points) (`research/LIKELIHOOD_DECOMPOSITION.md`).
+14. **Completed as a negative seed-17 pilot:** `--prompt-attention` gives each
+   interval record a span-length-agnostic query over the backbone sequence, but
+   worsens test exact NLL (`21.61 -> 22.66`) and leaves same-seed oracle token
+   accuracy unchanged at `4.65%`. Do not replicate this block unchanged.
+15. **Completed at seed 17:** keep RoBERTa's native vocabulary and full MLM head
+   in the corpus, corruption, chart, matched baseline and evaluation. The native
+   tree reaches `8.71%` oracle token accuracy and `0.281` decoded character
+   similarity, but the matched masked baseline reaches `20.04%` and `0.410`.
+   The shared handicap was real, but removing it exposes rather than closes the
+   tree-specific integration gap (`research/NATIVE_VOCABULARY.md`).
+16. **Completed at seed 17:** fixed eight-mask bank. It gives each node a native
+   MLM-compatible state without target-length leakage, improving exact NLL
+   `24.552 -> 20.026`, topology-prior NLL `25.829 -> 20.512`, and TV
+   `0.157 -> 0.126` (`research/FIXED_MASK_BANK.md`).
+17. **Completed diagnostically:** genuine top-down rollout. Greedy rollout gets
+   `16.95%` token accuracy on only 11 length-matched spans; 16 stochastic samples
+   per prompt yield `12.24%` over 156 matched pairs. This improves on the
+   off-distribution midpoint readout but remains below the masked baseline.
+18. **Next:** train against the gold-token/boundary exposure gap revealed by the
+   rollout, while keeping the fixed bank length-blind. Do not use the midpoint
+   auxiliary unchanged; midpoint NLL is `35.754` and is off-distribution here.
+19. Re-evaluate the scale-up gate only after that intervention.
 
 ## Currently claimable
 
@@ -233,4 +437,55 @@ NLL, replicated in 3/3 seeds against a capacity-matched control. It is claimable
 as an encoder-ablation result: it buys likelihood and token quality, not
 calibration, and it is a single-gap result on pilot-scale corpora. The overlap
 objection is answered on post-lineage text.
-A natural-text generation-quality advantage is **not** claimable.
+
+The two-gap factorized exact model's likelihood advantage over both proper
+baselines is compute-matched, not just update-matched: giving each baseline a
+wall-clock budget equal to the exact model's own training cost (12x for the
+sequential/autoregressive filler, 7x for the learned-length model) still
+leaves the exact model ahead by `5.9`-`7.5` nats with paired intervals
+excluding zero.
+
+That claim carries one qualification worth stating. The `-7.9` figure is
+measured under the tree posterior conditioned on the gold span. Under the
+model's own topology head, which does not select trees on token likelihood, it
+is `-5.557 [-6.194,-4.950]` and `-5.257 [-5.874,-4.663]`. Both are claimable;
+the second is the more conservative and should be preferred when the context is
+about what the model can do rather than about the objective. The advantage is
+lexical in both cases, and it does not come at a structural cost: the exact
+model's length model ties both baselines once tree shape is marginalized out.
+
+A natural-text generation-quality advantage is **not** claimable, and the
+decomposition now explains why in a way that bears on scaling. On matched
+two-gap checkpoints the likelihood advantage is distributional, not modal:
+under oracle structure the exact model's token accuracy (`4.0%`) is no better
+than the masked baseline's (`4.2%`) despite a `1.36` nat per token likelihood
+lead. Five candidate explanations for poor generation have been tested and
+rejected, including compounding.
+
+The matched pretrained control shows the current configuration losing to a
+plain masked model by roughly a factor of two, but that is attributable to the
+encoder integration rather than the objective: bottlenecking the baseline's
+encoder to the tree model's single pooled vector, objective untouched, removes
+`84%` of the gap.
+
+Pretraining is the one intervention that moves top-1 accuracy: `+1.7` points
+against its capacity-matched control (`3.95% -> 5.66%`), so the from-scratch
+deficit is not intrinsic to the objective.
+
+The matched cross-model control has since been built. Given the same backbone,
+stream, split and budget, the masked baseline reaches `12.56%` oracle-structure
+accuracy against the tree model's `5.66%` in 3/3 seeds with non-overlapping
+ranges, and token NLL `5.872` against `6.161`. The tree model's earlier lead
+over a `3.72%` baseline was an artifact of that baseline lacking pretraining
+and capacity.
+
+That control turned out to be decisive about the implementation, not the
+objective. `PretrainedIntervalEncoder` compresses the prompt into one
+768-dimensional vector, and a single linear layer then scores every one of the
+`O(D n^3)` chart cells from it plus static boundary embeddings, while the
+baseline runs all six transformer layers per prediction. Cutting the baseline's
+encoder access to that same single vector, with its objective unchanged, drops
+it from `12.56%` to `6.74%` — `84%` of the gap, in 3/3 seeds. At comparable
+encoder access the tree objective is ahead on token NLL (`6.161` against
+`6.814`). The `1.09` point residual is the honest upper bound on what the
+objective itself costs here.

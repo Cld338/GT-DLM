@@ -8,11 +8,14 @@ from typing import Dict, List, Sequence
 
 import datasets
 import torch
+from transformers import AutoTokenizer
 
 from gtdlm.text_tokenizer import (
     SPECIAL_TOKENS,
     tokenize_documents,
+    tokenize_pretrained_documents,
     train_bpe_tokenizer,
+    vocabulary_from_pretrained_tokenizer,
     vocabulary_from_tokenizer,
 )
 
@@ -43,6 +46,10 @@ def main() -> None:
     parser.add_argument("--max-validation-documents", type=int, default=1000)
     parser.add_argument("--max-test-documents", type=int, default=1000)
     parser.add_argument("--seed", type=int, default=17)
+    parser.add_argument("--native-vocabulary", action="store_true")
+    parser.add_argument("--model-name", default="distilroberta-base")
+    parser.add_argument("--cache-dir", default=".hf_cache/hub")
+    parser.add_argument("--local-files-only", action="store_true")
     args = parser.parse_args()
 
     corpus = datasets.load_dataset(DATASET_NAME, DATASET_CONFIG)
@@ -60,30 +67,50 @@ def main() -> None:
             seed=args.seed + {"train": 0, "validation": 1, "test": 2}[split_name],
         )
 
-    tokenizer = train_bpe_tokenizer(documents["train"], args.vocab_size)
-    vocab = vocabulary_from_tokenizer(tokenizer)
-    tokenized = {
-        name: tokenize_documents(
-            tokenizer, split_documents, args.max_document_tokens
+    if args.native_vocabulary:
+        tokenizer = AutoTokenizer.from_pretrained(
+            args.model_name,
+            cache_dir=args.cache_dir,
+            use_fast=True,
+            local_files_only=args.local_files_only,
         )
+        vocab = vocabulary_from_pretrained_tokenizer(tokenizer)
+        tokenize = tokenize_pretrained_documents
+    else:
+        tokenizer = train_bpe_tokenizer(documents["train"], args.vocab_size)
+        vocab = vocabulary_from_tokenizer(tokenizer)
+        tokenize = tokenize_documents
+    tokenized = {
+        name: tokenize(tokenizer, split_documents, args.max_document_tokens)
         for name, split_documents in documents.items()
     }
     os.makedirs(args.output_dir, exist_ok=True)
     tokenizer_path = os.path.join(args.output_dir, "tokenizer.json")
     corpus_path = os.path.join(args.output_dir, "corpus.pt")
     manifest_path = os.path.join(args.output_dir, "manifest.json")
-    tokenizer.save(tokenizer_path)
+    if args.native_vocabulary:
+        tokenizer.save_pretrained(args.output_dir)
+    else:
+        tokenizer.save(tokenizer_path)
     torch.save(tokenized, corpus_path)
     manifest = {
         "dataset": DATASET_NAME,
         "config": DATASET_CONFIG,
         "datasets_version": datasets.__version__,
         "seed": args.seed,
-        "requested_vocab_size": args.vocab_size,
+        "requested_vocab_size": (
+            None if args.native_vocabulary else args.vocab_size
+        ),
         "actual_vocab_size": vocab.vocab_size,
+        "native_vocabulary": args.native_vocabulary,
+        "model_name": args.model_name if args.native_vocabulary else None,
         "max_document_tokens": args.max_document_tokens,
         "limits": limits,
-        "special_tokens": list(SPECIAL_TOKENS),
+        "special_tokens": (
+            list(tokenizer.all_special_tokens)
+            if args.native_vocabulary
+            else list(SPECIAL_TOKENS)
+        ),
         "special_token_ids": {
             "PAD": vocab.PAD,
             "GAP": vocab.GAP,
@@ -107,4 +134,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

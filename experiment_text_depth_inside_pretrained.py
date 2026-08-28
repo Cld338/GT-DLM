@@ -9,7 +9,7 @@ import os
 import torch
 from tokenizers import Tokenizer
 from torch.utils.data import DataLoader
-from transformers import get_linear_schedule_with_warmup
+from transformers import AutoTokenizer, get_linear_schedule_with_warmup
 
 from evaluate_text_sampling import distribution_metrics
 from experiment import choose_device, parameter_count, seed_everything
@@ -24,7 +24,10 @@ from gtdlm.text_data import (
     random_length_windows,
     sample_text_infilling_examples,
 )
-from gtdlm.text_tokenizer import vocabulary_from_tokenizer
+from gtdlm.text_tokenizer import (
+    vocabulary_from_pretrained_tokenizer,
+    vocabulary_from_tokenizer,
+)
 from pretrain_depth_lexical import evaluate_token_nll, lexical_batch_log_probabilities
 
 
@@ -190,12 +193,35 @@ def main() -> None:
     parser.add_argument("--freeze-backbone", action="store_true")
     parser.add_argument("--gradient-checkpointing", action="store_true")
     parser.add_argument("--random-init-backbone", action="store_true")
+    parser.add_argument(
+        "--native-vocabulary",
+        action="store_true",
+        help="consume a corpus tokenized with the pretrained tokenizer and "
+             "reuse the pretrained MLM head",
+    )
+    parser.add_argument(
+        "--prompt-attention", action="store_true",
+        help="let each interval record attend over the backbone's sequence "
+             "output instead of sharing one pooled vector "
+             "(research/LIKELIHOOD_DECOMPOSITION.md)",
+    )
+    parser.add_argument(
+        "--fixed-mask-bank", type=int, default=0, metavar="K",
+        help="render K masks independent of target length and let each tree "
+             "node select an MLM-compatible mask state",
+    )
     parser.add_argument("--local-files-only", action="store_true")
     parser.add_argument("--no-mixed-precision", action="store_false", dest="mixed_precision")
     parser.set_defaults(mixed_precision=True)
     args = parser.parse_args()
     if not 0.0 <= args.warmup_ratio < 1.0:
         parser.error("--warmup-ratio must be in [0,1)")
+    if args.fixed_mask_bank < 0:
+        parser.error("--fixed-mask-bank must be nonnegative")
+    if args.fixed_mask_bank and not args.native_vocabulary:
+        parser.error("--fixed-mask-bank requires --native-vocabulary")
+    if args.fixed_mask_bank and args.prompt_attention:
+        parser.error("--fixed-mask-bank and --prompt-attention are exclusive")
     with open(
         os.path.join(args.base_artifact_dir, "results.json"), encoding="utf-8"
     ) as handle:
@@ -208,10 +234,26 @@ def main() -> None:
     seed_everything(training_seed)
     torch.set_float32_matmul_precision("high")
     device = choose_device(args.device)
-    source_tokenizer = Tokenizer.from_file(
-        os.path.join(str(config["data_dir"]), "tokenizer.json")
-    )
-    vocab = vocabulary_from_tokenizer(source_tokenizer)
+    data_dir = str(config["data_dir"])
+    manifest_path = os.path.join(data_dir, "manifest.json")
+    if os.path.exists(manifest_path):
+        with open(manifest_path, encoding="utf-8") as handle:
+            manifest = json.load(handle)
+        prepared_native = bool(manifest.get("native_vocabulary", False))
+        if prepared_native != args.native_vocabulary:
+            parser.error(
+                "--native-vocabulary must match the prepared corpus manifest"
+            )
+    if args.native_vocabulary:
+        source_tokenizer = AutoTokenizer.from_pretrained(
+            data_dir, use_fast=True, local_files_only=True
+        )
+        vocab = vocabulary_from_pretrained_tokenizer(source_tokenizer)
+    else:
+        source_tokenizer = Tokenizer.from_file(
+            os.path.join(data_dir, "tokenizer.json")
+        )
+        vocab = vocabulary_from_tokenizer(source_tokenizer)
     corpus = torch.load(
         os.path.join(str(config["data_dir"]), "corpus.pt"),
         map_location="cpu",
@@ -264,6 +306,9 @@ def main() -> None:
         gradient_checkpointing=args.gradient_checkpointing,
         local_files_only=args.local_files_only,
         random_init_backbone=args.random_init_backbone,
+        prompt_attention=args.prompt_attention,
+        native_vocabulary=args.native_vocabulary,
+        fixed_mask_count=args.fixed_mask_bank,
     ).to(device)
     if args.checkpoint:
         model.load_state_dict(
@@ -321,8 +366,16 @@ def main() -> None:
             "data_seed": data_seed,
             "training_seed": training_seed,
             "d_model": model.d_model,
-            "tree_objective": "pretrained_context_depth_exact_inside",
-            "token_action_space": "custom_non_structural_vocabulary",
+            "tree_objective": (
+                "pretrained_fixed_mask_bank_depth_exact_inside"
+                if args.fixed_mask_bank
+                else "pretrained_context_depth_exact_inside"
+            ),
+            "token_action_space": (
+                "pretrained_native_vocabulary_with_mlm_head"
+                if args.native_vocabulary
+                else "custom_non_structural_vocabulary"
+            ),
         },
         "parameters": parameter_count(model),
         "selected_epoch": selected_epoch,

@@ -87,6 +87,21 @@ python prepare_wikitext_pilot.py --output-dir artifacts/wikitext_large --vocab-s
 python measure_span_identifiability.py --device cuda --data-dir artifacts/wikitext_large --epochs 20 --validation-passes 4 --d-model 256 --layers 6 --heads 8 --policies position_marker,local_marker,anchored_copy --output-dir artifacts/span_identifiability_large
 python measure_pretrained_span_identifiability.py --device cuda --epochs 5 --validation-passes 8 --test-passes 8 --policies anchored_copy,uniform --output-dir artifacts/span_identifiability_pretrained
 python measure_pretrained_span_identifiability.py --device cuda --epochs 5 --validation-passes 8 --test-passes 8 --policies anchored_copy,uniform --random-init-backbone --output-dir artifacts/span_identifiability_random_architecture_control
+python measure_multigap_wallclock.py --device cuda --calibration-epochs 3 --artifact-dir artifacts/text_multigap_wallclock_calibration
+python experiment_multigap_matched_training.py --device cuda --models sequential_filler,length_masked --epochs-per-model "sequential_filler=361,length_masked=212" --exact-checkpoint artifacts/text_multigap_matched_training/factorized_depth_exact.pt --artifact-dir artifacts/text_multigap_wallclock_matched
+python decompose_multigap_likelihood.py --device cuda --artifact-dir artifacts/text_multigap_decomposition
+python evaluate_multigap_generation.py --device cuda --artifact-dir artifacts/text_multigap_generation
+python experiment_pretrained_masked_baseline.py --device cuda --artifact-dir artifacts/text_pretrained_masked_baseline
+python experiment_pretrained_masked_baseline.py --device cuda --bottleneck-context --artifact-dir artifacts/text_pretrained_masked_bottleneck
+python analyze_oracle_top1.py --output-dir artifacts/text_oracle_top1_summary
+python measure_pretrain_task_mismatch.py --device cuda --examples 512 --artifact-dir artifacts/text_pretrain_task_mismatch
+python prepare_wikitext_pilot.py --output-dir artifacts/wikitext_native --native-vocabulary --model-name distilroberta-base --cache-dir .hf_cache/hub --local-files-only --max-document-tokens 128 --max-train-documents 4000 --max-validation-documents 500 --max-test-documents 500
+python experiment_text_depth_inside_pretrained.py --device cuda --data-dir artifacts/wikitext_native --native-vocabulary --local-files-only --artifact-dir artifacts/text_depth_inside_native
+python experiment_pretrained_masked_baseline.py --device cuda --data-dir artifacts/wikitext_native --native-vocabulary --local-files-only --artifact-dir artifacts/text_pretrained_masked_native
+python evaluate_native_inside_readout.py --device cuda
+python evaluate_prompt_attention.py --device cuda --local-files-only
+python experiment_text_depth_inside_pretrained.py --device cuda --data-dir artifacts/wikitext_native --native-vocabulary --fixed-mask-bank 8 --local-files-only --artifact-dir artifacts/text_depth_inside_fixed_mask_bank
+python analyze_single_gap_tree_scoring.py --device cuda
 ```
 
 The experiment writes its metrics and checkpoints to `artifacts/`.
@@ -143,7 +158,9 @@ result: all three depth seeds beat the 30-epoch sequential filler by
 `0.924--1.269` nats and length-masked baseline by `0.648--0.993` nats, with
 paired-bootstrap 95% intervals entirely below zero. However, oracle-length
 greedy token accuracy remains only `2.1--2.3%` for depth versus `3.7%` for the
-masked baseline, and qualitative temperature-1 samples are weak. The supported
+masked baseline -- both at or below the `4.19%` accuracy of always emitting the
+most frequent training token, so neither is doing argmax lexical prediction --
+and qualitative temperature-1 samples are weak. The supported
 claim is improved joint span probability, driven substantially by structure—not
 strong lexical generation. See `research/LEXICAL_EVALUATION.md`.
 
@@ -308,9 +325,12 @@ the exact depth-inside recurrence untouched, lowers test exact NLL to
 `21.658+/-0.051` across three training seeds, against `25.367` for the identical
 architecture trained from random backbone weights on the same budget. The paired
 gain over that capacity-matched control is `-3.709+/-0.051` nats with every
-interval excluding zero, and oracle-structure token accuracy rises to `5.7%`,
-passing the oracle-length masked baseline's `3.7%` for the first time. Two
-findings limit it: length calibration does not improve at all (raw TV
+interval excluding zero, and oracle-structure token accuracy rises to `5.7%`
+against its own capacity-matched control's `3.95%`. That comparison was
+previously stated as passing the oracle-length masked baseline's `3.7%`; it is
+withdrawn, because that baseline is a 10M from-scratch model differing from the
+87M pretrained tree model in pretraining and capacity as well as objective. Two
+further findings limit it: length calibration does not improve at all (raw TV
 `0.122+/-0.002` against the control's `0.121`, so the `TV < 0.20` gate is
 saturated rather than passed more convincingly), and the Wikipedia-derived pilot
 corpus overlaps the backbone's pretraining lineage, so held-out here does not
@@ -410,3 +430,141 @@ run. Across three additional sampling seeds, TV improves from `0.172±0.010` to
 important. Direct tuple enumeration grows as `4^k`, so the next architecture is
 a small number of within-frontier topology-denoising refinements. See
 `research/FRONTIER_COUPLING.md`.
+
+The remaining training-matching confound on the two-gap likelihood result has
+been closed on wall-clock compute, not just optimizer updates. Per-epoch, the
+exact model costs `12.05x` more wall-clock time than the sequential
+(autoregressive) filler and `7.09x` more than the learned-length baseline.
+Retraining both baselines from scratch for an epoch budget that consumes the
+same wall-clock time as the exact model's own 30-epoch run (361 and 212
+epochs respectively) still loses two-gap joint NLL by `-5.916` and `-7.486`
+nats, with paired 95% intervals `[-6.594,-5.248]` and `[-8.265,-6.728]`. The
+sequential filler used nearly its entire budget and improved substantially
+over the update-matched run, while the learned-length baseline plateaued
+after roughly 43 epochs. This also satisfies the preregistered scale-up
+gate's compute-matched autoregressive-competitiveness condition on this
+project's joint-likelihood metric. See "Wall-clock-matched baseline
+retraining" in `research/MULTIGAP_EXACT_INSIDE.md`.
+
+An exact decomposition then locates where that likelihood advantage lives.
+Writing `log p(x) = root + E_q[token] + E_q[topology] + H(q)` for the tree
+posterior `q`, the advantage is `-9.453 [-10.329,-8.595]` nats lexical,
+`+3.670 [+3.283,+4.070]` nats *against* the exact model on structure, and
+`-2.164 [-2.372,-1.962]` nats of tree entropy. This refutes the hypothesis the
+study was built to test: tree multiplicity supplies only `27%` of the gap, not
+the bulk of it, even though a length-8 span admits 1430 ordered pivot trees.
+The lexical term is also flat across tree depth (`5.571` nats/token at the
+root against `5.4--5.8` deeper), so it is not an artifact of the tighter
+two-sided gold context that deep chart nodes enjoy; at the root the exact
+model sees no more than the masked baseline and still costs `5.571` against
+`6.933` nats/token.
+
+Re-scoring under tree distributions that do not select on token likelihood
+then locates the advantage. Every arm is an ELBO of one family,
+`log p(x) >= root + E_q'[sum (token + topology)] + H(q')`, tight at the
+posterior, so the totals stay comparable. Under the model's own topology head
+the advantage survives at `-5.557 [-6.194,-4.950]` and `-5.257
+[-5.874,-4.663]` nats: dropping token-likelihood selection costs
+`2.389 [2.154,2.626]` nats, not the whole gap. Along the midpoint tree the
+total does reverse to `+1.9`/`+2.2`, but that is an artifact of midpoint being
+off-distribution for a model trained on the exact marginal — the structural
+term is statistically unchanged between the posterior and the topology prior
+(`+0.030 [-0.057,+0.120]`) and blows up only under midpoint, which costs the
+model four times what the topology prior does.
+
+Splitting the structural term then removes it as a candidate bottleneck. The
+cost is almost entirely topology (`6.875`) rather than the root STOP decision
+(`1.087`, identical across arms), and the exact model's term describes a whole
+tree where both baselines describe only a length. Marginalizing shape out makes
+them comparable, and the exact model ties: `+0.086 [-0.024,+0.200]` against the
+sequential filler and `+0.092 [-0.008,+0.197]` against the masked baseline,
+both intervals containing zero. Structural cost grows about linearly in span
+length, so nothing degrades with recursion depth either.
+
+Compounding in recursive decoding was then tested and also fails. Greedy free
+decoding turns out to be uninformative — all three models collapse to the
+empty-length mode, the masked baseline's free length-match rate landing on
+exactly its empty-span rate — so the comparison is made under sampling, and
+restricted to the 304 gaps where both arms are comparable. There the free arm
+reaches `2.2%` token accuracy against oracle structure's `1.5%`, with every
+residual bias favouring the free arm. Five explanations for poor generation are
+now rejected.
+
+What replaces them comes from the oracle-structure arm, where all three models
+sit at `100%` length match on the same gaps. Token accuracy is `4.0%` for the
+exact model, `3.3%` sequential and `4.2%` masked: a `1.36` nat per token
+likelihood advantage produces no top-1 advantage at all. The gain is
+distributional rather than modal, which is why neither greedy decoding, which
+reads only the top token, nor sampling, which spreads across the distribution,
+converts it into better text. On current evidence this objective improves
+likelihood without improving generation.
+
+Pretraining is the one intervention that moves top-1 accuracy. Consolidating
+every checkpoint's oracle-structure accuracy, the `distilroberta` backbone
+reaches `5.66%` against its capacity-matched random-init control's `3.95%`, a
+well-controlled `+1.7` points, so the from-scratch top-1 deficit is not
+intrinsic to the objective.
+
+The matched cross-model control then settles the generation question for the
+current architecture. Giving the learned-length-plus-masks baseline the *same*
+backbone (85.2M against 87.0M), the same corruption stream, splits and budget,
+it reaches `12.56%` oracle-structure token accuracy to the tree model's
+`5.66%` in 3/3 seeds whose ranges do not overlap, with held-out token NLL
+`5.872+/-0.027` against `6.161`. The tree model's previously reported lead over
+a `3.72%` baseline was an artifact of that baseline lacking both pretraining
+and capacity.
+
+That result turns out to be about the implementation rather than the objective.
+The two arms reach the backbone very differently: `PretrainedIntervalEncoder`
+collapses the prompt into a single 768-dimensional vector, from which one
+linear layer scores every `O(D n^3)` chart cell over static boundary
+embeddings, while the baseline runs all six transformer layers for every
+prediction.
+
+Holding the objective fixed at masked and cutting the baseline's encoder access
+down to that same single pooled vector drops it from `12.56%` to
+`6.74%+/-0.23` -- removing `5.81` of the `6.90` point gap, about `84%`, in 3/3
+seeds. The residual between the bottlenecked baseline and the tree model is
+`1.09` points. At comparable encoder access the tree objective is ahead on
+token NLL (`6.161` against `6.814+/-0.046`). The comparison is tilted against
+this conclusion, since the bottlenecked baseline is handed an explicit
+within-span position embedding where the tree model gets only depth and
+boundary-token identity, and it collapses anyway.
+
+So the generation deficit is mostly how the pretrained encoder was attached,
+not exact latent-tree marginalization. What needs fixing is an integration that
+gives the chart per-node context without presupposing the span length.
+
+A second handicap sits underneath that one and is shared by every arm. The
+project keeps only `AutoModel`, so `distilroberta`'s masked-language-model head
+is discarded and predictions run over a 4,000-token custom BPE vocabulary
+rather than RoBERTa's 50,265, with the token head relearned from averaged input
+embeddings. Scoring the untouched pretrained model on the same spans with no
+finetuning at all gives `4.1%` exact match and `0.319` character similarity on
+decoded text, against `4.1%` and `0.316` for our finetuned masked baseline --
+a tie on 244 spans. Five epochs of finetuning buy no text quality over the
+pretrained model as it comes. Every accuracy figure in this project therefore
+sits on a crippled output side, which is the same regime in which the
+from-scratch models failed to clear frequency guessing. The two causes stack:
+a shared vocabulary-and-head handicap that caps everyone, and a tree-specific
+encoder bottleneck that accounts for `84%` of the remaining difference. See
+`research/LIKELIHOOD_DECOMPOSITION.md`.
+
+The native-vocabulary follow-up is now complete at seed 17. Keeping RoBERTa's
+50,265-token action space and full MLM head raises the absolute lexical floor,
+but it does not close the tree-specific gap. On the same 128 native-tokenized
+spans the masked baseline reaches `20.04%` oracle token accuracy, `0.410`
+nonempty decoded character similarity and `7.92%` exact match, against the
+tree model's `8.71%`, `0.281` and `0.99%`. Token NLL is `4.921` against
+`6.786`. The current integration therefore still fails the generation clause
+of the scale-up gate. See `research/NATIVE_VOCABULARY.md`.
+
+A fixed eight-mask bank now addresses the remaining interface mismatch without
+revealing target length. Test exact NLL improves `24.552 -> 20.026`, topology-
+prior ELBO NLL improves `25.829 -> 20.512`, and length TV improves
+`0.157 -> 0.126`. This is not a gold-posterior artifact. Generation moves much
+less: oracle-midpoint token accuracy is `9.80%`, while topology-aligned sampled
+rollout reaches `12.24%` on length-matched pairs against the native masked
+baseline's `20.04%`. The next blocker is gold-token/boundary exposure in the
+topology training path, not encoder likelihood. See
+`research/FIXED_MASK_BANK.md`.

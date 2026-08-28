@@ -127,11 +127,34 @@ def main():
         "--models", default=",".join(MODELS),
         help="comma-separated subset of the three models to train",
     )
+    parser.add_argument(
+        "--exact-checkpoint", default=None,
+        help="load a pretrained factorized_depth_exact checkpoint for comparison "
+             "instead of training it (for wall-clock/FLOP-matched baseline runs)",
+    )
+    parser.add_argument(
+        "--exact-checkpoint-test-nll", type=float, default=None,
+        help="previously reported test joint NLL for --exact-checkpoint, carried "
+             "into the results table for readability",
+    )
+    parser.add_argument(
+        "--epochs-per-model", default=None,
+        help="override --epochs per model for compute-matched budgets, as "
+             "'name=epochs,name=epochs' (e.g. 'sequential_filler=361,"
+             "length_masked=212')",
+    )
     args = parser.parse_args()
     selected = [name for name in args.models.split(",") if name]
     for name in selected:
         if name not in MODELS:
             parser.error("unknown model {!r}".format(name))
+    epochs_per_model = {name: args.epochs for name in selected}
+    if args.epochs_per_model:
+        for pair in args.epochs_per_model.split(","):
+            name, _, count = pair.partition("=")
+            if name not in MODELS:
+                parser.error("unknown model {!r} in --epochs-per-model".format(name))
+            epochs_per_model[name] = int(count)
 
     device = choose_device(args.device)
     with open(
@@ -177,30 +200,30 @@ def main():
         d_model=int(config["d_model"]), nhead=int(config["heads"]),
         layers=int(config["layers"]), max_positions=256, max_steps=32,
     )
-    training = {
-        "epochs": args.epochs, "batch_size": args.batch_size, "lr": args.lr
-    }
     updates_per_epoch = (len(corpus["train"]) + args.batch_size - 1) // args.batch_size
     print("two-gap matched training: {} train documents, {} updates/epoch, "
-          "{} epochs, {} validation examples, {} test examples".format(
-              len(corpus["train"]), updates_per_epoch, args.epochs,
+          "epochs={}, {} validation examples, {} test examples".format(
+              len(corpus["train"]), updates_per_epoch, epochs_per_model,
               len(validation), len(test)))
 
     os.makedirs(args.artifact_dir, exist_ok=True)
     models, selectors, histories, parameters = {}, {}, {}, {}
 
     for name in selected:
-        print("\n=== training {} from scratch ===".format(name))
+        model_epochs = epochs_per_model[name]
+        training = {"epochs": model_epochs, "batch_size": args.batch_size, "lr": args.lr}
+        print("\n=== training {} from scratch ({} epochs) ===".format(
+            name, model_epochs))
         seed_everything(args.seed)
         source = DynamicTextExampleDataset(corpus["train"], **source_args)
         selector = ValidationSelector(
             name, scorer_for(name, vocab, device, args.eval_batch_size),
-            validation, args.epochs,
+            validation, model_epochs,
         )
         if name == "factorized_depth_exact":
             model = IntervalInsideBoundaryModel(**shared).to(device)
             history = train_exact(
-                model, source, vocab, device, args.epochs, args.batch_size,
+                model, source, vocab, device, model_epochs, args.batch_size,
                 args.lr, on_epoch_end=selector,
             )
         elif name == "sequential_filler":
@@ -233,9 +256,26 @@ def main():
         if device.type == "cuda":
             torch.cuda.empty_cache()
 
+    reused_exact = False
+    if args.exact_checkpoint is not None and "factorized_depth_exact" not in models:
+        print("\n=== loading frozen {} from {} ===".format(
+            "factorized_depth_exact", args.exact_checkpoint))
+        model = IntervalInsideBoundaryModel(**shared).to(device)
+        model.load_state_dict(
+            torch.load(args.exact_checkpoint, map_location=device, weights_only=True)
+        )
+        model.eval()
+        models["factorized_depth_exact"] = model
+        parameters["factorized_depth_exact"] = parameter_count(model)
+        reused_exact = True
+
+    eval_names = list(selected)
+    if reused_exact:
+        eval_names = eval_names + ["factorized_depth_exact"]
+
     print("\n=== held-out test evaluation ===")
     nlls = {}
-    for name in selected:
+    for name in eval_names:
         scorer = scorer_for(name, vocab, device, args.eval_batch_size)
         nlls[name] = (-scorer(models[name], test)).cpu()
 
@@ -254,9 +294,14 @@ def main():
                 "random_window_min", "random_window_max") if key in config},
             **vars(args),
             "updates_per_epoch": updates_per_epoch,
-            "training_matched": True,
+            "training_matched": not reused_exact,
             "initialization": "random",
-            "objective": "from_scratch_two_gap_matched_updates",
+            "objective": (
+                "wallclock_matched_baselines_vs_frozen_exact" if reused_exact
+                else "from_scratch_two_gap_matched_updates"
+            ),
+            "reused_exact_checkpoint": args.exact_checkpoint,
+            "epochs_per_model": epochs_per_model,
         },
         "parameters": parameters,
         "selected_epoch": {
@@ -280,22 +325,49 @@ def main():
     ) as handle:
         json.dump(result, handle, indent=2)
 
-    lines = [
-        "# From-scratch update-matched two-gap training", "",
-        "All three models start from random initialization, see the same two-gap",
-        "corruption stream at {} updates per epoch for {} epochs, and select their".format(
-            updates_per_epoch, args.epochs),
-        "endpoint on the same {} held-out validation examples.".format(len(validation)),
-        "",
-        "| Model | Parameters | Selected epoch | Validation joint NLL | Test joint NLL | Test NLL / gap |",
-        "|---|---:|---:|---:|---:|---:|",
-    ]
-    for name in selected:
-        lines.append("| `{}` | {:,} | {} | {:.3f} | {:.3f} | {:.3f} |".format(
-            name, parameters[name], selectors[name].best_epoch,
-            selectors[name].best_nll, result["joint_nll"][name],
-            result["nll_per_gap"][name],
-        ))
+    if reused_exact:
+        lines = [
+            "# Wall-clock-matched two-gap baseline retraining", "",
+            "{} epoch budgets are fit inside the wall-clock cost of the frozen".format(
+                ", ".join("`{}`".format(n) for n in selected)),
+            "`factorized_depth_exact` checkpoint loaded from `{}`,".format(
+                args.exact_checkpoint),
+            "which is included unmodified for comparison.",
+            "",
+            "| Model | Parameters | Epochs | Selected epoch | Validation joint NLL | Test joint NLL | Test NLL / gap |",
+            "|---|---:|---:|---:|---:|---:|---:|",
+        ]
+        for name in selected:
+            lines.append("| `{}` | {:,} | {} | {} | {:.3f} | {:.3f} | {:.3f} |".format(
+                name, parameters[name], epochs_per_model[name],
+                selectors[name].best_epoch,
+                selectors[name].best_nll, result["joint_nll"][name],
+                result["nll_per_gap"][name],
+            ))
+        lines.append(
+            "| `factorized_depth_exact` (reused) | {:,} | -- | -- | -- | {:.3f} | {:.3f} |".format(
+                parameters["factorized_depth_exact"],
+                result["joint_nll"]["factorized_depth_exact"],
+                result["nll_per_gap"]["factorized_depth_exact"],
+            )
+        )
+    else:
+        lines = [
+            "# From-scratch update-matched two-gap training", "",
+            "All three models start from random initialization, see the same two-gap",
+            "corruption stream at {} updates per epoch for {} epochs, and select their".format(
+                updates_per_epoch, args.epochs),
+            "endpoint on the same {} held-out validation examples.".format(len(validation)),
+            "",
+            "| Model | Parameters | Selected epoch | Validation joint NLL | Test joint NLL | Test NLL / gap |",
+            "|---|---:|---:|---:|---:|---:|",
+        ]
+        for name in selected:
+            lines.append("| `{}` | {:,} | {} | {:.3f} | {:.3f} | {:.3f} |".format(
+                name, parameters[name], selectors[name].best_epoch,
+                selectors[name].best_nll, result["joint_nll"][name],
+                result["nll_per_gap"][name],
+            ))
     if comparisons:
         lines.extend([
             "", "| Comparison | Mean NLL difference | 95% CI |", "|---|---:|---:|",

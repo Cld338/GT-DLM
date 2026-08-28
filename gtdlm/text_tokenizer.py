@@ -76,6 +76,44 @@ def vocabulary_from_tokenizer(tokenizer: Tokenizer) -> TextVocabulary:
     )
 
 
+def vocabulary_from_pretrained_tokenizer(tokenizer) -> TextVocabulary:
+    """Use a Hugging Face masked-LM tokenizer as the model action space.
+
+    The mask token doubles as the observed gap marker. Documents themselves
+    are encoded without special tokens; ``TextInfillingExample.prompt`` adds
+    the tokenizer's BOS/EOS pair around the corrupted sequence.
+    """
+    required = {
+        "pad_token_id": tokenizer.pad_token_id,
+        "mask_token_id": tokenizer.mask_token_id,
+    }
+    missing = [name for name, value in required.items() if value is None]
+    if missing:
+        raise ValueError(
+            "pretrained tokenizer is missing required ids: {}".format(
+                ", ".join(missing)
+            )
+        )
+    left = tokenizer.bos_token_id
+    if left is None:
+        left = tokenizer.cls_token_id
+    right = tokenizer.eos_token_id
+    if right is None:
+        right = tokenizer.sep_token_id
+    if left is None or right is None:
+        raise ValueError("pretrained tokenizer must define BOS/EOS or CLS/SEP ids")
+    specials = tuple(int(token) for token in tokenizer.all_special_ids)
+    return TextVocabulary(
+        len(tokenizer),
+        PAD=int(tokenizer.pad_token_id),
+        GAP=int(tokenizer.mask_token_id),
+        MASK=int(tokenizer.mask_token_id),
+        LEFT=int(left),
+        RIGHT=int(right),
+        EXTRA_STRUCTURAL=specials,
+    )
+
+
 def tokenize_documents(
     tokenizer: Tokenizer,
     documents: Sequence[str],
@@ -89,3 +127,20 @@ def tokenize_documents(
         if document.strip()
     ]
 
+
+def tokenize_pretrained_documents(
+    tokenizer, documents: Sequence[str], max_document_tokens: int
+) -> List[List[int]]:
+    """Tokenize corpus text in a pretrained model's native vocabulary."""
+    if max_document_tokens < 1:
+        raise ValueError("max_document_tokens must be positive")
+    return [
+        tokenizer(
+            document,
+            add_special_tokens=False,
+            truncation=True,
+            max_length=max_document_tokens,
+        )["input_ids"]
+        for document in documents
+        if document.strip()
+    ]
