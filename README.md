@@ -99,6 +99,7 @@ python prepare_wikitext_pilot.py --output-dir artifacts/wikitext_native --native
 python experiment_text_depth_inside_pretrained.py --device cuda --data-dir artifacts/wikitext_native --native-vocabulary --local-files-only --artifact-dir artifacts/text_depth_inside_native
 python experiment_pretrained_masked_baseline.py --device cuda --data-dir artifacts/wikitext_native --native-vocabulary --local-files-only --artifact-dir artifacts/text_pretrained_masked_native
 python evaluate_native_inside_readout.py --device cuda
+python evaluate_prompt_attention.py --device cuda --local-files-only
 python experiment_text_depth_inside_pretrained.py --device cuda --data-dir artifacts/wikitext_native --native-vocabulary --fixed-mask-bank 8 --local-files-only --artifact-dir artifacts/text_depth_inside_fixed_mask_bank
 python analyze_single_gap_tree_scoring.py --device cuda
 ```
