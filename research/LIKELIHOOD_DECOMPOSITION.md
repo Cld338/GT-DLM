@@ -119,9 +119,13 @@ the model can find that tree without being told the answer.
 
 The measured `+3.7` nat structural deficit is the natural suspect. At
 generation time a structural error is not a partial loss but a categorical
-one: the wrong length or topology misplaces every token that follows. The next
-section tests both points directly, and finds for the structural explanation
-while clearing the posterior-scoring one.
+one: the wrong length or topology misplaces every token that follows.
+
+The next sections test both points. Reading forward, the posterior-scoring
+explanation is cleared and the structural one is **also rejected** — the `+3.7`
+nats turn out to be a units artifact, not a deficit. Neither suspicion in this
+section survives; both are kept because the tests that killed them are what
+narrowed the question.
 
 ## Scoring under trees not selected with the answer
 
@@ -277,20 +281,21 @@ model expands recursively, so every token it emits becomes the interval
 boundary conditioning its children, and an early error changes the context for
 everything below it.
 
-The existing generation numbers fit that shape. Oracle-structure token accuracy
-is `5.7%` for the tree model against `3.7%` for the oracle-length masked model,
-but free-sample accuracy is `2.1%` against `3.7%` — the tree model loses `3.6`
-points to its own decoding while the masked model loses nothing. Those figures
-come from the pretrained single-gap study rather than this two-gap checkpoint,
-so they indicate the hypothesis rather than establish it here.
+The generation numbers available at the time appeared to fit that shape:
+oracle-structure token accuracy `5.7%` for the tree model against `3.7%` for
+the oracle-length masked model, with free-sample accuracy `2.1%` against
+`3.7%`, so the tree model seemed to lose `3.6` points to its own decoding while
+the masked model lost nothing.
 
-That makes the next measurement clear, and it is a decoding question rather
-than an objective question: measure oracle-structure against free-sample
-accuracy for all three models on this matched two-gap checkpoint. If the tree
-model's gap is large while the masked model's is near zero, the bottleneck is
-compounding in recursive decoding, and the responses to try are decoding-side —
-tree-marginalizing or MBR decoding, or reducing how much each emitted token
-conditions its descendants.
+Both halves of that reading have since failed. The comparison itself is
+withdrawn — the `3.7%` baseline is a 10M from-scratch model differing from the
+87M pretrained tree model in pretraining and capacity as well as objective, and
+it sits *below* the `4.19%` trivial floor. And the hypothesis it motivated is
+rejected by the direct test in the next section.
+
+The measurement it prompted was still the right one to run, and it is the
+subject of the next section: oracle-structure against free-sample accuracy for
+all three models on the matched two-gap checkpoint.
 
 ## Testing the compounding hypothesis: it fails
 

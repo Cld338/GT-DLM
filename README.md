@@ -149,7 +149,9 @@ result: all three depth seeds beat the 30-epoch sequential filler by
 `0.924--1.269` nats and length-masked baseline by `0.648--0.993` nats, with
 paired-bootstrap 95% intervals entirely below zero. However, oracle-length
 greedy token accuracy remains only `2.1--2.3%` for depth versus `3.7%` for the
-masked baseline, and qualitative temperature-1 samples are weak. The supported
+masked baseline -- both at or below the `4.19%` accuracy of always emitting the
+most frequent training token, so neither is doing argmax lexical prediction --
+and qualitative temperature-1 samples are weak. The supported
 claim is improved joint span probability, driven substantially by structure—not
 strong lexical generation. See `research/LEXICAL_EVALUATION.md`.
 

@@ -95,7 +95,10 @@ TV in 3/3 seeds at a measured exact-NLL cost.
 
 The scope limit again matters: oracle-structure token accuracy is `2.1--3.5%`
 against `3.7%` for the oracle-length masked model, and free samples are weak.
-This is a joint structural likelihood result. See
+Both of those numbers are now known to sit at or below the `4.19%` trivial
+floor of always emitting the most frequent training token, so neither model is
+doing argmax lexical prediction at all and the ordering between them carries no
+weight. This is a joint structural likelihood result. See
 `research/LEXICAL_EVALUATION.md` and `research/JOINT_LEXICAL_OBJECTIVE.md`.
 
 ### Factorized multi-gap (training-matched likelihood result)
@@ -184,8 +187,9 @@ matched intervention isolating the surviving twin. See
 | Comparison by training FLOPs or wall-clock, not epoch count | `JOINT_LEXICAL_OBJECTIVE.md` item 4 | **Done:** exact costs 12.05x (sequential) / 7.09x (masked) more wall-clock per epoch; retraining both baselines for a matched wall-clock budget (361 / 212 epochs) still loses by `-5.916 [-6.594,-5.248]` and `-7.486 [-8.265,-6.728]` nats |
 | Insertion/blank baselines and the selected two-block frontier model | `DEPTH_INSIDE.md` control 4 | Partial: sequential and masked are done |
 | Corpus not seen by the pretrained backbone | `PRETRAINED_CONTEXT_DEPTH.md` limit 1 | **Done:** gain is larger on post-lineage text (`-6.136` vs `-4.879`); see `CORPUS_OVERLAP_CONTROL.md` |
+| Baseline on the same pretrained backbone | `LIKELIHOOD_DECOMPOSITION.md` | **Done, against the objective:** matched on backbone, stream, split and budget, the masked baseline reaches `12.56%` oracle-structure accuracy to the tree model's `5.66%` in 3/3 non-overlapping seeds |
 
-### 3. Generation quality
+### 3. Generation quality (CLOSED, negatively)
 
 Source: named independently by `research/LEXICAL_EVALUATION.md` and
 `research/JOINT_LEXICAL_OBJECTIVE.md` item 5.
@@ -198,9 +202,9 @@ pretraining from capacity: the capacity-matched random-init control stays at
 `0.5%`.
 
 Generation itself remains unusable. Free-sample exact match is `0.2--0.5%` and
-edit similarity `2.3%`, so the item stays open. What has changed is its
-diagnosis: the bottleneck is no longer missing context in the encoder. See
-`research/PRETRAINED_CONTEXT_DEPTH.md`.
+edit similarity `2.3%`. The diagnosis changed first -- the bottleneck is not
+missing context in the encoder (`research/PRETRAINED_CONTEXT_DEPTH.md`) -- and
+the item has since been closed negatively by the chain below.
 
 An exact decomposition of the two-gap likelihood has now resolved this, and
 the answer is unfavorable to the headline claim. Splitting `log p(x)` into
@@ -240,7 +244,21 @@ for all three models on the same gaps, token accuracy is `4.0%` for the exact
 model, `3.3%` sequential and `4.2%` masked — the exact model's `1.36` nat per
 token likelihood advantage produces **no top-1 advantage at all**. The gain is
 distributional, not modal, which is why neither greedy nor sampled decoding can
-convert it. See `research/LIKELIHOOD_DECOMPOSITION.md`.
+convert it.
+
+A trivial floor makes that starker. Always emitting the most frequent training
+token scores `4.35%` on these two-gap targets, so none of the three from-scratch
+models clears it: they are tied at not beating frequency guessing, and no
+conclusion about the objective can rest on differences between them.
+
+The matched control then closes the item. Given the *same* pretrained backbone,
+stream, split and budget, the masked baseline reaches `12.56%`
+oracle-structure accuracy against the tree model's `5.66%` in 3/3 seeds with
+non-overlapping ranges, and token NLL `5.872+/-0.027` against `6.161`. Where a
+pretrained masked encoder is available, using it directly beats adapting it to
+this objective on this task. The likelihood results are unaffected; the
+inference from them to better generation is refuted. See
+`research/LIKELIHOOD_DECOMPOSITION.md`.
 
 ### 4. Cross-gap dependence, if pursued again
 
