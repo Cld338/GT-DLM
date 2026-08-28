@@ -95,6 +95,18 @@ Exact ordered-pair TV does not improve (`0.293 -> 0.296`), so the result adds
 a marginal and aggregate-length calibration claim, not an exact-pair or fluent
 generation claim. See `research/MULTIGAP_EXACT_INSIDE.md`.
 
+The training-matching confound is now closed on wall-clock as well as update
+count. The exact chart costs 12.05x (sequential filler) and 7.09x (learned
+lengths + masks) more wall-clock per epoch, so the update-matched comparison
+above gave the exact model far more compute, not less. Retraining both
+baselines from scratch for an epoch budget that consumes the exact model's own
+30-epoch wall-clock cost (361 and 212 epochs respectively) still loses by
+`-5.916 [-6.594,-5.248]` and `-7.486 [-8.265,-6.728]` nats. The sequential
+filler used nearly its full budget and improved substantially, while the
+length-masked model plateaued after roughly 43 epochs, confirming it was
+already near convergence. See "Wall-clock-matched baseline retraining" in
+`research/MULTIGAP_EXACT_INSIDE.md`.
+
 ## Closed directions
 
 Recording rejections is part of the record; several were favorable controls
@@ -146,7 +158,7 @@ matched intervention isolating the surviving twin. See
 |---|---|---|
 | From-scratch matched two-gap training of all three models | `MULTIGAP_EXACT_INSIDE.md` control 4 | **Done:** exact beats both baselines by `-7.947 [-8.711,-7.202]` and `-7.646 [-8.394,-6.926]` nats at matched updates; the multi-gap likelihood claim is unblocked |
 | Joint and per-gap length calibration under parallel sampling | `MULTIGAP_EXACT_INSIDE.md` control 3 | **Done:** per-gap TV is `0.131--0.134` raw and `0.119--0.121` calibrated; total length improves slightly, while exact ordered-pair calibration does not |
-| Comparison by training FLOPs or wall-clock, not epoch count | `JOINT_LEXICAL_OBJECTIVE.md` item 4 | Not started |
+| Comparison by training FLOPs or wall-clock, not epoch count | `JOINT_LEXICAL_OBJECTIVE.md` item 4 | **Done:** exact costs 12.05x (sequential) / 7.09x (masked) more wall-clock per epoch; retraining both baselines for a matched wall-clock budget (361 / 212 epochs) still loses by `-5.916 [-6.594,-5.248]` and `-7.486 [-8.265,-6.728]` nats |
 | Insertion/blank baselines and the selected two-block frontier model | `DEPTH_INSIDE.md` control 4 | Partial: sequential and masked are done |
 | Corpus not seen by the pretrained backbone | `PRETRAINED_CONTEXT_DEPTH.md` limit 1 | **Done:** gain is larger on post-lineage text (`-6.136` vs `-4.879`); see `CORPUS_OVERLAP_CONTROL.md` |
 
@@ -187,7 +199,7 @@ compute. The oracle-length gap must be reported either way.
 |---|---|
 | Length-extrapolation slice | Copy-specific attribution and corpus overlap are now controlled, but at flattened lengths neither arm beats the uniform prior per example, so `anchored_copy` is not usable as a long-span slice on this corpus |
 | Gap-composition slice | Synthetic passes; text has likelihood plus per-gap and total-length calibration evidence, but exact ordered-pair calibration remains weak |
-| Compute-matched AR competitiveness | Not attempted |
+| Compute-matched AR competitiveness | **Passed, with a scope limit.** The sequential filler is this project's autoregressive baseline (`research/NATURAL_LANGUAGE_PILOT.md`). Retrained for a wall-clock budget matching the exact model's own training cost (361 vs 30 epochs), it still loses two-gap joint NLL by `-5.916 [-6.594,-5.248]`. The exact model is compute-competitive-to-superior on this joint likelihood metric; it has not been compared on standard LM perplexity or against an external AR implementation |
 
 The `research/PROPOSAL.md` hold on scaling to 50--100M therefore stands.
 
@@ -215,8 +227,11 @@ The `research/PROPOSAL.md` hold on scaling to 50--100M therefore stands.
 5. **Completed:** joint and per-gap parallel length calibration. Marginal and
    total-length calibration pass; ordered-pair calibration does not improve
    (`research/MULTIGAP_EXACT_INSIDE.md`).
-6. Complete the baseline table and the FLOP-matched comparison.
-7. Re-evaluate the scale-up gate.
+6. **Completed:** the baseline table and the wall-clock-matched comparison.
+   The exact model costs 12.05x / 7.09x more wall-clock per epoch than the
+   two baselines; retraining both for a matched wall-clock budget still loses
+   by `-5.916` and `-7.486` nats (`research/MULTIGAP_EXACT_INSIDE.md`).
+7. Re-evaluate the scale-up gate (below).
 
 ## Currently claimable
 
@@ -233,4 +248,15 @@ NLL, replicated in 3/3 seeds against a capacity-matched control. It is claimable
 as an encoder-ablation result: it buys likelihood and token quality, not
 calibration, and it is a single-gap result on pilot-scale corpora. The overlap
 objection is answered on post-lineage text.
+
+The two-gap factorized exact model's likelihood advantage over both proper
+baselines is now claimable as compute-matched, not just update-matched: giving
+each baseline a wall-clock budget equal to the exact model's own training cost
+(12x for the sequential/autoregressive filler, 7x for the learned-length
+model) still leaves the exact model ahead by `5.9`-`7.5` nats with paired
+intervals excluding zero. This also satisfies the scale-up gate's
+compute-matched autoregressive-competitiveness condition on this project's
+joint-likelihood metric, though not against an external AR implementation or
+on standard LM perplexity.
+
 A natural-text generation-quality advantage is **not** claimable.

@@ -329,3 +329,57 @@ Evaluator: `evaluate_multigap_sampling.py`; results are in the matched-training
 artifact directory.
 
 Artifacts: `artifacts/text_multigap_matched_training`.
+
+## Wall-clock-matched baseline retraining
+
+Control 4 matched optimizer updates (125/epoch, 30 epochs) across all three
+models, but the exact chart costs `O(D n^3)` per gap while both baselines are
+single forward passes. A 3-epoch calibration (`measure_multigap_wallclock.py`,
+first epoch dropped to remove CUDA warm-up) measured steady-state wall-clock
+cost per epoch on identical hardware:
+
+| Model | Seconds / epoch | Relative to exact |
+|---|---:|---:|
+| Factorized depth exact | 181.50 | 1.0x |
+| Sequential filler | 15.06 | 12.05x cheaper |
+| Learned lengths + masks | 25.59 | 7.09x cheaper |
+
+The update-matched control therefore gave the exact model 12x and 7x more
+wall-clock compute than the two baselines respectively -- the opposite of a
+favorable confound. To close this, the frozen exact checkpoint from control 4
+was kept unmodified, and both baselines were retrained from scratch (same
+seed, same two-gap corruption stream, same validation-selected endpoint) for
+an epoch budget that consumes the same wall-clock time as the exact model's
+30-epoch run: 361 epochs for the sequential filler and 212 epochs for the
+learned-length model.
+
+| Model | Epoch budget | Selected epoch | Test joint NLL | Test NLL / gap |
+|---|---:|---:|---:|---:|
+| Factorized depth exact (reused, unchanged) | -- | -- | **43.300** | **21.650** |
+| Sequential filler | 361 | 360 | 49.216 | 24.608 |
+| Learned lengths + masks | 212 | 43 | 50.786 | 25.393 |
+
+| Comparison | Mean NLL difference | Paired 95% CI |
+|---|---:|---:|
+| Exact minus sequential | `-5.916` | `[-6.594,-5.248]` |
+| Exact minus length-masked | `-7.486` | `[-8.265,-6.728]` |
+
+Both intervals exclude zero by a wide margin. The sequential filler used
+essentially its entire 361-epoch budget (selected epoch 360) and improved
+substantially over its update-matched result (`51.247 -> 49.216`), confirming
+it was still compute-starved before; even so it remains far behind the exact
+model. The length-masked model, in contrast, selected epoch 43 of 212 and
+barely improved over its update-matched result (`50.946 -> 50.786`),
+confirming the earlier observation that this baseline plateaus by roughly
+epoch 20 regardless of how much further budget it is given.
+
+This closes the remaining training-matching confound and the scale-up gate's
+compute-matched autoregressive-competitiveness condition (`sequential filler`
+is the autoregressive baseline in `research/NATURAL_LANGUAGE_PILOT.md`): the
+factorized exact depth-inside model's two-gap likelihood advantage is not an
+artifact of the update-matched comparison granting it disproportionate
+compute. If anything, the update-matched control undersold the gap for the
+length-masked baseline while flattering the sequential baseline, which had
+genuine remaining headroom. Artifacts:
+`artifacts/text_multigap_wallclock_calibration`,
+`artifacts/text_multigap_wallclock_matched`.

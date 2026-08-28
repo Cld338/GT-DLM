@@ -87,6 +87,8 @@ python prepare_wikitext_pilot.py --output-dir artifacts/wikitext_large --vocab-s
 python measure_span_identifiability.py --device cuda --data-dir artifacts/wikitext_large --epochs 20 --validation-passes 4 --d-model 256 --layers 6 --heads 8 --policies position_marker,local_marker,anchored_copy --output-dir artifacts/span_identifiability_large
 python measure_pretrained_span_identifiability.py --device cuda --epochs 5 --validation-passes 8 --test-passes 8 --policies anchored_copy,uniform --output-dir artifacts/span_identifiability_pretrained
 python measure_pretrained_span_identifiability.py --device cuda --epochs 5 --validation-passes 8 --test-passes 8 --policies anchored_copy,uniform --random-init-backbone --output-dir artifacts/span_identifiability_random_architecture_control
+python measure_multigap_wallclock.py --device cuda --calibration-epochs 3 --artifact-dir artifacts/text_multigap_wallclock_calibration
+python experiment_multigap_matched_training.py --device cuda --models sequential_filler,length_masked --epochs-per-model "sequential_filler=361,length_masked=212" --exact-checkpoint artifacts/text_multigap_matched_training/factorized_depth_exact.pt --artifact-dir artifacts/text_multigap_wallclock_matched
 ```
 
 The experiment writes its metrics and checkpoints to `artifacts/`.
@@ -410,3 +412,18 @@ run. Across three additional sampling seeds, TV improves from `0.172±0.010` to
 important. Direct tuple enumeration grows as `4^k`, so the next architecture is
 a small number of within-frontier topology-denoising refinements. See
 `research/FRONTIER_COUPLING.md`.
+
+The remaining training-matching confound on the two-gap likelihood result has
+been closed on wall-clock compute, not just optimizer updates. Per-epoch, the
+exact model costs `12.05x` more wall-clock time than the sequential
+(autoregressive) filler and `7.09x` more than the learned-length baseline.
+Retraining both baselines from scratch for an epoch budget that consumes the
+same wall-clock time as the exact model's own 30-epoch run (361 and 212
+epochs respectively) still loses two-gap joint NLL by `-5.916` and `-7.486`
+nats, with paired 95% intervals `[-6.594,-5.248]` and `[-8.265,-6.728]`. The
+sequential filler used nearly its entire budget and improved substantially
+over the update-matched run, while the learned-length baseline plateaued
+after roughly 43 epochs. This also satisfies the preregistered scale-up
+gate's compute-matched autoregressive-competitiveness condition on this
+project's joint-likelihood metric. See "Wall-clock-matched baseline
+retraining" in `research/MULTIGAP_EXACT_INSIDE.md`.
