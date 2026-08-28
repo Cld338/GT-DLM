@@ -88,10 +88,12 @@ validation split. Test joint NLL is `43.300` against `51.247` sequential and
 nats. Both baselines converge by roughly epoch 20 while the exact model is
 still improving, so the gap is a lower bound under this budget.
 
-The remaining cap is evidential, not procedural: this is a held-out likelihood
-result. Joint and per-gap calibration under parallel sampling (control 3) is
-not started, so no sampling or generation claim follows. See
-`research/MULTIGAP_EXACT_INSIDE.md`.
+Parallel sampling control 3 is now complete. Raw per-gap TV is
+`0.131--0.134`; one shared validation-fitted root bias gives
+`0.119--0.121`, and total-length TV improves from `0.196` to `0.192`.
+Exact ordered-pair TV does not improve (`0.293 -> 0.296`), so the result adds
+a marginal and aggregate-length calibration claim, not an exact-pair or fluent
+generation claim. See `research/MULTIGAP_EXACT_INSIDE.md`.
 
 ## Closed directions
 
@@ -143,7 +145,7 @@ matched intervention isolating the surviving twin. See
 | Item | Source | State |
 |---|---|---|
 | From-scratch matched two-gap training of all three models | `MULTIGAP_EXACT_INSIDE.md` control 4 | **Done:** exact beats both baselines by `-7.947 [-8.711,-7.202]` and `-7.646 [-8.394,-6.926]` nats at matched updates; the multi-gap likelihood claim is unblocked |
-| Joint and per-gap length calibration under parallel sampling | `MULTIGAP_EXACT_INSIDE.md` control 3 | Not started; multi-gap has likelihood evidence only |
+| Joint and per-gap length calibration under parallel sampling | `MULTIGAP_EXACT_INSIDE.md` control 3 | **Done:** per-gap TV is `0.131--0.134` raw and `0.119--0.121` calibrated; total length improves slightly, while exact ordered-pair calibration does not |
 | Comparison by training FLOPs or wall-clock, not epoch count | `JOINT_LEXICAL_OBJECTIVE.md` item 4 | Not started |
 | Insertion/blank baselines and the selected two-block frontier model | `DEPTH_INSIDE.md` control 4 | Partial: sequential and masked are done |
 | Corpus not seen by the pretrained backbone | `PRETRAINED_CONTEXT_DEPTH.md` limit 1 | **Done:** gain is larger on post-lineage text (`-6.136` vs `-4.879`); see `CORPUS_OVERLAP_CONTROL.md` |
@@ -184,7 +186,7 @@ compute. The oracle-length gap must be reported either way.
 | Condition | State |
 |---|---|
 | Length-extrapolation slice | Copy-specific attribution and corpus overlap are now controlled, but at flattened lengths neither arm beats the uniform prior per example, so `anchored_copy` is not usable as a long-span slice on this corpus |
-| Gap-composition slice | Synthetic passes; text has likelihood evidence only |
+| Gap-composition slice | Synthetic passes; text has likelihood plus per-gap and total-length calibration evidence, but exact ordered-pair calibration remains weak |
 | Compute-matched AR competitiveness | Not attempted |
 
 The `research/PROPOSAL.md` hold on scaling to 50--100M therefore stands.
@@ -210,8 +212,11 @@ The `research/PROPOSAL.md` hold on scaling to 50--100M therefore stands.
    unmatched `-2.5` and `-2.3`, and the baselines converge by epoch 20 while
    the exact model is still improving, so the gap is a lower bound
    (`research/MULTIGAP_EXACT_INSIDE.md`).
-5. Complete the baseline table and the FLOP-matched comparison.
-6. Re-evaluate the scale-up gate.
+5. **Completed:** joint and per-gap parallel length calibration. Marginal and
+   total-length calibration pass; ordered-pair calibration does not improve
+   (`research/MULTIGAP_EXACT_INSIDE.md`).
+6. Complete the baseline table and the FLOP-matched comparison.
+7. Re-evaluate the scale-up gate.
 
 ## Currently claimable
 

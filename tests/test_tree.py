@@ -52,6 +52,11 @@ from measure_pretrained_span_identifiability import (
     render_masked_text,
     unique_token_positions,
 )
+from measure_twin_intervention import paired_statistics
+from evaluate_multigap_sampling import multigap_distribution_metrics
+from evaluate_multigap_sampling import (
+    bootstrap_target_length_covariance,
+)
 from gtdlm.text_data import (
     anchored_repeat_pairs,
     spans_remain_recoverable,
@@ -1192,6 +1197,62 @@ class SpanPolicyTests(unittest.TestCase):
             places=6,
         )
 
+    def test_twin_intervention_bootstrap_matches_document_weighted_estimand(self):
+        result = paired_statistics(
+            [0.0, 0.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0, 4.0],
+            [0, 0, 0, 1],
+            seed=7,
+            bootstrap_samples=2000,
+        )
+        self.assertAlmostEqual(result["mean_nll_change"], 2.0)
+        self.assertAlmostEqual(result["mean_nll_change_example_weighted"], 1.0)
+        low, high = result["bootstrap_95_ci"]
+        self.assertLessEqual(low, result["mean_nll_change"])
+        self.assertGreaterEqual(high, result["mean_nll_change"])
+        with self.assertRaises(ValueError):
+            paired_statistics(
+                [0.0], [0.0, 1.0], [0], seed=7, bootstrap_samples=10
+            )
+
+    def test_multigap_metrics_recover_deterministic_joint_targets(self):
+        examples = [
+            TextInfillingExample(((), (), ()), ((), (7,))),
+            TextInfillingExample(((), (), ()), ((7, 8), (7, 8, 9))),
+            TextInfillingExample(
+                ((), (), ()), ((1, 2, 3, 4, 5, 6, 7, 8, 9), ())
+            ),
+        ]
+        probabilities = []
+        for example in examples:
+            matrix = []
+            for span in example.spans:
+                row = [0.0] * 10
+                row[len(span)] = 1.0
+                matrix.append(row)
+            probabilities.append(matrix)
+        result = multigap_distribution_metrics(examples, probabilities)
+        self.assertAlmostEqual(result["joint"]["marginal_tv_to_empirical"], 0.0)
+        self.assertAlmostEqual(
+            result["joint"]["observed_target_match_probability"], 1.0
+        )
+        self.assertAlmostEqual(result["joint"]["conditional_brier"], 0.0)
+        self.assertAlmostEqual(
+            result["total_length"]["marginal_tv_to_empirical"], 0.0
+        )
+        self.assertAlmostEqual(
+            result["total_length"]["observed_target_match_probability"], 1.0
+        )
+        self.assertAlmostEqual(result["total_length"]["conditional_brier"], 0.0)
+        self.assertAlmostEqual(
+            result["joint"]["predicted_length_covariance"],
+            result["joint"]["target_length_covariance"],
+        )
+
+        self.assertEqual(
+            bootstrap_target_length_covariance(
+                examples[:1], seed=3, bootstrap_samples=20
+            ), [0.0, 0.0])
 
 if __name__ == "__main__":
     unittest.main()
