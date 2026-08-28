@@ -18,9 +18,11 @@ generation claims, and the preregistered scale-up gate has not been passed.
 The two-gap likelihood advantage has since been decomposed. It is lexical, it
 survives scoring under the model's own tree head at about 70% strength
 (`-5.3`/`-5.6` nats), and it is not an artifact of the gold-conditioned tree
-posterior. The identified bottleneck is instead the structural term, a stable
-`+3.65` nat deficit against both baselines whose errors cascade during
-generation while costing only their own nats in likelihood.
+posterior. The structural term is *not* a deficit once tree shape is
+marginalized out: the exact model's length model ties both baselines
+(`+0.086 [-0.024,+0.200]`). Four explanations for poor generation are now
+rejected, and the surviving hypothesis is compounding in recursive decoding —
+a decoding problem rather than an objective one.
 
 ## What is established
 
@@ -204,12 +206,22 @@ on the exact marginal: the structural term is unchanged between the posterior
 and the topology prior (`+0.030 [-0.057,+0.120]`) and blows up only under
 midpoint, which costs the model four times as much as the topology prior does.
 
-The structural deficit is therefore real and stable at `+3.65` nats but is not
-the dominant likelihood term. Its significance is asymmetric: in scoring a bad
-length costs its own nats, while in generation it misplaces every token that
-follows. That asymmetry, not the unavailability of the likelihood, is the
-current explanation for poor generation, and it is consistent with length
-calibration never improving anywhere in the project. See
+Splitting the structural term then removes it as a candidate bottleneck. The
+cost is almost entirely topology (`6.875`) rather than the root STOP decision
+(`1.087`, identical across arms), and the exact model's term describes a whole
+tree while both baselines describe only a length. Marginalizing shape out makes
+them comparable, and the exact model then ties: `+0.086 [-0.024,+0.200]` against
+sequential and `+0.092 [-0.008,+0.197]` against masked, both intervals
+containing zero. The earlier `+3.65` reading was a units artifact. Structural
+cost also grows about linearly in span length, so nothing degrades with
+recursion depth.
+
+Four explanations for poor generation have now been tested and rejected: tree
+multiplicity, tighter gold context at depth, posterior-conditioned tree
+selection, and a worse structural model. The surviving hypothesis is
+compounding in recursive decoding — the masked baseline emits every token in
+one parallel pass and cannot compound, while the tree model makes each emitted
+token the interval boundary conditioning its children. See
 `research/LIKELIHOOD_DECOMPOSITION.md`.
 
 ### 4. Cross-gap dependence, if pursued again
@@ -272,15 +284,20 @@ The `research/PROPOSAL.md` hold on scaling to 50--100M therefore stands.
    token likelihood. Under the model's own topology head the advantage
    survives at `-5.3`/`-5.6` nats; the midpoint reversal is an
    off-distribution artifact (`research/LIKELIHOOD_DECOMPOSITION.md`).
-9. **Next:** attack the structural deficit, now the identified bottleneck. It
-   is a stable `+3.65` nats against both baselines and is where errors cascade
-   during generation. Unlike the calibration attempts already rejected, this
-   needs a change to the structural model itself, not a post-hoc bias.
-10. Re-evaluate the scale-up gate (below).
-11. Optional, only if the structural hypothesis needs further discrimination:
-   a genuine top-down rollout, closing the residual gap between gold-token and
-   self-generated-token conditioning in the topology head. Sampling-based and
-   noisier than any arm measured so far.
+9. **Completed:** split the structural term. It is topology rather than root,
+   and once tree shape is marginalized out the exact model ties both baselines,
+   so it is not the bottleneck (`research/LIKELIHOOD_DECOMPOSITION.md`).
+10. **Next:** measure oracle-structure against free-sample token accuracy for
+   all three models on the matched two-gap checkpoint. This tests the surviving
+   hypothesis directly: the tree model should show a large gap between the two
+   and the masked model close to none. It needs no retraining.
+11. If that confirms, the responses are decoding-side — tree-marginalizing or
+   MBR decoding, or weakening how much each emitted token conditions its
+   descendants. Note this is a different class of fix from the six rejected
+   directions, all of which changed the objective or added structure to it.
+12. Re-evaluate the scale-up gate (below).
+13. Optional: a genuine top-down rollout, closing the residual gap between
+   gold-token and self-generated-token conditioning in the topology head.
 
 ## Currently claimable
 
@@ -311,9 +328,10 @@ model's own topology head, which does not select trees on token likelihood, it
 is `-5.557 [-6.194,-4.950]` and `-5.257 [-5.874,-4.663]`. Both are claimable;
 the second is the more conservative and should be preferred when the context is
 about what the model can do rather than about the objective. The advantage is
-lexical in both cases and coexists with a `+3.65` nat structural deficit.
+lexical in both cases, and it does not come at a structural cost: the exact
+model's length model ties both baselines once tree shape is marginalized out.
 
-A natural-text generation-quality advantage is **not** claimable, and the
-decomposition now supplies a mechanism for why: the structural term, whose
-errors cascade during generation while costing only their own nats in
-likelihood.
+A natural-text generation-quality advantage is **not** claimable. The
+decomposition has narrowed why to a decoding hypothesis — compounding in
+recursive expansion — with four alternative explanations rejected, but that
+hypothesis is not yet tested on this checkpoint.

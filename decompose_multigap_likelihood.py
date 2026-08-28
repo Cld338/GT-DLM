@@ -196,6 +196,12 @@ def decompose_exact_batch(
         ("lexical", lexical),
         ("structure", topology + root),
         ("tree_entropy", entropy),
+        # The two halves of the structural term answer different questions.
+        # "root" is the STOP decision that sets whether the gap is empty at
+        # all; "topology" is every choice of tree shape below it. A deficit in
+        # the first is a length model to fix, in the second a shape model.
+        ("structure_root", root),
+        ("structure_topology", topology),
     ):
         totals = torch.zeros(len(examples), device=device)
         totals.index_add_(0, owner, values)
@@ -203,6 +209,14 @@ def decompose_exact_batch(
     per_example["total"] = sum(per_example[name] for name in COMPONENTS)
     per_example["depth_lexical"] = depth_lexical.cpu()
     per_example["depth_count"] = depth_count.cpu()
+    # Per-gap rows keyed by span length, so the structural cost can be read
+    # against how much structure there is to describe.
+    span_lengths = torch.zeros(gap_count)
+    for gap_index, chart in charts["combined"].items():
+        span_lengths[gap_index] = int(chart.shape[-1])
+    per_example["gap_span_length"] = span_lengths
+    per_example["gap_structure"] = (topology + root).cpu()
+    per_example["gap_lexical"] = lexical.cpu()
     if reference is not None:
         # The posterior and midpoint arms must reproduce a value the likelihood
         # path already computes; the topology-prior arm is an ELBO with no such
@@ -231,7 +245,10 @@ def decompose_exact(model, examples, vocab, device, batch_size, tree="posterior"
     ]
     result = {
         key: torch.cat([part[key] for part in parts])
-        for key in list(COMPONENTS) + ["total"]
+        for key in list(COMPONENTS) + [
+            "total", "structure_root", "structure_topology",
+            "gap_span_length", "gap_structure", "gap_lexical",
+        ]
     }
     # Batches can reach different maximum depths; pad before concatenating.
     depth = max(part["depth_lexical"].size(1) for part in parts)
@@ -362,6 +379,14 @@ def main():
         ),
     }
 
+    # The exact model's structural term describes a whole tree, while both
+    # baselines describe only a length. Adding back the tree entropy marginalizes
+    # the shape out, giving the one structural figure that is comparable across
+    # all three factorizations. Baseline entropies are zero, so this leaves them
+    # unchanged.
+    for parts in decompositions.values():
+        parts["structure_net"] = parts["structure"] + parts["tree_entropy"]
+
     # Report as NLL contributions so that lower is better everywhere, matching
     # the sign convention of every other document in this project.
     nll = {
@@ -381,7 +406,7 @@ def main():
         "factorized_depth_exact_midpoint_tree",
     )
     for other in contrasts:
-        for key in list(COMPONENTS) + ["total"]:
+        for key in list(COMPONENTS) + ["total", "structure_net"]:
             comparisons["exact_vs_{}_{}".format(other, key)] = paired_bootstrap(
                 nll["factorized_depth_exact"][key], nll[other][key]
             )
@@ -392,7 +417,7 @@ def main():
         ("midpoint", "factorized_depth_exact_midpoint_tree"),
     ):
         for other in ("sequential_filler", "length_masked"):
-            for key in list(COMPONENTS) + ["total"]:
+            for key in list(COMPONENTS) + ["total", "structure_net"]:
                 comparisons["{}_vs_{}_{}".format(prefix, other, key)] = (
                     paired_bootstrap(nll[arm][key], nll[other][key])
                 )
@@ -477,6 +502,68 @@ def main():
                         entry["bootstrap_95_low"], entry["bootstrap_95_high"],
                     )
                 )
+    # Which half of the structural term carries the deficit.
+    structure_split = {
+        name: {
+            "root": float(nll[name]["structure_root"].mean()),
+            "topology": float(nll[name]["structure_topology"].mean()),
+            "net_of_entropy": float(nll[name]["structure_net"].mean()),
+        }
+        for name in nll if "structure_root" in nll[name]
+    }
+    lines.extend([
+        "",
+        "## Structural term, split", "",
+        "`root` is the STOP decision that sets whether a gap is empty at all.",
+        "`topology` is every choice of tree shape below it. `net_of_entropy`",
+        "adds the tree entropy back, marginalizing shape out, and is the only",
+        "structural figure comparable with baselines that describe a length",
+        "rather than a tree.",
+        "",
+        "| Arm | Root | Topology | Net of entropy |",
+        "|---|---:|---:|---:|",
+    ])
+    for name, row in structure_split.items():
+        lines.append("| `{}` | {:.3f} | {:.3f} | {:.3f} |".format(
+            name, row["root"], row["topology"], row["net_of_entropy"],
+        ))
+    for name in ("sequential_filler", "length_masked"):
+        lines.append("| `{}` | -- | -- | {:.3f} |".format(
+            name, float(nll[name]["structure_net"].mean()),
+        ))
+
+    # Structural cost against how much structure there is to describe.
+    exact_parts = decompositions["factorized_depth_exact"]
+    lengths = exact_parts["gap_span_length"]
+    lines.extend([
+        "",
+        "## Exact structural and lexical cost by span length", "",
+        "Per-gap nats, posterior arm. A deficit that grows with span length",
+        "points at the recursion; one that is flat points at the root decision.",
+        "",
+        "| Span length | Gaps | Structure / gap | Lexical / token |",
+        "|---:|---:|---:|---:|",
+    ])
+    length_profile = []
+    for value in sorted(set(int(x) for x in lengths.tolist())):
+        mask = lengths == value
+        count = int(mask.sum())
+        structure = float(-exact_parts["gap_structure"][mask].mean())
+        entry = {
+            "span_length": value, "gaps": count, "structure_per_gap": structure,
+            "lexical_per_token": (
+                float(-exact_parts["gap_lexical"][mask].sum()) / (count * value)
+                if value else 0.0
+            ),
+        }
+        length_profile.append(entry)
+        lines.append("| {} | {} | {:.3f} | {} |".format(
+            value, count, structure,
+            "--" if not value else "{:.3f}".format(entry["lexical_per_token"]),
+        ))
+    result["structure_split"] = structure_split
+    result["exact_by_span_length"] = length_profile
+
     lines.extend([
         "",
         "## Exact lexical term by tree depth", "",

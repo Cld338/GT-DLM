@@ -193,10 +193,11 @@ midpoint supervision, so midpoint trees are simply a poor description of its
 tree distribution. Midpoint is answer-independent, but it conflates that with
 being off-distribution, and only the second effect produces the reversal.
 
-**The structural deficit is real, stable, and not the dominant term.** At
-`+3.64`/`+3.65` nats it is unchanged between the posterior and the topology
-prior, so it is a genuine property of the model rather than a scoring artifact.
-But the lexical advantage of `-5.3`/`-5.6` nats outweighs it.
+**The structural term is stable across arms** at `+3.64`/`+3.65` nats, so it is
+not a scoring artifact of the tree distribution. It is, however, an artifact of
+*units* — the section after next splits it and shows the exact model's length
+model is statistically tied with both baselines once tree shape is
+marginalized out.
 
 ## What this resolves
 
@@ -206,19 +207,90 @@ likelihoods, and it survives that at `-5.3` to `-5.6` nats with intervals well
 clear of zero.
 
 The generation contradiction is therefore *not* explained by the likelihood
-being unavailable at generation time. The remaining explanation is the
-asymmetry in how a structural error is punished. In likelihood scoring, a bad
-length or topology costs its own nats and nothing more — `+3.65` on this
-corpus, comfortably covered by the token advantage. In free generation the same
-error is categorical: the wrong length or the wrong split misplaces every token
-that follows, and the cost compounds down the tree instead of being summed. A
-model can hold a `5` nat likelihood advantage and still generate worse text if
-its errors are concentrated in the one factor whose mistakes cascade.
+being unavailable at generation time. The next section tests whether the
+structural term explains it instead.
 
-That reading is consistent with everything else on record: length calibration
-that never improves, a `TV < 0.20` gate that reads as saturated rather than
-passed, and free-sample quality that stays poor while every likelihood metric
-improves.
+## Is the structural term actually a deficit?
+
+The `+3.65` nats read as a structural deficit above, and the previous revision
+of this document treated it as the identified bottleneck. Splitting the term
+shows that reading was wrong, and the error was one of units.
+
+| Arm | Root | Topology | Net of entropy |
+|---|---:|---:|---:|
+| Posterior tree | 1.087 | 6.875 | 5.798 |
+| Topology prior | 1.087 | 6.844 | **4.378** |
+| Midpoint tree | 1.087 | 9.260 | 10.347 |
+| Sequential filler | -- | -- | **4.292** |
+| Learned lengths + masks | -- | -- | **4.286** |
+
+Two things follow.
+
+**The root decision is not where the cost is.** The STOP term that sets whether
+a gap is empty at all costs `1.087` nats and is identical across every arm, by
+construction. Structure is `6.875` nats of topology against `1.087` of root, so
+any structural story is about tree shape, not about the empty/non-empty
+decision that length calibration has always targeted.
+
+**Compared like with like, the deficit disappears.** The exact model's
+structural term describes an entire tree; both baselines describe only a
+length. Adding the tree entropy back marginalizes shape out and makes the three
+comparable — for the topology-prior arm this is exactly `root + log Z_topology`,
+the model's structural cost of producing a span of the observed length with
+shape summed out. That figure is `4.378` against `4.292` and `4.286`:
+
+| Comparison | Structure net of entropy |
+|---|---:|
+| Topology prior minus sequential | `+0.086 [-0.024,+0.200]` |
+| Topology prior minus masked | `+0.092 [-0.008,+0.197]` |
+
+Both intervals contain zero. The exact model's length model is statistically
+tied with both baselines, not `3.65` nats behind them. The apparent deficit was
+an artifact of charging it for describing a tree while charging the baselines
+only for describing a length.
+
+The per-span-length profile agrees that nothing degrades with recursion depth.
+Structural cost grows close to linearly, about one nat per token, and the
+lexical cost per token is flat:
+
+| Span length | Gaps | Structure / gap | Lexical / token |
+|---:|---:|---:|---:|
+| 0 | 121 | 1.351 | -- |
+| 2 | 54 | 2.768 | 5.432 |
+| 4 | 56 | 3.919 | 5.510 |
+| 6 | 39 | 6.058 | 5.659 |
+| 8 | 45 | 8.419 | 5.469 |
+
+## Where this leaves the generation question
+
+Four candidate explanations have now been tested and rejected: tree
+multiplicity, tighter two-sided gold context at depth, posterior-conditioned
+tree selection, and a worse structural model. On held-out likelihood the exact
+model is better at tokens and tied on structure.
+
+What remains is the ordinary likelihood-versus-sample-quality gap, and the
+decomposition points at a specific mechanism for it: **how each model decodes**,
+not what it scores. The masked baseline draws one length and then emits every
+token in a single parallel pass conditioned on the prompt alone, so nothing it
+generates feeds back into anything else and there is no compounding. The exact
+model expands recursively, so every token it emits becomes the interval
+boundary conditioning its children, and an early error changes the context for
+everything below it.
+
+The existing generation numbers fit that shape. Oracle-structure token accuracy
+is `5.7%` for the tree model against `3.7%` for the oracle-length masked model,
+but free-sample accuracy is `2.1%` against `3.7%` — the tree model loses `3.6`
+points to its own decoding while the masked model loses nothing. Those figures
+come from the pretrained single-gap study rather than this two-gap checkpoint,
+so they indicate the hypothesis rather than establish it here.
+
+That makes the next measurement clear, and it is a decoding question rather
+than an objective question: measure oracle-structure against free-sample
+accuracy for all three models on this matched two-gap checkpoint. If the tree
+model's gap is large while the masked model's is near zero, the bottleneck is
+compounding in recursive decoding, and the responses to try are decoding-side —
+tree-marginalizing or MBR decoding, or reducing how much each emitted token
+conditions its descendants.
 
 ## Limits of this measurement
 

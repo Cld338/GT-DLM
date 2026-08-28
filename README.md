@@ -455,10 +455,20 @@ term is statistically unchanged between the posterior and the topology prior
 (`+0.030 [-0.057,+0.120]`) and blows up only under midpoint, which costs the
 model four times what the topology prior does.
 
-So the likelihood advantage is real and largely available without knowing the
-answer, while the `+3.65` nat structural deficit is stable and is not the
-dominant likelihood term. Its significance is asymmetric: in scoring, a bad
-length costs its own nats; in generation it misplaces every token that
-follows. That asymmetry is the current explanation for poor generation, and it
-is consistent with length calibration never improving anywhere in this
-project. See `research/LIKELIHOOD_DECOMPOSITION.md`.
+Splitting the structural term then removes it as a candidate bottleneck. The
+cost is almost entirely topology (`6.875`) rather than the root STOP decision
+(`1.087`, identical across arms), and the exact model's term describes a whole
+tree where both baselines describe only a length. Marginalizing shape out makes
+them comparable, and the exact model ties: `+0.086 [-0.024,+0.200]` against the
+sequential filler and `+0.092 [-0.008,+0.197]` against the masked baseline,
+both intervals containing zero. Structural cost grows about linearly in span
+length, so nothing degrades with recursion depth either.
+
+Four explanations for poor generation have therefore been tested and rejected:
+tree multiplicity, tighter gold context at depth, posterior-conditioned tree
+selection, and a worse structural model. The surviving hypothesis is
+compounding in recursive decoding — the masked baseline emits every token in
+one parallel pass and cannot compound, while the tree model makes each emitted
+token the interval boundary conditioning its children. That is a decoding
+problem rather than an objective one, and testing it is the next step. See
+`research/LIKELIHOOD_DECOMPOSITION.md`.
