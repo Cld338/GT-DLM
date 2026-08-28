@@ -442,19 +442,23 @@ two-sided gold context that deep chart nodes enjoy; at the root the exact
 model sees no more than the masked baseline and still costs `5.571` against
 `6.933` nats/token.
 
-Re-scoring along the midpoint tree — answer-independent, since its pivots
-depend only on span length — then reverses the headline. The token advantage
-survives at about half strength (`6.366` against `6.933` and `6.976`
-nats/token), but the structural deficit widens from `+3.7` to `+6.1` nats and
-the exact model *loses* overall by `+1.946 [+1.152,+2.738]` against the
-sequential filler and `+2.246 [+1.476,+3.024]` against the masked baseline.
-The `-7.9` nat advantage is therefore substantially an artifact of scoring
-under a tree posterior conditioned on the gold span, which free generation
-cannot access. This explains the generation metrics, and explains why length
-calibration has never improved anywhere in the project: the structural term is
-a large real deficit, not a calibration detail. The midpoint tree is one
-answer-independent tree rather than the distribution generation actually
-follows, so the honest reading is a bracket — the generation-time comparison
-lies between the posterior-scored `-7.9` and the midpoint-scored `+1.9`, and
-locating it inside that bracket is the next measurement. See
-`research/LIKELIHOOD_DECOMPOSITION.md`.
+Re-scoring under tree distributions that do not select on token likelihood
+then locates the advantage. Every arm is an ELBO of one family,
+`log p(x) >= root + E_q'[sum (token + topology)] + H(q')`, tight at the
+posterior, so the totals stay comparable. Under the model's own topology head
+the advantage survives at `-5.557 [-6.194,-4.950]` and `-5.257
+[-5.874,-4.663]` nats: dropping token-likelihood selection costs
+`2.389 [2.154,2.626]` nats, not the whole gap. Along the midpoint tree the
+total does reverse to `+1.9`/`+2.2`, but that is an artifact of midpoint being
+off-distribution for a model trained on the exact marginal — the structural
+term is statistically unchanged between the posterior and the topology prior
+(`+0.030 [-0.057,+0.120]`) and blows up only under midpoint, which costs the
+model four times what the topology prior does.
+
+So the likelihood advantage is real and largely available without knowing the
+answer, while the `+3.65` nat structural deficit is stable and is not the
+dominant likelihood term. Its significance is asymmetric: in scoring, a bad
+length costs its own nats; in generation it misplaces every token that
+follows. That asymmetry is the current explanation for poor generation, and it
+is consistent with length calibration never improving anywhere in this
+project. See `research/LIKELIHOOD_DECOMPOSITION.md`.

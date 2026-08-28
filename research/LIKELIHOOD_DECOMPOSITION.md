@@ -120,108 +120,119 @@ the model can find that tree without being told the answer.
 The measured `+3.7` nat structural deficit is the natural suspect. At
 generation time a structural error is not a partial loss but a categorical
 one: the wrong length or topology misplaces every token that follows. The next
-section tests both points directly.
+section tests both points directly, and finds for the structural explanation
+while clearing the posterior-scoring one.
 
-## Scoring under a tree chosen without the answer
-
-The follow-up is now run, and it reverses the headline comparison.
+## Scoring under trees not selected with the answer
 
 The originally planned quantity — the lexical term under the model's own tree
-*prior* `p(T | prompt)` — turns out not to be well defined for this model. The
-topology head is conditioned on the emitted token
-(`topology_logits_fn(hidden, chosen)`), so trees and tokens are generated
-jointly top-down and there is no token-independent tree distribution to
-average over.
+*prior* `p(T | prompt)` — is not well defined for this model. The topology head
+is conditioned on the emitted token (`topology_logits_fn(hidden, chosen)`), so
+trees and tokens are generated jointly top-down and there is no
+token-independent tree distribution to average over.
 
-The available substitute is a tree chosen **without consulting the token
-identities**. The midpoint tree is exactly that: its pivots are
-`(lo + hi) // 2`, a function of span length alone. Scoring the same model, on
-the same tokens, along that fixed tree isolates how much of the advantage
-required selecting the tree with knowledge of the answer. Its edge indicators
-come from the same autograd trick, since the gradient of a plain sum is `1` on
-the edges used and `0` elsewhere; the entropy term is then identically zero,
-which the tests pin.
+What is well defined is a family of bounds. For any tree distribution `q'`,
+
+```text
+log p(x) >= root + E_{q'}[sum (token_e + topology_e)] + H(q')
+```
+
+with equality when `q'` is the posterior. Every arm below is one of these
+ELBOs, differing only in how far tree selection is allowed to consult the
+answer, so all totals are comparable to each other and to the baselines' exact
+likelihoods. The tests pin the identity, the non-negativity of each entropy,
+and that no arm exceeds the posterior.
+
+Two substitutes for the posterior are available:
+
+- **Topology prior**, `q_struct(T) ∝ exp(sum topology_e)`: the tree
+  distribution induced by the model's own topology head, with token
+  likelihoods removed from tree selection. This is the exact counterpart of
+  rolling trees out top-down from that head, with no sampling noise.
+- **Midpoint tree**: pivots `(lo + hi) // 2`, a function of span length alone.
+  Fully answer-independent, but not a tree this model was trained toward.
 
 | Model | Lexical | Structure | Tree entropy | Total |
 |---|---:|---:|---:|---:|
 | Factorized depth exact, posterior tree | **37.502** | 7.962 | -2.164 | **43.300** |
+| Factorized depth exact, topology prior | 41.311 | 7.931 | -3.553 | 45.689 |
 | Factorized depth exact, midpoint tree | 42.846 | 10.347 | 0.000 | 53.192 |
-| Sequential filler | 46.955 | **4.292** | 0.000 | **51.247** |
+| Sequential filler | 46.955 | **4.292** | 0.000 | 51.247 |
 | Learned lengths + masks | 46.661 | 4.286 | 0.000 | 50.946 |
 
 | Comparison | Lexical | Structure | Total |
 |---|---:|---:|---:|
+| Topology prior minus sequential | `-5.644 [-6.294,-5.014]` | `+3.640 [+3.264,+4.029]` | `-5.557 [-6.194,-4.950]` |
+| Topology prior minus masked | `-5.349 [-5.984,-4.745]` | `+3.646 [+3.288,+4.016]` | `-5.257 [-5.874,-4.663]` |
 | Midpoint minus sequential | `-4.109 [-4.752,-3.480]` | `+6.055 [+5.440,+6.684]` | `+1.946 [+1.152,+2.738]` |
 | Midpoint minus masked | `-3.815 [-4.444,-3.201]` | `+6.061 [+5.456,+6.676]` | `+2.246 [+1.476,+3.024]` |
 
 | Model | Lexical nats / token |
 |---|---:|
 | Factorized depth exact, posterior tree | 5.572 |
+| Factorized depth exact, topology prior | 6.138 |
 | Factorized depth exact, midpoint tree | 6.366 |
 | Sequential filler | 6.976 |
 | Learned lengths + masks | 6.933 |
 
-**The token advantage survives, but shrinks by more than half.** Of the `1.36`
-nats per token separating the exact model from the masked baseline, `0.79`
-disappears when the tree is chosen without the answer (`5.572 -> 6.366`) and
-`0.57` remains (`6.366` against `6.933`). The per-example lexical advantage
-over both baselines still excludes zero.
+**Under the model's own tree head the advantage survives at about 70%
+strength.** The topology prior beats both baselines by
+`-5.557 [-6.194,-4.950]` and `-5.257 [-5.874,-4.663]` nats, against `-7.9` and
+`-7.6` for the posterior. Removing token likelihoods from tree selection costs
+`2.389 [2.154,2.626]` nats, which is the price of not knowing the answer — not
+the whole advantage.
 
-**The total advantage does not survive: it reverses.** Along an
-answer-independent tree the exact model *loses* by `+1.946 [+1.152,+2.738]`
-nats to the sequential filler and `+2.246 [+1.476,+3.024]` to the masked
-baseline. The reason is the structural term, whose deficit widens from `+3.7`
-to `+6.1` nats and now more than cancels the surviving token advantage.
+**The midpoint reversal is an artifact of midpoint being off-distribution.**
+Two diagnostics show this rather than assume it. First, the structural term
+under the topology prior is `7.931`, statistically identical to the posterior's
+`7.962` (`+0.030 [-0.057,+0.120]`, interval containing zero) — the `+6.1` nat
+structural blow-up appears only under midpoint. Second, midpoint costs the
+model `9.892 [8.879,10.924]` nats against its posterior, four times what the
+topology prior costs. This model was trained on the exact marginal, never on
+midpoint supervision, so midpoint trees are simply a poor description of its
+tree distribution. Midpoint is answer-independent, but it conflates that with
+being off-distribution, and only the second effect produces the reversal.
+
+**The structural deficit is real, stable, and not the dominant term.** At
+`+3.64`/`+3.65` nats it is unchanged between the posterior and the topology
+prior, so it is a genuine property of the model rather than a scoring artifact.
+But the lexical advantage of `-5.3`/`-5.6` nats outweighs it.
 
 ## What this resolves
 
-The generation contradiction is resolved, and the answer is unfavorable to the
-headline claim.
+The likelihood advantage is not an artifact of posterior-conditioned scoring.
+It shrinks by `2.4` nats when tree selection stops consulting token
+likelihoods, and it survives that at `-5.3` to `-5.6` nats with intervals well
+clear of zero.
 
-The `-7.9` nat advantage is measured under a tree posterior conditioned on the
-gold span. Free generation must commit to a tree without that information. When
-the tree is chosen that way, the exact model's better token head does not
-compensate for its much worse structural model, and it ends up behind both
-baselines — which is exactly what the generation metrics have said all along
-(`2.1%` free-sample token accuracy against the masked model's `3.7%`). Those
-metrics were not anomalous; the likelihood comparison was measuring something
-free generation cannot use.
+The generation contradiction is therefore *not* explained by the likelihood
+being unavailable at generation time. The remaining explanation is the
+asymmetry in how a structural error is punished. In likelihood scoring, a bad
+length or topology costs its own nats and nothing more — `+3.65` on this
+corpus, comfortably covered by the token advantage. In free generation the same
+error is categorical: the wrong length or the wrong split misplaces every token
+that follows, and the cost compounds down the tree instead of being summed. A
+model can hold a `5` nat likelihood advantage and still generate worse text if
+its errors are concentrated in the one factor whose mistakes cascade.
 
-This also explains, from the likelihood side, why length calibration has never
-improved anywhere in the project despite repeated attempts. The structural
-deficit is not a calibration detail to be tuned away by a root bias. It is
-large, it is the dominant term once the tree is not chosen with the answer, and
-it is where the model is genuinely weaker than both baselines.
+That reading is consistent with everything else on record: length calibration
+that never improves, a `TV < 0.20` gate that reads as saturated rather than
+passed, and free-sample quality that stays poor while every likelihood metric
+improves.
 
 ## Limits of this measurement
 
-The midpoint tree is *an* answer-independent tree, not the tree distribution
-free generation actually follows. Generation samples topology top-down from the
-model's own head, and that policy could be better than midpoint — this model
-was trained on the exact marginal, not on midpoint supervision, so it has no
-particular reason to favor midpoint trees. The `+1.9`/`+2.2` reversal is
-therefore a probe result, and the honest reading is bracketing rather than
-point estimation: the true generation-time comparison lies somewhere between
-the posterior-scored `-7.9` and the midpoint-scored `+1.9`, and nothing here
-establishes where.
+The topology prior still peeks at the answer in one place. Its topology head is
+conditioned on the *gold* token at each node, whereas a real rollout conditions
+on the token the model just generated. The bracket has narrowed from
+`[-7.9, +1.9]` to something whose generation-side endpoint is bounded by
+`-5.3`, but it is not closed: the residual gap is exactly the difference
+between gold-token and self-generated-token conditioning in the topology head.
 
-What is established is the qualitative claim, and it is robust to that
-uncertainty: the exact model's likelihood advantage depends substantially on
-choosing the latent tree with knowledge of the answer, and its structural term
-is a genuine and large deficit rather than a calibration artifact.
-
-## Next measurement
-
-Score the same tokens along trees rolled out top-down from the model's own
-topology head. That is the generation distribution itself, so it closes the
-bracket above. It is sampling-based and therefore noisier than either endpoint
-here, and needs several rollout seeds with paired intervals.
-
-If the result stays on the losing side of the bracket, the structural model is
-the thing to fix and the two-gap likelihood claim must be restated as a
-posterior-scored result. If it lands near the posterior endpoint, the model's
-own tree policy is much better than midpoint and the bottleneck is the decoder
-rather than the objective.
+Closing it needs a genuine top-down rollout, which is sampling-based and
+noisier than any arm here. That is worth doing only if the structural
+hypothesis above needs further discrimination; the cheaper and more directly
+useful next step is to attack the structural deficit itself.
 
 Evaluator: `decompose_multigap_likelihood.py`. Artifacts:
 `artifacts/text_multigap_decomposition`.

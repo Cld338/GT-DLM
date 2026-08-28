@@ -264,6 +264,19 @@ class FrontierTest(unittest.TestCase):
         )
         self.assertTrue(bool((midpoint["total"] <= parts["total"] + 1e-5).all()))
 
+        # The topology-prior arm is an ELBO under the model's own topology
+        # head: it must reconstruct, carry non-negative entropy, and sit at or
+        # below the posterior arm, which is the tight bound.
+        prior = decompose_exact_batch(
+            model, examples, vocab, torch.device("cpu"), tree="topology_prior"
+        )
+        self.assertTrue(torch.allclose(
+            prior["lexical"] + prior["structure"] + prior["tree_entropy"],
+            prior["total"], atol=1e-5,
+        ))
+        self.assertTrue(bool((prior["tree_entropy"] >= -1e-6).all()))
+        self.assertTrue(bool((prior["total"] <= parts["total"] + 1e-5).all()))
+
     def test_shared_latent_exactly_marginalizes_and_nests_factorized_model(self):
         vocab = TextVocabulary(
             vocab_size=12, PAD=0, GAP=1, MASK=2, LEFT=3, RIGHT=4

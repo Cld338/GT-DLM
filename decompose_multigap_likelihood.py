@@ -70,6 +70,7 @@ from gtdlm.text_tokenizer import vocabulary_from_tokenizer
 COMPONENTS = ("lexical", "structure", "tree_entropy")
 REPORT_ORDER = (
     "factorized_depth_exact",
+    "factorized_depth_exact_topology_prior",
     "factorized_depth_exact_midpoint_tree",
     "sequential_filler",
     "length_masked",
@@ -96,20 +97,36 @@ def decompose_exact_batch(
     ``(lo + hi) // 2`` and therefore depend on the span length alone, never on
     which tokens the span contains. Its "marginals" are the gradient of a plain
     sum, so they are 0/1 indicators of the single tree's edges, and the entropy
-    term is identically zero. Comparing the two isolates how much of the
-    lexical advantage requires choosing the tree with knowledge of the answer.
+    term is identically zero.
+
+    ``"topology_prior"`` uses ``q_struct(T) proportional to exp(sum topology_e)``,
+    the tree distribution induced by the model's own topology head with the
+    token likelihoods removed from the tree selection. This is the exact
+    counterpart of rolling trees out top-down from that head, without the
+    sampling noise.
+
+    All three are the same estimator family. For any tree distribution ``q'``,
+
+        log p(x) >= root + E_{q'}[sum (token_e + topology_e)] + H(q'),
+
+    with equality when ``q'`` is the posterior. So the three arms are ELBOs
+    that differ only in how much the tree selection is allowed to consult the
+    answer, and their totals are directly comparable to each other and to the
+    baselines' exact likelihoods.
     """
-    if tree not in ("posterior", "midpoint"):
-        raise ValueError("tree must be 'posterior' or 'midpoint'")
+    if tree not in ("posterior", "midpoint", "topology_prior"):
+        raise ValueError(
+            "tree must be 'posterior', 'midpoint' or 'topology_prior'"
+        )
     partition_fn = (
-        batched_depth_inside_log_partition if tree == "posterior"
-        else batched_depth_midpoint_tree_log_weight
+        batched_depth_midpoint_tree_log_weight if tree == "midpoint"
+        else batched_depth_inside_log_partition
     )
     with torch.no_grad():
         exact, midpoint, _, charts = multi_depth_gap_log_likelihoods(
             model, examples, vocab, device, return_charts=True
         )
-    reference = exact if tree == "posterior" else midpoint
+    reference = {"posterior": exact, "midpoint": midpoint}.get(tree)
     owner = charts["owner"]
     gap_count = int(owner.numel())
     lexical = torch.zeros(gap_count, device=device)
@@ -135,19 +152,32 @@ def decompose_exact_batch(
     for gap_index, chart in charts["combined"].items():
         by_shape.setdefault(tuple(chart.shape), []).append(gap_index)
     for shape, group in by_shape.items():
-        stacked = torch.stack(
-            [charts["combined"][index] for index in group]
-        ).detach().requires_grad_(True)
+        token_part = torch.stack([charts["token"][index] for index in group])
+        topology_part = torch.stack([charts["topology"][index] for index in group])
+        # The tree distribution is defined by whichever chart drives the
+        # partition: the full weights for the posterior and midpoint arms, the
+        # topology weights alone when tree selection must not consult token
+        # likelihoods. Unreachable entries stay -inf so they keep zero mass.
+        if tree == "topology_prior":
+            source = torch.where(
+                torch.stack([charts["combined"][index] for index in group])
+                > float("-inf"),
+                topology_part,
+                torch.full_like(topology_part, float("-inf")),
+            )
+        else:
+            source = torch.stack([charts["combined"][index] for index in group])
+        stacked = source.detach().requires_grad_(True)
         with torch.enable_grad():
             log_partition = partition_fn(stacked)
             marginals, = torch.autograd.grad(log_partition.sum(), stacked)
-        token_part = torch.stack([charts["token"][index] for index in group])
-        topology_part = torch.stack([charts["topology"][index] for index in group])
         dims = tuple(range(1, stacked.ndim))
         group_lexical = (marginals * token_part).sum(dim=dims)
         group_topology = (marginals * topology_part).sum(dim=dims)
-        # H(q) = log Z - E_q[sum of used chart weights].
-        group_entropy = log_partition.detach() - (group_lexical + group_topology)
+        # H(q') = log Z - E_q'[sum of the weights that defined q'].
+        group_entropy = log_partition.detach() - (
+            marginals * stacked.detach().nan_to_num(neginf=0.0)
+        ).sum(dim=dims)
         # Collapse every axis except batch and depth.
         interval_dims = tuple(range(2, stacked.ndim))
         by_depth_lexical = (marginals * token_part).sum(dim=interval_dims)
@@ -170,15 +200,24 @@ def decompose_exact_batch(
         totals = torch.zeros(len(examples), device=device)
         totals.index_add_(0, owner, values)
         per_example[name] = totals.cpu()
-    per_example["total"] = reference.cpu()
+    per_example["total"] = sum(per_example[name] for name in COMPONENTS)
     per_example["depth_lexical"] = depth_lexical.cpu()
     per_example["depth_count"] = depth_count.cpu()
-    reconstructed = sum(per_example[name] for name in COMPONENTS)
-    residual = float((reconstructed - per_example["total"]).abs().max())
-    if residual > 1e-3:
+    if reference is not None:
+        # The posterior and midpoint arms must reproduce a value the likelihood
+        # path already computes; the topology-prior arm is an ELBO with no such
+        # counterpart, so it is checked against the bound instead.
+        residual = float((per_example["total"] - reference.cpu()).abs().max())
+        if residual > 1e-3:
+            raise AssertionError(
+                "decomposition does not reconstruct the {} likelihood "
+                "(max residual {:.6f})".format(tree, residual)
+            )
+    slack = float((per_example["total"] - exact.cpu()).max())
+    if slack > 1e-3:
         raise AssertionError(
-            "decomposition does not reconstruct the exact likelihood "
-            "(max residual {:.6f})".format(residual)
+            "{} tree distribution exceeds the exact log likelihood by {:.6f}; "
+            "every arm is an ELBO and must lie at or below it".format(tree, slack)
         )
     return per_example
 
@@ -305,6 +344,12 @@ def main():
         "factorized_depth_exact": decompose_exact(
             exact_model, test, vocab, device, args.batch_size
         ),
+        # Same model and tokens; the tree distribution is the model's own
+        # topology head, with token likelihoods removed from tree selection.
+        "factorized_depth_exact_topology_prior": decompose_exact(
+            exact_model, test, vocab, device, args.batch_size,
+            tree="topology_prior",
+        ),
         # Same model, same tokens, but the tree is fixed by span length alone.
         "factorized_depth_exact_midpoint_tree": decompose_exact(
             exact_model, test, vocab, device, args.batch_size, tree="midpoint"
@@ -330,8 +375,9 @@ def main():
     comparisons = {}
     contrasts = (
         "sequential_filler", "length_masked",
-        # Same model and tokens, tree chosen without seeing them: the
-        # difference is exactly the posterior-selection benefit.
+        # Same model and tokens, tree chosen without token likelihoods or
+        # without the tokens at all: the differences are the selection benefit.
+        "factorized_depth_exact_topology_prior",
         "factorized_depth_exact_midpoint_tree",
     )
     for other in contrasts:
@@ -339,13 +385,17 @@ def main():
             comparisons["exact_vs_{}_{}".format(other, key)] = paired_bootstrap(
                 nll["factorized_depth_exact"][key], nll[other][key]
             )
-    # The generation-relevant contrast: an x-independent tree against the
-    # baselines, which never get to choose a tree using the answer either.
-    for other in ("sequential_filler", "length_masked"):
-        for key in list(COMPONENTS) + ["total"]:
-            comparisons["midpoint_vs_{}_{}".format(other, key)] = paired_bootstrap(
-                nll["factorized_depth_exact_midpoint_tree"][key], nll[other][key]
-            )
+    # The generation-relevant contrasts: tree distributions that do not select
+    # on token likelihood, against baselines that never get to select at all.
+    for prefix, arm in (
+        ("topology_prior", "factorized_depth_exact_topology_prior"),
+        ("midpoint", "factorized_depth_exact_midpoint_tree"),
+    ):
+        for other in ("sequential_filler", "length_masked"):
+            for key in list(COMPONENTS) + ["total"]:
+                comparisons["{}_vs_{}_{}".format(prefix, other, key)] = (
+                    paired_bootstrap(nll[arm][key], nll[other][key])
+                )
 
     # Per-token nats by tree depth. The exact model's token head sees the gold
     # tokens flanking each interval, so deep nodes are predicted from a tight
@@ -415,6 +465,7 @@ def main():
     ])
     for prefix, others in (
         ("exact", contrasts),
+        ("topology_prior", ("sequential_filler", "length_masked")),
         ("midpoint", ("sequential_filler", "length_masked")),
     ):
         for other in others:
