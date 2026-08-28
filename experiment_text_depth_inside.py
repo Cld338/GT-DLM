@@ -60,16 +60,18 @@ def depth_batch_log_likelihoods(
     device: torch.device,
     penalty_start_depth: int,
     late_depth_child_penalty: float,
+    return_charts: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     tokens, padding, positions, roots_left, roots_right = collate_prompt_contexts(
         examples, vocab, device
     )
-    # Only prompt-attention models accept per-record owner indices; the
+    # Context-readout variants accept per-record owner indices; the
     # from-scratch model's signature has no such argument.
     prompt_attention = bool(getattr(model, "prompt_attention", False))
+    uses_owners = bool(getattr(model, "requires_record_owners", False))
     if prompt_attention:
         model.encoder.keep_prompt_states(True)
-    owners_for = (lambda index: (index,)) if prompt_attention else (lambda index: ())
+    owners_for = (lambda index: (index,)) if uses_owners else (lambda index: ())
     encoded = model.encode(tokens, padding)
     contexts = encoded[torch.arange(len(examples), device=device), positions]
     exact: List[torch.Tensor] = [contexts.new_zeros(()) for _ in examples]
@@ -171,18 +173,29 @@ def depth_batch_log_likelihoods(
             )
             for index, example in enumerate(examples) if example.spans[0]
         }
+        token_by_example = {
+            index: torch.full_like(chart, float("-inf"))
+            for index, chart in weights_by_example.items()
+        }
+        topology_by_example = {
+            index: torch.full_like(chart, float("-inf"))
+            for index, chart in weights_by_example.items()
+        }
         cursor = 0
         for record_index, (example_index, depth, lo, hi) in enumerate(records):
             width = hi - lo
             pivots = torch.arange(cursor, cursor + width, device=device)
             span_tensor = span_tensors[example_index]
-            scores = (
-                token_logp[
-                    record_index, token_index[span_tensor[lo:hi]]
-                ]
-                + topology_logp[pivots, targets[pivots]]
-            )
+            token_scores = token_logp[
+                record_index, token_index[span_tensor[lo:hi]]
+            ]
+            topology_scores = topology_logp[pivots, targets[pivots]]
+            scores = token_scores + topology_scores
             weights_by_example[example_index][depth, lo, hi, lo:hi] = scores
+            token_by_example[example_index][depth, lo, hi, lo:hi] = token_scores
+            topology_by_example[example_index][depth, lo, hi, lo:hi] = (
+                topology_scores
+            )
             cursor += width
         for length in range(1, 9):
             group = [
@@ -202,7 +215,21 @@ def depth_batch_log_likelihoods(
             for offset, example_index in enumerate(group):
                 exact[example_index] = group_exact[offset]
                 midpoint[example_index] = group_midpoint[offset]
-    return torch.stack(exact), torch.stack(midpoint)
+    exact_tensor, midpoint_tensor = torch.stack(exact), torch.stack(midpoint)
+    if not return_charts:
+        return exact_tensor, midpoint_tensor
+    return exact_tensor, midpoint_tensor, {
+        "combined": weights_by_example if records else {},
+        "token": token_by_example if records else {},
+        "topology": topology_by_example if records else {},
+        "root": (
+            {
+                index: F.logsigmoid(-stop_logits[root_records[index]])
+                for index in root_records
+            }
+            if records else {}
+        ),
+    }
 
 
 def train_depth_model(

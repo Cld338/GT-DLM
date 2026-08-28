@@ -644,6 +644,99 @@ class FrontierTest(unittest.TestCase):
         logits[valid].mean().backward()
         self.assertIsNotNone(baseline_head[-1].weight.grad)
 
+    def test_fixed_mask_bank_is_length_blind_and_differentiable(self):
+        class StubTokenizer:
+            pad_token_id = 1
+            mask_token_id = 9
+            bos_token_id = 0
+            eos_token_id = 2
+            cls_token_id = None
+            sep_token_id = None
+            all_special_ids = [0, 1, 2, 3, 9]
+            mask_token = "<mask>"
+
+            def __len__(self):
+                return 16
+
+        class ContextualBackbone(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.config = SimpleNamespace(hidden_size=8)
+                self.embedding = torch.nn.Embedding(16, 8)
+
+            def get_input_embeddings(self):
+                return self.embedding
+
+            def forward(self, input_ids, attention_mask):
+                hidden = self.embedding(input_ids)
+                mask = attention_mask.unsqueeze(-1).to(hidden.dtype)
+                context = (hidden * mask).sum(1, keepdim=True) / mask.sum(
+                    1, keepdim=True
+                ).clamp_min(1)
+                positions = torch.arange(
+                    hidden.size(1), device=hidden.device, dtype=hidden.dtype
+                ).view(1, -1, 1)
+                return SimpleNamespace(
+                    last_hidden_state=hidden + context + positions / 10
+                )
+
+        tokenizer = StubTokenizer()
+        vocab = vocabulary_from_pretrained_tokenizer(tokenizer)
+        backbone = ContextualBackbone()
+        mlm_head = torch.nn.Sequential(
+            torch.nn.Linear(8, 8), torch.nn.GELU(),
+            torch.nn.LayerNorm(8), torch.nn.Linear(8, len(tokenizer)),
+        )
+        model = PretrainedIntervalInsideModel(
+            vocab.vocab_size, vocab.GAP, vocab.PAD, tokenizer,
+            backbone=backbone, pretrained_tokenizer=tokenizer,
+            pretrained_lm_head=mlm_head, native_vocabulary=True,
+            fixed_mask_count=4, initialize_custom_embeddings=False,
+            dropout=0.0,
+        )
+        # Same observed prompt, different hidden target lengths. Target length
+        # must not change encoder input or the fixed bank.
+        examples = [
+            TextInfillingExample(((5,), (8,)), ((6,),)),
+            TextInfillingExample(((5,), (8,)), ((6, 7, 10),)),
+        ]
+        rows = [example.prompt(vocab) for example in examples]
+        tokens = torch.tensor(rows)
+        padding = tokens.eq(vocab.PAD)
+        encoded = model.encode(tokens, padding)
+        self.assertEqual(tuple(model.encoder.mask_bank_states.shape), (2, 4, 8))
+        self.assertTrue(torch.allclose(
+            model.encoder.mask_bank_states[0],
+            model.encoder.mask_bank_states[1],
+        ))
+        self.assertFalse(torch.allclose(
+            model.encoder.mask_bank_states[0, 0],
+            model.encoder.mask_bank_states[0, 1],
+        ))
+        gap_positions = torch.tensor([row.index(vocab.GAP) for row in rows])
+        contexts = encoded[torch.arange(2), gap_positions]
+        hidden = model.interval_hidden(
+            contexts, torch.tensor([5, 5]), torch.tensor([8, 8]),
+            torch.tensor([0, 0]), torch.tensor([0, 1]),
+        )
+        self.assertTrue(torch.allclose(hidden[0], hidden[1], atol=1e-6))
+
+        exact, _, charts = depth_batch_log_likelihoods(
+            model, examples, vocab, torch.device("cpu"), 4, 0.0,
+            return_charts=True,
+        )
+        self.assertTrue(torch.isfinite(exact).all())
+        for index, combined in charts["combined"].items():
+            reachable = combined > float("-inf")
+            self.assertTrue(torch.allclose(
+                combined[reachable],
+                charts["token"][index][reachable]
+                + charts["topology"][index][reachable],
+            ))
+        (-exact.mean()).backward()
+        self.assertIsNotNone(model.mask_bank_query.weight.grad)
+        self.assertIsNotNone(model.mask_bank_residual_scale.grad)
+
     def test_lexical_metrics_condition_on_nonempty_length_matches(self):
         examples = [
             corrupt_token_sequence([10, 11, 12, 13], [(1, 3)]),

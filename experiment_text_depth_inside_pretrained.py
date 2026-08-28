@@ -205,12 +205,23 @@ def main() -> None:
              "output instead of sharing one pooled vector "
              "(research/LIKELIHOOD_DECOMPOSITION.md)",
     )
+    parser.add_argument(
+        "--fixed-mask-bank", type=int, default=0, metavar="K",
+        help="render K masks independent of target length and let each tree "
+             "node select an MLM-compatible mask state",
+    )
     parser.add_argument("--local-files-only", action="store_true")
     parser.add_argument("--no-mixed-precision", action="store_false", dest="mixed_precision")
     parser.set_defaults(mixed_precision=True)
     args = parser.parse_args()
     if not 0.0 <= args.warmup_ratio < 1.0:
         parser.error("--warmup-ratio must be in [0,1)")
+    if args.fixed_mask_bank < 0:
+        parser.error("--fixed-mask-bank must be nonnegative")
+    if args.fixed_mask_bank and not args.native_vocabulary:
+        parser.error("--fixed-mask-bank requires --native-vocabulary")
+    if args.fixed_mask_bank and args.prompt_attention:
+        parser.error("--fixed-mask-bank and --prompt-attention are exclusive")
     with open(
         os.path.join(args.base_artifact_dir, "results.json"), encoding="utf-8"
     ) as handle:
@@ -297,6 +308,7 @@ def main() -> None:
         random_init_backbone=args.random_init_backbone,
         prompt_attention=args.prompt_attention,
         native_vocabulary=args.native_vocabulary,
+        fixed_mask_count=args.fixed_mask_bank,
     ).to(device)
     if args.checkpoint:
         model.load_state_dict(
@@ -354,7 +366,11 @@ def main() -> None:
             "data_seed": data_seed,
             "training_seed": training_seed,
             "d_model": model.d_model,
-            "tree_objective": "pretrained_context_depth_exact_inside",
+            "tree_objective": (
+                "pretrained_fixed_mask_bank_depth_exact_inside"
+                if args.fixed_mask_bank
+                else "pretrained_context_depth_exact_inside"
+            ),
             "token_action_space": (
                 "pretrained_native_vocabulary_with_mlm_head"
                 if args.native_vocabulary

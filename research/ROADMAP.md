@@ -50,6 +50,17 @@ tree-specific deficit: on the same 128 native spans the masked baseline reaches
 is `4.921` against `6.786`. The tree retains passing length TV (`0.157`). See
 `research/NATIVE_VOCABULARY.md`.
 
+The first successful tree-side integration is now in hand at seed 17. A fixed
+bank of eight native mask states is independent of target length and feeds
+MLM-compatible states to each queried node. Test exact NLL improves
+`24.552 -> 20.026`, topology-prior ELBO NLL improves `25.829 -> 20.512`, and
+length TV improves `0.157 -> 0.126`. The gain survives answer-independent tree
+selection and is not posterior exploitation. Generation moves much less:
+oracle-midpoint accuracy is `9.80%`, and sampled top-down rollout reaches
+`12.24%` on length-matched pairs against the masked baseline's `20.04%`. The
+remaining blocker is gold-token/boundary exposure during topology training. See
+`research/FIXED_MASK_BANK.md`.
+
 ## What is established
 
 ### Synthetic range-infilling (closed)
@@ -208,6 +219,7 @@ matched intervention isolating the surviving twin. See
 | Corpus not seen by the pretrained backbone | `PRETRAINED_CONTEXT_DEPTH.md` limit 1 | **Done:** gain is larger on post-lineage text (`-6.136` vs `-4.879`); see `CORPUS_OVERLAP_CONTROL.md` |
 | Baseline on the same pretrained backbone | `LIKELIHOOD_DECOMPOSITION.md` | **Done:** matched on backbone, stream, split and budget, the masked baseline reaches `12.56%` oracle-structure accuracy to the tree model's `5.66%` in 3/3 non-overlapping seeds; `84%` of that gap is encoder access, not the objective |
 | Native pretrained vocabulary and MLM head | `NATIVE_VOCABULARY.md` | **Done at seed 17:** the full native path is implemented for corpus, chart, baseline and evaluation. It raises the lexical floor but leaves the native masked baseline well ahead (`20.04%` vs `8.71%` token accuracy; `0.410` vs `0.281` decoded character similarity) |
+| Fixed length-blind native mask bank | `FIXED_MASK_BANK.md` | **Done at seed 17:** exact and topology-prior NLL improve by `4.526` and `5.317` nats, with TV `0.126`; generation improves only modestly and remains below the native masked baseline |
 
 ### 3. Generation quality (deficit attributed to the encoder, not the objective)
 
@@ -314,17 +326,18 @@ baseline's oracle-structure token accuracy (`5.66%` against `12.56%`), so the
 clause is failed by a clear margin. Scaling the current configuration is not
 warranted.
 
-Read the gate's generation clause with the vocabulary handicap in mind. Every
-arm predicts over a 4,000-token custom BPE with a relearned output head, and in
-that regime finetuning buys no text quality over the untouched pretrained
-model. The clause is being evaluated on models that are all weak for a reason
-that has nothing to do with the objective.
+The vocabulary handicap has now been removed in both arms. The native masked
+baseline improves to `20.04%` oracle token accuracy while the pooled tree reaches
+`8.71%`, confirming that the output side mattered but did not explain the
+tree-specific gap. The fixed mask bank then solves the encoder-likelihood part:
+topology-prior NLL improves by `5.317` nats with TV `0.126`. It still reaches
+only `12.24%` on length-matched sampled rollout pairs, so the gate remains held
+for generation rather than likelihood.
 
-The hold is not a verdict on the objective. The encoder-access test attributes
-`84%` of the generation gap to how the pretrained encoder is attached, so what
-the hold blocks is scaling *this integration*. An encoder integration that
-gives the chart per-node context without presupposing span length (recommended
-order item 14) is the thing to try before the gate is re-run.
+The hold is not a verdict on the objective. It now blocks scaling a training
+path that uses gold pivot tokens and boundaries but rolls out with self-generated
+ones. Recommended order item 18 is the intervention to test before the gate is
+re-run.
 
 ## Recommended order
 
@@ -396,9 +409,18 @@ order item 14) is the thing to try before the gate is re-run.
    similarity, but the matched masked baseline reaches `20.04%` and `0.410`.
    The shared handicap was real, but removing it exposes rather than closes the
    tree-specific integration gap (`research/NATIVE_VOCABULARY.md`).
-16. Re-evaluate the scale-up gate (below).
-17. Optional: a genuine top-down rollout, closing the residual gap between
-   gold-token and self-generated-token conditioning in the topology head.
+16. **Completed at seed 17:** fixed eight-mask bank. It gives each node a native
+   MLM-compatible state without target-length leakage, improving exact NLL
+   `24.552 -> 20.026`, topology-prior NLL `25.829 -> 20.512`, and TV
+   `0.157 -> 0.126` (`research/FIXED_MASK_BANK.md`).
+17. **Completed diagnostically:** genuine top-down rollout. Greedy rollout gets
+   `16.95%` token accuracy on only 11 length-matched spans; 16 stochastic samples
+   per prompt yield `12.24%` over 156 matched pairs. This improves on the
+   off-distribution midpoint readout but remains below the masked baseline.
+18. **Next:** train against the gold-token/boundary exposure gap revealed by the
+   rollout, while keeping the fixed bank length-blind. Do not use the midpoint
+   auxiliary unchanged; midpoint NLL is `35.754` and is off-distribution here.
+19. Re-evaluate the scale-up gate only after that intervention.
 
 ## Currently claimable
 

@@ -99,6 +99,8 @@ python prepare_wikitext_pilot.py --output-dir artifacts/wikitext_native --native
 python experiment_text_depth_inside_pretrained.py --device cuda --data-dir artifacts/wikitext_native --native-vocabulary --local-files-only --artifact-dir artifacts/text_depth_inside_native
 python experiment_pretrained_masked_baseline.py --device cuda --data-dir artifacts/wikitext_native --native-vocabulary --local-files-only --artifact-dir artifacts/text_pretrained_masked_native
 python evaluate_native_inside_readout.py --device cuda
+python experiment_text_depth_inside_pretrained.py --device cuda --data-dir artifacts/wikitext_native --native-vocabulary --fixed-mask-bank 8 --local-files-only --artifact-dir artifacts/text_depth_inside_fixed_mask_bank
+python analyze_single_gap_tree_scoring.py --device cuda
 ```
 
 The experiment writes its metrics and checkpoints to `artifacts/`.
@@ -555,3 +557,13 @@ nonempty decoded character similarity and `7.92%` exact match, against the
 tree model's `8.71%`, `0.281` and `0.99%`. Token NLL is `4.921` against
 `6.786`. The current integration therefore still fails the generation clause
 of the scale-up gate. See `research/NATIVE_VOCABULARY.md`.
+
+A fixed eight-mask bank now addresses the remaining interface mismatch without
+revealing target length. Test exact NLL improves `24.552 -> 20.026`, topology-
+prior ELBO NLL improves `25.829 -> 20.512`, and length TV improves
+`0.157 -> 0.126`. This is not a gold-posterior artifact. Generation moves much
+less: oracle-midpoint token accuracy is `9.80%`, while topology-aligned sampled
+rollout reaches `12.24%` on length-matched pairs against the native masked
+baseline's `20.04%`. The next blocker is gold-token/boundary exposure in the
+topology training path, not encoder likelihood. See
+`research/FIXED_MASK_BANK.md`.

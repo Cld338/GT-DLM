@@ -695,14 +695,15 @@ A residual of `1.09` points remains and should not be explained away. It is
 the honest upper bound on what the objective itself might cost at this scale,
 and it is small next to the `5.81` points attributable to the encoder.
 
-The forward path remains an encoder integration that keeps per-node context
-without presupposing the span length. The first observed-sequence attention
-implementation has now been tried: `--prompt-attention` worsens test exact NLL
-from `21.61` to `22.66` and leaves same-seed oracle token accuracy unchanged at
-`4.65%`. That block should not be replicated unchanged. A fixed number of masks
-(`max_span`) would let the chart read `state[pivot]` without the true `n`
-leaking, but it is still untested and changes the conditioning interface enough
-to require an explicit objective audit.
+The forward path now has one successful likelihood result. Observed-sequence
+`--prompt-attention` failed, but a fixed bank of eight native mask states improves
+test exact NLL `24.552 -> 20.026` and topology-prior ELBO NLL
+`25.829 -> 20.512` without revealing the target length; length TV also improves
+to `0.126`. The exact gain is not posterior exploitation. Generation improves
+only modestly (`8.71% -> 9.80%` oracle-midpoint token accuracy, `12.24%` under
+sampled topology rollout on length-matched pairs), so the remaining blocker is
+gold-token/boundary exposure in training rather than encoder likelihood. See
+`research/FIXED_MASK_BANK.md`.
 
 Evaluator: `decompose_multigap_likelihood.py`. Artifacts:
 `artifacts/text_multigap_decomposition`.

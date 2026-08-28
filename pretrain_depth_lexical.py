@@ -92,7 +92,11 @@ def lexical_batch_log_probabilities(
         span_tensors[example_index][pivot]
         for example_index, _, _, _, pivot in records
     ])
-    owners = (example_ids,) if getattr(model, "prompt_attention", False) else ()
+    owners = (
+        (example_ids,)
+        if getattr(model, "requires_record_owners", False)
+        else ()
+    )
     token_logits, _, _ = model.interval_logits(
         contexts[example_ids], left, right, depths, *owners
     )

@@ -69,11 +69,10 @@ token units and sampled spans differ after retokenization. The decoded-text
 metrics make the native tree/baseline gap interpretable, and those are evaluated
 on exactly the same 128 native spans.
 
-This is one training seed. Replication is warranted only after selecting a
-better span-length-agnostic per-node encoder integration. The first
-`--prompt-attention` pilot did not improve same-seed token accuracy and worsened
-test exact NLL, so simply composing that attention block with the native head is
-not yet justified as a full replicated run.
+This is one training seed. The first `--prompt-attention` integration failed,
+but the subsequent fixed native mask bank succeeded on answer-independent
+likelihood while leaving a rollout exposure gap. Replication should follow an
+intervention on that new bottleneck rather than repeating prompt attention.
 
 Artifacts:
 
@@ -81,3 +80,7 @@ Artifacts:
 - `artifacts/text_depth_inside_native/results.json`
 - `artifacts/text_pretrained_masked_native/results.json`
 - `artifacts/text_depth_inside_native_readout/readout.json`
+
+The subsequent fixed-mask-bank integration improves answer-independent
+likelihood substantially but leaves a generation gap; see
+`research/FIXED_MASK_BANK.md`.

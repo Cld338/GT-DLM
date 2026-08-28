@@ -528,6 +528,7 @@ class PretrainedIntervalEncoder(nn.Module):
         pretrained_tokenizer=None,
         initialize_custom_embeddings: bool = True,
         native_vocabulary: bool = False,
+        fixed_mask_count: int = 0,
     ) -> None:
         super().__init__()
         if backbone is None or pretrained_tokenizer is None:
@@ -561,6 +562,11 @@ class PretrainedIntervalEncoder(nn.Module):
         self.pad_id = pad_id
         self.max_length = max_length
         self.native_vocabulary = native_vocabulary
+        self.fixed_mask_count = int(fixed_mask_count)
+        if self.fixed_mask_count < 0:
+            raise ValueError("fixed_mask_count must be nonnegative")
+        if self.fixed_mask_count and not native_vocabulary:
+            raise ValueError("fixed mask banks require native vocabulary")
         if native_vocabulary and int(pretrained_tokenizer.mask_token_id) != gap_id:
             raise ValueError("native vocabulary requires GAP to be the mask token")
         d_model = int(backbone.config.hidden_size)
@@ -577,6 +583,7 @@ class PretrainedIntervalEncoder(nn.Module):
         self._keep_prompt_states = False
         self.prompt_states = None
         self.prompt_mask = None
+        self.mask_bank_states = None
         if initialize_custom_embeddings and not native_vocabulary:
             self.initialize_custom_token_embeddings()
         if gradient_checkpointing:
@@ -693,7 +700,12 @@ class PretrainedIntervalEncoder(nn.Module):
         if steps is not None:
             raise ValueError("prompt encoder does not accept generation steps")
         if self.native_vocabulary:
-            model_inputs = self.native_model_inputs(tokens, padding_mask)
+            counts = (
+                [self.fixed_mask_count] * len(tokens)
+                if self.fixed_mask_count
+                else None
+            )
+            model_inputs = self.native_model_inputs(tokens, padding_mask, counts)
         else:
             texts, _ = self.render_prompts(tokens, padding_mask)
             encoded = self.pretrained_tokenizer(
@@ -710,12 +722,30 @@ class PretrainedIntervalEncoder(nn.Module):
             int(self.pretrained_tokenizer.mask_token_id)
         )
         counts = mask_matches.sum(dim=1)
-        if not bool(counts.eq(1).all()):
-            raise ValueError("encoded prompts must retain exactly one mask token")
+        expected_masks = self.fixed_mask_count or 1
+        if not bool(counts.eq(expected_masks).all()):
+            raise ValueError(
+                "encoded prompts must retain exactly {} mask token(s)".format(
+                    expected_masks
+                )
+            )
         mask_positions = mask_matches.to(torch.int64).argmax(dim=1)
         hidden = self.backbone(**model_inputs).last_hidden_state
         rows = torch.arange(len(tokens), device=tokens.device)
-        context = self.context_norm(hidden[rows, mask_positions])
+        if self.fixed_mask_count:
+            banks = hidden.new_zeros(
+                (len(tokens), self.fixed_mask_count, hidden.size(-1))
+            )
+            for row in range(len(tokens)):
+                positions = mask_matches[row].nonzero().flatten()
+                banks[row] = hidden[row, positions]
+            # Keep raw backbone mask states for the pretrained MLM head. The
+            # pooled context is used only by STOP/topology queries.
+            self.mask_bank_states = banks
+            context = self.context_norm(banks.mean(dim=1))
+        else:
+            self.mask_bank_states = None
+            context = self.context_norm(hidden[rows, mask_positions])
         custom_gaps = tokens.eq(self.gap_id).unsqueeze(-1).to(context.dtype)
         if self._keep_prompt_states:
             # Stash the full sequence for interval heads that attend over it.
@@ -758,8 +788,11 @@ class PretrainedIntervalInsideModel(nn.Module):
         prompt_attention: bool = False,
         native_vocabulary: bool = False,
         pretrained_lm_head=None,
+        fixed_mask_count: int = 0,
     ) -> None:
         super().__init__()
+        if prompt_attention and fixed_mask_count:
+            raise ValueError("prompt attention and fixed mask bank are exclusive")
         if native_vocabulary:
             if backbone is None and pretrained_lm_head is None:
                 from transformers import (
@@ -811,6 +844,7 @@ class PretrainedIntervalInsideModel(nn.Module):
             pretrained_tokenizer=pretrained_tokenizer,
             initialize_custom_embeddings=initialize_custom_embeddings,
             native_vocabulary=native_vocabulary,
+            fixed_mask_count=fixed_mask_count,
         )
         d_model = self.encoder.hidden_size
         # With prompt_attention each interval builds a query from its own
@@ -819,14 +853,25 @@ class PretrainedIntervalInsideModel(nn.Module):
         # Cost is O(D n^2 L): the token head runs per interval record, not per
         # chart cell, and all records of an example share the same keys.
         self.prompt_attention = prompt_attention
-        self.interval_projection = nn.Linear(
-            (4 if prompt_attention else 3) * d_model, d_model
+        self.fixed_mask_count = int(fixed_mask_count)
+        self.requires_record_owners = bool(prompt_attention or fixed_mask_count)
+        self.interval_projection = (
+            None if fixed_mask_count else nn.Linear(
+                (4 if prompt_attention else 3) * d_model, d_model
+            )
         )
         if prompt_attention:
             self.prompt_query = nn.Linear(3 * d_model, d_model)
             self.prompt_key = nn.Linear(d_model, d_model)
             self.prompt_value = nn.Linear(d_model, d_model)
             self.prompt_norm = nn.LayerNorm(d_model)
+        if fixed_mask_count:
+            # Queries depend only on the observed prompt summary, generated
+            # boundaries and depth. The bank width is constant, so no target
+            # length is available to this selection.
+            self.mask_bank_query = nn.Linear(3 * d_model, d_model)
+            self.mask_bank_residual = nn.Linear(3 * d_model, d_model)
+            self.mask_bank_residual_scale = nn.Parameter(torch.zeros(()))
         self.interval_norm = nn.LayerNorm(d_model)
         self.interval_dropout = nn.Dropout(dropout)
         if native_vocabulary:
@@ -901,6 +946,26 @@ class PretrainedIntervalInsideModel(nn.Module):
         attended = torch.bmm(scores.softmax(dim=-1), values)
         return self.prompt_norm(attended[owners, ranks])
 
+    def _attend_mask_bank(self, features: torch.Tensor, owners: torch.Tensor):
+        """Select one MLM-compatible state from a fixed, length-blind bank."""
+        states = self.encoder.mask_bank_states
+        if states is None:
+            raise ValueError("fixed mask bank needs encoder states before scoring")
+        if int(owners.max()) >= states.size(0):
+            raise ValueError("fixed mask bank owner exceeds encoded batch")
+        queries = self.mask_bank_query(features)
+        owned_states = states[owners]
+        scores = torch.bmm(
+            queries.unsqueeze(1), owned_states.transpose(1, 2)
+        ).squeeze(1) / (queries.size(-1) ** 0.5)
+        attended = torch.bmm(
+            scores.softmax(dim=-1).unsqueeze(1), owned_states
+        ).squeeze(1)
+        # Start exactly in the pretrained mask-state space; let training add a
+        # bounded node-specific correction only if validation supports it.
+        correction = torch.tanh(self.mask_bank_residual(features))
+        return attended + self.mask_bank_residual_scale.tanh() * correction
+
     def interval_hidden(
         self,
         context_hidden: torch.Tensor,
@@ -914,6 +979,11 @@ class PretrainedIntervalInsideModel(nn.Module):
         left = self.encoder.token_embedding(left_boundary)
         right = self.encoder.token_embedding(right_boundary)
         features = torch.cat((context_hidden, left, right), dim=-1)
+        if self.fixed_mask_count:
+            if owners is None:
+                raise ValueError("fixed mask bank needs per-record owner indices")
+            hidden = self._attend_mask_bank(features, owners)
+            return self.interval_dropout(hidden)
         if self.prompt_attention:
             if owners is None:
                 raise ValueError("prompt attention needs per-record owner indices")

@@ -31,6 +31,8 @@ def decode_oracle_midpoint_sequences(
 ):
     """Greedily predict tokens with target length and balanced tree supplied."""
     contexts, roots_left, roots_right = [], [], []
+    fixed_bank = bool(getattr(model, "fixed_mask_count", 0))
+    bank_chunks = []
     from experiment_text_inside import collate_prompt_contexts
 
     for start in range(0, len(examples), batch_size):
@@ -44,10 +46,14 @@ def decode_oracle_midpoint_sequences(
                 "evaluate_prompt_attention.py rather than this decoder"
             )
         encoded = model.encode(tokens, padding)
+        if fixed_bank:
+            bank_chunks.append(model.encoder.mask_bank_states)
         contexts.append(encoded[torch.arange(len(batch), device=device), positions])
         roots_left.append(left)
         roots_right.append(right)
     contexts = torch.cat(contexts)
+    if fixed_bank:
+        model.encoder.mask_bank_states = torch.cat(bank_chunks)
     roots_left = torch.cat(roots_left)
     roots_right = torch.cat(roots_right)
     generated_ids = torch.tensor(vocab.generated_token_ids, device=device)
@@ -89,6 +95,7 @@ def decode_oracle_midpoint_sequences(
         token_logits, _, _ = model.interval_logits(
             contexts[example_ids], left, right,
             depths if depth_conditioned else None,
+            *((example_ids,) if fixed_bank else ()),
         )
         chosen = generated_ids[
             token_logits.index_select(-1, generated_ids).argmax(dim=-1)

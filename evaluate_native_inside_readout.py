@@ -12,8 +12,13 @@ from evaluate_inside_lexical import (
     decode_oracle_midpoint_sequences,
     lexical_sampling_metrics,
 )
-from experiment import choose_device, edit_distance
+from experiment import choose_device, edit_distance, seed_everything
 from experiment_pretrained_masked_baseline import decode_oracle_length
+from experiment_text_inside import (
+    collate_prompt_contexts,
+    late_depth_topology_logits,
+    sample_inside_sequences,
+)
 from gtdlm.model import PretrainedIntervalInsideModel, PretrainedLengthMaskedModel
 from gtdlm.text_data import random_length_windows, sample_text_infilling_examples
 from gtdlm.text_tokenizer import vocabulary_from_pretrained_tokenizer
@@ -65,6 +70,103 @@ def frequency_floor(corpus, vocab, examples):
     }
 
 
+@torch.inference_mode()
+def decode_greedy_top_down(model, examples, vocab, device, batch_size):
+    """Generate tokens and topology jointly, without gold length or tree."""
+    contexts, roots_left, roots_right, bank_chunks = [], [], [], []
+    for start in range(0, len(examples), batch_size):
+        batch = examples[start:start + batch_size]
+        tokens, padding, positions, left, right = collate_prompt_contexts(
+            batch, vocab, device
+        )
+        encoded = model.encode(tokens, padding)
+        if getattr(model, "fixed_mask_count", 0):
+            bank_chunks.append(model.encoder.mask_bank_states)
+        contexts.append(encoded[torch.arange(len(batch), device=device), positions])
+        roots_left.append(left)
+        roots_right.append(right)
+    contexts = torch.cat(contexts)
+    roots_left = torch.cat(roots_left)
+    roots_right = torch.cat(roots_right)
+    if bank_chunks:
+        model.encoder.mask_bank_states = torch.cat(bank_chunks)
+    generated = torch.tensor(vocab.generated_token_ids, device=device)
+    canvases = [[None] for _ in examples]
+    unfinished = [False] * len(examples)
+    for depth in range(8):
+        locations = []
+        for owner, canvas in enumerate(canvases):
+            for position, item in enumerate(canvas):
+                if item is not None:
+                    continue
+                left = next(
+                    (canvas[k] for k in range(position - 1, -1, -1)
+                     if canvas[k] is not None),
+                    int(roots_left[owner]),
+                )
+                right = next(
+                    (canvas[k] for k in range(position + 1, len(canvas))
+                     if canvas[k] is not None),
+                    int(roots_right[owner]),
+                )
+                locations.append((owner, position, left, right))
+        if not locations:
+            break
+        owners = torch.tensor(
+            [item[0] for item in locations], dtype=torch.long, device=device
+        )
+        left = torch.tensor(
+            [item[2] for item in locations], dtype=torch.long, device=device
+        )
+        right = torch.tensor(
+            [item[3] for item in locations], dtype=torch.long, device=device
+        )
+        depths = torch.full_like(left, depth)
+        token_logits, stop_logits, hidden = model.interval_logits(
+            contexts[owners], left, right, depths,
+            *((owners,) if getattr(model, "requires_record_owners", False) else ()),
+        )
+        chosen = generated[
+            token_logits.index_select(-1, generated).argmax(dim=-1)
+        ]
+        topology = late_depth_topology_logits(
+            model.topology_logits(hidden, chosen), depths, 4, 0.0
+        ).argmax(dim=-1)
+        stops = stop_logits.gt(0) if depth == 0 else torch.zeros_like(
+            stop_logits, dtype=torch.bool
+        )
+        decisions = {
+            (owner, position): (
+                bool(stops[index]), int(chosen[index]), int(topology[index])
+            )
+            for index, (owner, position, _, _) in enumerate(locations)
+        }
+        for owner, canvas in enumerate(canvases):
+            expanded = []
+            for position, item in enumerate(canvas):
+                if item is not None:
+                    expanded.append(item)
+                    continue
+                stop, token, topology_value = decisions[(owner, position)]
+                if stop:
+                    continue
+                if topology_value & 1:
+                    expanded.append(None)
+                expanded.append(token)
+                if topology_value & 2:
+                    expanded.append(None)
+            if sum(item is not None for item in expanded) > 32:
+                unfinished[owner] = True
+                expanded = [item for item in expanded if item is not None]
+            canvases[owner] = expanded
+    for owner, canvas in enumerate(canvases):
+        unfinished[owner] = unfinished[owner] or any(item is None for item in canvas)
+    predictions = [
+        [int(item) for item in canvas if item is not None] for canvas in canvases
+    ]
+    return predictions, unfinished
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -80,6 +182,7 @@ def main():
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
     parser.add_argument("--examples", type=int, default=128)
     parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument("--samples-per-prompt", type=int, default=16)
     args = parser.parse_args()
 
     with open(
@@ -116,6 +219,7 @@ def main():
         max_length=int(config["max_length"]),
         local_files_only=True,
         native_vocabulary=True,
+        fixed_mask_count=int(config.get("fixed_mask_bank", 0)),
     ).to(device)
     model.load_state_dict(torch.load(
         os.path.join(args.artifact_dir, "inside.pt"),
@@ -130,6 +234,38 @@ def main():
     )
     tree_metrics.update(decoded_metrics(tokenizer, examples, predictions))
     tree_metrics["mean_nfe"] = sum(nfes) / max(1, len(nfes))
+    top_down_predictions, top_down_unfinished = decode_greedy_top_down(
+        model, examples, vocab, device, args.batch_size
+    )
+    top_down_metrics = lexical_sampling_metrics(
+        examples,
+        [[row] for row in top_down_predictions],
+        [[flag] for flag in top_down_unfinished],
+    )
+    top_down_metrics.update(
+        decoded_metrics(tokenizer, examples, top_down_predictions)
+    )
+    seed_everything(1702)
+    sampled_predictions, sampled_unfinished = sample_inside_sequences(
+        model, examples, vocab, device,
+        args.samples_per_prompt, args.batch_size,
+        depth_conditioned=True, penalty_start_depth=4,
+        late_depth_child_penalty=0.0,
+    )
+    sampled_metrics = lexical_sampling_metrics(
+        examples, sampled_predictions, sampled_unfinished
+    )
+    flat_examples = [
+        example
+        for example, rows in zip(examples, sampled_predictions)
+        for _ in rows
+    ]
+    flat_predictions = [
+        row for rows in sampled_predictions for row in rows
+    ]
+    sampled_metrics.update(
+        decoded_metrics(tokenizer, flat_examples, flat_predictions)
+    )
     del model
     if device.type == "cuda":
         torch.cuda.empty_cache()
@@ -171,7 +307,9 @@ def main():
             corpus, vocab, examples
         ),
         "models": {
-            "native_tree": tree_metrics,
+            "native_tree_oracle_midpoint": tree_metrics,
+            "native_tree_greedy_top_down": top_down_metrics,
+            "native_tree_sampled_top_down": sampled_metrics,
             "native_masked_baseline": baseline_metrics,
         },
     }
