@@ -42,6 +42,14 @@ NLL. Scaling the current configuration is still not warranted, but what needs
 fixing is the encoder integration, not the objective. See
 `research/LIKELIHOOD_DECOMPOSITION.md`.
 
+The native-vocabulary/MLM-head follow-up is now complete at seed 17. It removes
+the shared output-side handicap from both arms but does not remove the
+tree-specific deficit: on the same 128 native spans the masked baseline reaches
+`20.04%` oracle token accuracy, `0.410` decoded character similarity and
+`7.92%` exact match against the tree's `8.71%`, `0.281` and `0.99%`; token NLL
+is `4.921` against `6.786`. The tree retains passing length TV (`0.157`). See
+`research/NATIVE_VOCABULARY.md`.
+
 ## What is established
 
 ### Synthetic range-infilling (closed)
@@ -199,7 +207,7 @@ matched intervention isolating the surviving twin. See
 | Insertion/blank baselines and the selected two-block frontier model | `DEPTH_INSIDE.md` control 4 | Partial: sequential and masked are done |
 | Corpus not seen by the pretrained backbone | `PRETRAINED_CONTEXT_DEPTH.md` limit 1 | **Done:** gain is larger on post-lineage text (`-6.136` vs `-4.879`); see `CORPUS_OVERLAP_CONTROL.md` |
 | Baseline on the same pretrained backbone | `LIKELIHOOD_DECOMPOSITION.md` | **Done:** matched on backbone, stream, split and budget, the masked baseline reaches `12.56%` oracle-structure accuracy to the tree model's `5.66%` in 3/3 non-overlapping seeds; `84%` of that gap is encoder access, not the objective |
-| Native pretrained vocabulary and MLM head | `LIKELIHOOD_DECOMPOSITION.md` | **Open, and it caps everything:** the untouched pretrained model ties our finetuned baseline on decoded text, so the custom 4,000-token vocabulary and discarded MLM head currently cancel the benefit of finetuning |
+| Native pretrained vocabulary and MLM head | `NATIVE_VOCABULARY.md` | **Done at seed 17:** the full native path is implemented for corpus, chart, baseline and evaluation. It raises the lexical floor but leaves the native masked baseline well ahead (`20.04%` vs `8.71%` token accuracy; `0.410` vs `0.281` decoded character similarity) |
 
 ### 3. Generation quality (deficit attributed to the encoder, not the objective)
 
@@ -378,19 +386,16 @@ order item 14) is the thing to try before the gate is re-run.
    objective fixed, cutting encoder access to one pooled vector drops the
    baseline `12.56% -> 6.74%`, explaining `84%` of the gap in 3/3 seeds
    (sd `0.23` points) (`research/LIKELIHOOD_DECOMPOSITION.md`).
-14. **In progress:** an encoder integration that gives the chart per-node
-   context without presupposing the span length. Implemented as
-   `--prompt-attention`: each interval record queries the backbone's sequence
-   output, batched per example, at `O(D n^2 L)`. Addresses the tree-specific
-   bottleneck only.
-15. **Next, and larger:** keep RoBERTa's native vocabulary and MLM head instead
-   of a 4,000-token custom BPE with a head relearned from averaged input
-   embeddings. This is the shared handicap, and the diagnostic above shows it
-   currently cancels the entire benefit of finetuning. It needs the corpus
-   re-tokenized and the vocabulary threaded through corruption, chart and
-   evaluation, so it is the largest remaining change — but without it the
-   absolute generation numbers, and any comparison drawn between weak models
-   inside them, stay hard to interpret.
+14. **Completed as a negative seed-17 pilot:** `--prompt-attention` gives each
+   interval record a span-length-agnostic query over the backbone sequence, but
+   worsens test exact NLL (`21.61 -> 22.66`) and leaves same-seed oracle token
+   accuracy unchanged at `4.65%`. Do not replicate this block unchanged.
+15. **Completed at seed 17:** keep RoBERTa's native vocabulary and full MLM head
+   in the corpus, corruption, chart, matched baseline and evaluation. The native
+   tree reaches `8.71%` oracle token accuracy and `0.281` decoded character
+   similarity, but the matched masked baseline reaches `20.04%` and `0.410`.
+   The shared handicap was real, but removing it exposes rather than closes the
+   tree-specific integration gap (`research/NATIVE_VOCABULARY.md`).
 16. Re-evaluate the scale-up gate (below).
 17. Optional: a genuine top-down rollout, closing the residual gap between
    gold-token and self-generated-token conditioning in the topology head.

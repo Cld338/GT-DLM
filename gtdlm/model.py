@@ -501,11 +501,13 @@ class IntervalInsideBoundaryModel(nn.Module):
 
 
 class PretrainedIntervalEncoder(nn.Module):
-    """Masked-language prompt encoder with custom-vocabulary boundary states.
+    """Masked-language prompt encoder with interval boundary states.
 
     The pretrained backbone runs once per observed prompt. Only its mask-token
     state is needed by the interval chart; all latent tree states then reuse
-    that context and differ through custom-BPE boundary and depth embeddings.
+    that context and differ through boundary and depth embeddings. The native
+    vocabulary path feeds pretrained token ids directly, avoiding the lossy
+    decode/re-tokenize bridge used by the historical custom-BPE experiments.
     """
 
     def __init__(
@@ -525,6 +527,7 @@ class PretrainedIntervalEncoder(nn.Module):
         backbone=None,
         pretrained_tokenizer=None,
         initialize_custom_embeddings: bool = True,
+        native_vocabulary: bool = False,
     ) -> None:
         super().__init__()
         if backbone is None or pretrained_tokenizer is None:
@@ -557,14 +560,24 @@ class PretrainedIntervalEncoder(nn.Module):
         self.gap_id = gap_id
         self.pad_id = pad_id
         self.max_length = max_length
+        self.native_vocabulary = native_vocabulary
+        if native_vocabulary and int(pretrained_tokenizer.mask_token_id) != gap_id:
+            raise ValueError("native vocabulary requires GAP to be the mask token")
         d_model = int(backbone.config.hidden_size)
-        self.token_embedding = nn.Embedding(vocab_size, d_model)
+        if native_vocabulary:
+            self.token_embedding = backbone.get_input_embeddings()
+            if self.token_embedding.num_embeddings != vocab_size:
+                raise ValueError(
+                    "native vocabulary size does not match pretrained embeddings"
+                )
+        else:
+            self.token_embedding = nn.Embedding(vocab_size, d_model)
         self.step_embedding = nn.Embedding(max_steps, d_model)
         self.context_norm = nn.LayerNorm(d_model)
         self._keep_prompt_states = False
         self.prompt_states = None
         self.prompt_mask = None
-        if initialize_custom_embeddings:
+        if initialize_custom_embeddings and not native_vocabulary:
             self.initialize_custom_token_embeddings()
         if gradient_checkpointing:
             self.backbone.gradient_checkpointing_enable()
@@ -634,6 +647,43 @@ class PretrainedIntervalEncoder(nn.Module):
             custom_gap_positions.append(gap)
         return texts, custom_gap_positions
 
+    def native_model_inputs(
+        self,
+        tokens: torch.Tensor,
+        padding_mask: Optional[torch.Tensor],
+        mask_counts: Optional[Sequence[int]] = None,
+    ):
+        """Build native-token inputs, optionally expanding the single gap."""
+        if not self.native_vocabulary:
+            raise ValueError("native_model_inputs requires native vocabulary")
+        if padding_mask is None:
+            padding_mask = tokens.eq(self.pad_id)
+        if mask_counts is None:
+            return {
+                "input_ids": tokens.masked_fill(padding_mask, self.pad_id),
+                "attention_mask": (~padding_mask).to(torch.long),
+            }
+        rows = []
+        for row, padded, count in zip(tokens, padding_mask, mask_counts):
+            valid = row[~padded].tolist()
+            gaps = [index for index, token in enumerate(valid) if token == self.gap_id]
+            if len(gaps) != 1:
+                raise ValueError("native pretrained encoder requires one gap")
+            gap = gaps[0]
+            expanded = (
+                valid[:gap]
+                + [self.gap_id] * max(1, int(count))
+                + valid[gap + 1 :]
+            )[: self.max_length]
+            rows.append(expanded)
+        width = max(len(row) for row in rows)
+        input_ids = tokens.new_full((len(rows), width), self.pad_id)
+        attention_mask = tokens.new_zeros((len(rows), width))
+        for index, row in enumerate(rows):
+            input_ids[index, :len(row)] = torch.tensor(row, device=tokens.device)
+            attention_mask[index, :len(row)] = 1
+        return {"input_ids": input_ids, "attention_mask": attention_mask}
+
     def forward(
         self,
         tokens: torch.Tensor,
@@ -642,17 +692,20 @@ class PretrainedIntervalEncoder(nn.Module):
     ) -> torch.Tensor:
         if steps is not None:
             raise ValueError("prompt encoder does not accept generation steps")
-        texts, _ = self.render_prompts(tokens, padding_mask)
-        encoded = self.pretrained_tokenizer(
-            texts,
-            padding=True,
-            truncation=True,
-            max_length=self.max_length,
-            return_tensors="pt",
-        )
-        model_inputs = {
-            key: value.to(tokens.device) for key, value in encoded.items()
-        }
+        if self.native_vocabulary:
+            model_inputs = self.native_model_inputs(tokens, padding_mask)
+        else:
+            texts, _ = self.render_prompts(tokens, padding_mask)
+            encoded = self.pretrained_tokenizer(
+                texts,
+                padding=True,
+                truncation=True,
+                max_length=self.max_length,
+                return_tensors="pt",
+            )
+            model_inputs = {
+                key: value.to(tokens.device) for key, value in encoded.items()
+            }
         mask_matches = model_inputs["input_ids"].eq(
             int(self.pretrained_tokenizer.mask_token_id)
         )
@@ -703,8 +756,44 @@ class PretrainedIntervalInsideModel(nn.Module):
         initialize_custom_embeddings: bool = True,
         tie_token_embeddings: bool = True,
         prompt_attention: bool = False,
+        native_vocabulary: bool = False,
+        pretrained_lm_head=None,
     ) -> None:
         super().__init__()
+        if native_vocabulary:
+            if backbone is None and pretrained_lm_head is None:
+                from transformers import (
+                    AutoConfig,
+                    AutoModelForMaskedLM,
+                    AutoTokenizer,
+                )
+
+                if pretrained_tokenizer is None:
+                    pretrained_tokenizer = AutoTokenizer.from_pretrained(
+                        model_name,
+                        cache_dir=cache_dir,
+                        use_fast=True,
+                        local_files_only=local_files_only,
+                    )
+                if random_init_backbone:
+                    config = AutoConfig.from_pretrained(
+                        model_name,
+                        cache_dir=cache_dir,
+                        local_files_only=local_files_only,
+                    )
+                    masked_lm = AutoModelForMaskedLM.from_config(config)
+                else:
+                    masked_lm = AutoModelForMaskedLM.from_pretrained(
+                        model_name,
+                        cache_dir=cache_dir,
+                        local_files_only=local_files_only,
+                    )
+                backbone = masked_lm.base_model
+                pretrained_lm_head = getattr(masked_lm, "lm_head", None)
+            if backbone is None or pretrained_lm_head is None:
+                raise ValueError(
+                    "native vocabulary needs both a backbone and pretrained MLM head"
+                )
         self.encoder = PretrainedIntervalEncoder(
             vocab_size,
             gap_id,
@@ -721,6 +810,7 @@ class PretrainedIntervalInsideModel(nn.Module):
             backbone=backbone,
             pretrained_tokenizer=pretrained_tokenizer,
             initialize_custom_embeddings=initialize_custom_embeddings,
+            native_vocabulary=native_vocabulary,
         )
         d_model = self.encoder.hidden_size
         # With prompt_attention each interval builds a query from its own
@@ -739,9 +829,15 @@ class PretrainedIntervalInsideModel(nn.Module):
             self.prompt_norm = nn.LayerNorm(d_model)
         self.interval_norm = nn.LayerNorm(d_model)
         self.interval_dropout = nn.Dropout(dropout)
-        self.token_head = nn.Linear(d_model, vocab_size)
-        if tie_token_embeddings:
-            self.token_head.weight = self.encoder.token_embedding.weight
+        if native_vocabulary:
+            # Keep RoBERTa's dense/GELU/layer-norm/decoder stack intact rather
+            # than relearning a custom-vocabulary projection from averaged
+            # input embeddings.
+            self.token_head = pretrained_lm_head
+        else:
+            self.token_head = nn.Linear(d_model, vocab_size)
+            if tie_token_embeddings:
+                self.token_head.weight = self.encoder.token_embedding.weight
         self.stop_head = nn.Linear(d_model, 1)
         self.topology_head = nn.Linear(2 * d_model, 4)
 
@@ -947,8 +1043,44 @@ class PretrainedLengthMaskedModel(nn.Module):
         initialize_custom_embeddings: bool = True,
         tie_token_embeddings: bool = True,
         bottleneck_context: bool = False,
+        native_vocabulary: bool = False,
+        pretrained_lm_head=None,
     ) -> None:
         super().__init__()
+        if native_vocabulary:
+            if backbone is None and pretrained_lm_head is None:
+                from transformers import (
+                    AutoConfig,
+                    AutoModelForMaskedLM,
+                    AutoTokenizer,
+                )
+
+                if pretrained_tokenizer is None:
+                    pretrained_tokenizer = AutoTokenizer.from_pretrained(
+                        model_name,
+                        cache_dir=cache_dir,
+                        use_fast=True,
+                        local_files_only=local_files_only,
+                    )
+                if random_init_backbone:
+                    config = AutoConfig.from_pretrained(
+                        model_name,
+                        cache_dir=cache_dir,
+                        local_files_only=local_files_only,
+                    )
+                    masked_lm = AutoModelForMaskedLM.from_config(config)
+                else:
+                    masked_lm = AutoModelForMaskedLM.from_pretrained(
+                        model_name,
+                        cache_dir=cache_dir,
+                        local_files_only=local_files_only,
+                    )
+                backbone = masked_lm.base_model
+                pretrained_lm_head = getattr(masked_lm, "lm_head", None)
+            if backbone is None or pretrained_lm_head is None:
+                raise ValueError(
+                    "native vocabulary needs both a backbone and pretrained MLM head"
+                )
         self.encoder = PretrainedIntervalEncoder(
             vocab_size,
             gap_id,
@@ -964,13 +1096,17 @@ class PretrainedLengthMaskedModel(nn.Module):
             backbone=backbone,
             pretrained_tokenizer=pretrained_tokenizer,
             initialize_custom_embeddings=initialize_custom_embeddings,
+            native_vocabulary=native_vocabulary,
         )
         d_model = self.encoder.hidden_size
         self.max_span = max_span
         self.length_head = nn.Linear(d_model, max_span + 1)
-        self.token_head = nn.Linear(d_model, vocab_size)
-        if tie_token_embeddings:
-            self.token_head.weight = self.encoder.token_embedding.weight
+        if native_vocabulary:
+            self.token_head = pretrained_lm_head
+        else:
+            self.token_head = nn.Linear(d_model, vocab_size)
+            if tie_token_embeddings:
+                self.token_head.weight = self.encoder.token_embedding.weight
         # Diagnostic arm. With bottleneck_context the token pass reads the same
         # single mask-token summary vector the interval chart is restricted to,
         # plus a within-span position embedding, instead of one contextualized
@@ -998,35 +1134,42 @@ class PretrainedLengthMaskedModel(nn.Module):
         ``[batch, max_count, hidden]`` tensor, with a boolean validity mask.
         """
         encoder = self.encoder
-        texts, _ = encoder.render_prompts(tokens, padding_mask)
-        mask_token = encoder.pretrained_tokenizer.mask_token
-        if mask_counts is not None:
-            rendered = []
-            for text, count in zip(texts, mask_counts):
-                # One mask is already present from render_prompts; a zero-length
-                # span still needs a position to read, so keep at least one.
-                rendered.append(text.replace(mask_token, mask_token * max(1, int(count))))
-            texts = rendered
-        encoded = encoder.pretrained_tokenizer(
-            texts,
-            padding=True,
-            truncation=True,
-            max_length=encoder.max_length,
-            return_tensors="pt",
-        )
-        model_inputs = {
-            key: value.to(tokens.device) for key, value in encoded.items()
-        }
+        if encoder.native_vocabulary:
+            model_inputs = encoder.native_model_inputs(
+                tokens, padding_mask, mask_counts
+            )
+        else:
+            texts, _ = encoder.render_prompts(tokens, padding_mask)
+            mask_token = encoder.pretrained_tokenizer.mask_token
+            if mask_counts is not None:
+                rendered = []
+                for text, count in zip(texts, mask_counts):
+                    # One mask is already present from render_prompts; a zero-length
+                    # span still needs a position to read, so keep at least one.
+                    rendered.append(text.replace(
+                        mask_token, mask_token * max(1, int(count))
+                    ))
+                texts = rendered
+            encoded = encoder.pretrained_tokenizer(
+                texts,
+                padding=True,
+                truncation=True,
+                max_length=encoder.max_length,
+                return_tensors="pt",
+            )
+            model_inputs = {
+                key: value.to(tokens.device) for key, value in encoded.items()
+            }
         hidden = encoder.backbone(**model_inputs).last_hidden_state
         matches = model_inputs["input_ids"].eq(
             int(encoder.pretrained_tokenizer.mask_token_id)
         )
         width = int(matches.sum(dim=1).max().clamp_min(1))
-        states = hidden.new_zeros((len(texts), width, hidden.size(-1)))
+        states = hidden.new_zeros((hidden.size(0), width, hidden.size(-1)))
         valid = torch.zeros(
-            (len(texts), width), dtype=torch.bool, device=hidden.device
+            (hidden.size(0), width), dtype=torch.bool, device=hidden.device
         )
-        for row in range(len(texts)):
+        for row in range(hidden.size(0)):
             positions = matches[row].nonzero().flatten()
             if not positions.numel():
                 # Truncation removed the gap; leave the row invalid.

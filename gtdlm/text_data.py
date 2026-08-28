@@ -18,6 +18,7 @@ class TextVocabulary:
     MASK: int
     LEFT: int
     RIGHT: int
+    EXTRA_STRUCTURAL: Tuple[int, ...] = ()
 
     @property
     def stop_action(self) -> int:
@@ -29,7 +30,14 @@ class TextVocabulary:
 
     @property
     def structural_ids(self) -> Tuple[int, ...]:
-        return (self.PAD, self.GAP, self.MASK, self.LEFT, self.RIGHT)
+        # Native pretrained tokenizers can define additional non-generative
+        # symbols (for example RoBERTa's <unk>). Preserve the five historical
+        # fields while allowing those symbols to be excluded from the action
+        # space without changing any custom-BPE caller.
+        return tuple(dict.fromkeys(
+            (self.PAD, self.GAP, self.MASK, self.LEFT, self.RIGHT)
+            + tuple(self.EXTRA_STRUCTURAL)
+        ))
 
     @property
     def generated_token_ids(self) -> List[int]:

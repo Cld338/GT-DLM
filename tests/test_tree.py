@@ -114,6 +114,7 @@ from gtdlm.text_tokenizer import (
     SPECIAL_TOKENS,
     split_documents,
     train_bpe_tokenizer,
+    vocabulary_from_pretrained_tokenizer,
     vocabulary_from_tokenizer,
 )
 from gtdlm.tree import (
@@ -556,6 +557,92 @@ class FrontierTest(unittest.TestCase):
         (-exact.mean()).backward()
         self.assertIsNotNone(backbone.embedding.weight.grad)
         self.assertIsNotNone(model.encoder.step_embedding.weight.grad)
+
+    def test_native_pretrained_vocabulary_reuses_embeddings_and_mlm_head(self):
+        from gtdlm.model import PretrainedLengthMaskedModel
+
+        class StubNativeTokenizer:
+            pad_token_id = 1
+            mask_token_id = 9
+            bos_token_id = 0
+            eos_token_id = 2
+            cls_token_id = None
+            sep_token_id = None
+            all_special_ids = [0, 1, 2, 3, 9]
+            mask_token = "<mask>"
+
+            def __len__(self):
+                return 16
+
+        class StubBackbone(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.config = SimpleNamespace(hidden_size=8)
+                self.embedding = torch.nn.Embedding(16, 8)
+
+            def get_input_embeddings(self):
+                return self.embedding
+
+            def forward(self, input_ids, attention_mask):
+                del attention_mask
+                return SimpleNamespace(last_hidden_state=self.embedding(input_ids))
+
+        tokenizer = StubNativeTokenizer()
+        vocab = vocabulary_from_pretrained_tokenizer(tokenizer)
+        self.assertNotIn(3, vocab.generated_token_ids)
+        backbone = StubBackbone()
+        mlm_head = torch.nn.Sequential(
+            torch.nn.Linear(8, 8),
+            torch.nn.GELU(),
+            torch.nn.LayerNorm(8),
+            torch.nn.Linear(8, len(tokenizer)),
+        )
+        model = PretrainedIntervalInsideModel(
+            vocab.vocab_size,
+            vocab.GAP,
+            vocab.PAD,
+            tokenizer,
+            backbone=backbone,
+            pretrained_tokenizer=tokenizer,
+            pretrained_lm_head=mlm_head,
+            native_vocabulary=True,
+            initialize_custom_embeddings=False,
+        )
+        self.assertIs(model.encoder.token_embedding, backbone.embedding)
+        self.assertIs(model.token_head, mlm_head)
+        example = corrupt_token_sequence([5, 6, 7, 8, 10], [(1, 3)])
+        exact, midpoint = depth_batch_log_likelihoods(
+            model, [example], vocab, torch.device("cpu"), 4, 0.0
+        )
+        self.assertTrue(torch.isfinite(exact).all())
+        self.assertGreaterEqual(float(exact[0]), float(midpoint[0]))
+        (-exact.mean()).backward()
+        self.assertIsNotNone(backbone.embedding.weight.grad)
+        self.assertIsNotNone(mlm_head[-1].weight.grad)
+
+        baseline_backbone = StubBackbone()
+        baseline_head = torch.nn.Sequential(
+            torch.nn.Linear(8, 8), torch.nn.GELU(),
+            torch.nn.LayerNorm(8), torch.nn.Linear(8, len(tokenizer)),
+        )
+        baseline = PretrainedLengthMaskedModel(
+            vocab.vocab_size, 8, vocab.GAP, vocab.PAD, tokenizer,
+            backbone=baseline_backbone,
+            pretrained_tokenizer=tokenizer,
+            pretrained_lm_head=baseline_head,
+            native_vocabulary=True,
+            initialize_custom_embeddings=False,
+        )
+        prompts = torch.tensor([
+            [vocab.LEFT, 5, vocab.GAP, 8, vocab.RIGHT],
+            [vocab.LEFT, 6, vocab.GAP, vocab.RIGHT, vocab.PAD],
+        ])
+        padding = prompts.eq(vocab.PAD)
+        logits, valid = baseline.predict_tokens(prompts, padding, [2, 3])
+        self.assertEqual(tuple(logits.shape), (2, 3, len(tokenizer)))
+        self.assertEqual(valid.sum(dim=1).tolist(), [2, 3])
+        logits[valid].mean().backward()
+        self.assertIsNotNone(baseline_head[-1].weight.grad)
 
     def test_lexical_metrics_condition_on_nonempty_length_matches(self):
         examples = [

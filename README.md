@@ -95,6 +95,10 @@ python experiment_pretrained_masked_baseline.py --device cuda --artifact-dir art
 python experiment_pretrained_masked_baseline.py --device cuda --bottleneck-context --artifact-dir artifacts/text_pretrained_masked_bottleneck
 python analyze_oracle_top1.py --output-dir artifacts/text_oracle_top1_summary
 python measure_pretrain_task_mismatch.py --device cuda --examples 512 --artifact-dir artifacts/text_pretrain_task_mismatch
+python prepare_wikitext_pilot.py --output-dir artifacts/wikitext_native --native-vocabulary --model-name distilroberta-base --cache-dir .hf_cache/hub --local-files-only --max-document-tokens 128 --max-train-documents 4000 --max-validation-documents 500 --max-test-documents 500
+python experiment_text_depth_inside_pretrained.py --device cuda --data-dir artifacts/wikitext_native --native-vocabulary --local-files-only --artifact-dir artifacts/text_depth_inside_native
+python experiment_pretrained_masked_baseline.py --device cuda --data-dir artifacts/wikitext_native --native-vocabulary --local-files-only --artifact-dir artifacts/text_pretrained_masked_native
+python evaluate_native_inside_readout.py --device cuda
 ```
 
 The experiment writes its metrics and checkpoints to `artifacts/`.
@@ -542,3 +546,12 @@ from-scratch models failed to clear frequency guessing. The two causes stack:
 a shared vocabulary-and-head handicap that caps everyone, and a tree-specific
 encoder bottleneck that accounts for `84%` of the remaining difference. See
 `research/LIKELIHOOD_DECOMPOSITION.md`.
+
+The native-vocabulary follow-up is now complete at seed 17. Keeping RoBERTa's
+50,265-token action space and full MLM head raises the absolute lexical floor,
+but it does not close the tree-specific gap. On the same 128 native-tokenized
+spans the masked baseline reaches `20.04%` oracle token accuracy, `0.410`
+nonempty decoded character similarity and `7.92%` exact match, against the
+tree model's `8.71%`, `0.281` and `0.99%`. Token NLL is `4.921` against
+`6.786`. The current integration therefore still fails the generation clause
+of the scale-up gate. See `research/NATIVE_VOCABULARY.md`.

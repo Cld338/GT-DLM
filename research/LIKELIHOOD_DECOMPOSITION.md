@@ -666,6 +666,22 @@ The two causes stack rather than compete: a shared vocabulary-and-head handicap
 that caps everyone, and a tree-specific encoder bottleneck that accounts for
 `84%` of the remaining difference.
 
+### Native-output follow-up
+
+The shared handicap has now been removed in an end-to-end seed-17 run. Both the
+tree and matched masked baseline use RoBERTa's 50,265-token vocabulary, direct
+native token-id prompts, backbone input embeddings for boundaries, and the full
+pretrained MLM head. On the same 128 native spans the masked baseline reaches
+`20.04%` oracle token accuracy and `0.410` nonempty decoded character similarity
+against the tree's `8.71%` and `0.281`; token NLL is `4.921` against `6.786`.
+The tree retains passing length TV at `0.157`.
+
+This resolves the output-side implementation question but does not reverse the
+attribution above. Removing the shared handicap exposes a larger direct native
+gap rather than closing the tree-specific one. Native-versus-custom token scores
+are not paired because retokenization changes spans; the native tree-versus-
+baseline comparison is paired. See `research/NATIVE_VOCABULARY.md`.
+
 ### What this changes
 
 The generation result is largely an artifact of how the pretrained encoder was
@@ -679,13 +695,14 @@ A residual of `1.09` points remains and should not be explained away. It is
 the honest upper bound on what the objective itself might cost at this scale,
 and it is small next to the `5.81` points attributable to the encoder.
 
-The forward path is an encoder integration that keeps per-node context without
-presupposing the span length. Two candidates, neither yet tried: render a
-fixed number of masks (`max_span`) regardless of the true length, so the chart
-can read `state[pivot]` without `n` leaking; or keep the backbone's states over
-the observed left and right segments and let the interval head attend over
-them instead of consuming a single pooled vector. The second is the more
-principled, since it never presupposes anything about the span.
+The forward path remains an encoder integration that keeps per-node context
+without presupposing the span length. The first observed-sequence attention
+implementation has now been tried: `--prompt-attention` worsens test exact NLL
+from `21.61` to `22.66` and leaves same-seed oracle token accuracy unchanged at
+`4.65%`. That block should not be replicated unchanged. A fixed number of masks
+(`max_span`) would let the chart read `state[pivot]` without the true `n`
+leaking, but it is still untested and changes the conditioning interface enough
+to require an explicit objective audit.
 
 Evaluator: `decompose_multigap_likelihood.py`. Artifacts:
 `artifacts/text_multigap_decomposition`.

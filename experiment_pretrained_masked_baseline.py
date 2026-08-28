@@ -30,7 +30,7 @@ import torch
 import torch.nn.functional as F
 from tokenizers import Tokenizer
 from torch.utils.data import DataLoader
-from transformers import get_linear_schedule_with_warmup
+from transformers import AutoTokenizer, get_linear_schedule_with_warmup
 
 from evaluate_inside_lexical import lexical_sampling_metrics
 from experiment import choose_device, parameter_count, seed_everything
@@ -42,7 +42,10 @@ from gtdlm.text_data import (
     random_length_windows,
     sample_text_infilling_examples,
 )
-from gtdlm.text_tokenizer import vocabulary_from_tokenizer
+from gtdlm.text_tokenizer import (
+    vocabulary_from_pretrained_tokenizer,
+    vocabulary_from_tokenizer,
+)
 
 
 def collate_prompts(
@@ -139,6 +142,7 @@ def evaluate_token_nll(model, examples, vocab, device, batch_size, max_span):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--base-artifact-dir", default="artifacts/text_trajectory")
+    parser.add_argument("--data-dir", default="")
     parser.add_argument(
         "--artifact-dir", default="artifacts/text_pretrained_masked_baseline"
     )
@@ -161,6 +165,7 @@ def main():
     parser.add_argument("--max-validation-examples", type=int, default=128)
     parser.add_argument("--seed", type=int, default=-1)
     parser.add_argument("--random-init-backbone", action="store_true")
+    parser.add_argument("--native-vocabulary", action="store_true")
     parser.add_argument(
         "--bottleneck-context", action="store_true",
         help="restrict the token pass to the single mask-token summary vector "
@@ -174,16 +179,33 @@ def main():
         os.path.join(args.base_artifact_dir, "results.json"), encoding="utf-8"
     ) as handle:
         config = json.load(handle)["config"]
+    if args.data_dir:
+        config["data_dir"] = args.data_dir
     data_seed = int(config["seed"])
     training_seed = data_seed if args.seed < 0 else args.seed
     seed_everything(training_seed)
     torch.set_float32_matmul_precision("high")
     device = choose_device(args.device)
 
-    source_tokenizer = Tokenizer.from_file(
-        os.path.join(str(config["data_dir"]), "tokenizer.json")
-    )
-    vocab = vocabulary_from_tokenizer(source_tokenizer)
+    data_dir = str(config["data_dir"])
+    manifest_path = os.path.join(data_dir, "manifest.json")
+    if os.path.exists(manifest_path):
+        with open(manifest_path, encoding="utf-8") as handle:
+            manifest = json.load(handle)
+        if bool(manifest.get("native_vocabulary", False)) != args.native_vocabulary:
+            parser.error(
+                "--native-vocabulary must match the prepared corpus manifest"
+            )
+    if args.native_vocabulary:
+        source_tokenizer = AutoTokenizer.from_pretrained(
+            data_dir, use_fast=True, local_files_only=True
+        )
+        vocab = vocabulary_from_pretrained_tokenizer(source_tokenizer)
+    else:
+        source_tokenizer = Tokenizer.from_file(
+            os.path.join(data_dir, "tokenizer.json")
+        )
+        vocab = vocabulary_from_tokenizer(source_tokenizer)
     corpus = torch.load(
         os.path.join(str(config["data_dir"]), "corpus.pt"),
         map_location="cpu", weights_only=True,
@@ -220,6 +242,7 @@ def main():
         max_length=args.max_length, local_files_only=args.local_files_only,
         random_init_backbone=args.random_init_backbone,
         bottleneck_context=args.bottleneck_context,
+        native_vocabulary=args.native_vocabulary,
     ).to(device)
     print("pretrained masked baseline{}: {:,} parameters, {} train documents".format(
         " [bottleneck context]" if args.bottleneck_context else "",
