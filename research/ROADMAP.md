@@ -310,7 +310,8 @@ matched intervention isolating the surviving twin. See
 | Expected rollout rounds, the parallel claim itself | `GENERATION_THEORY.md` | **Done, then superseded:** `5.758` rounds for `5.758` tokens on the fixed-mask-bank model, a pure chain. The scaffold that replaced it emits `3.5`--`3.8` tokens in `2.82`--`2.97` rounds in 6/6 replicated runs, so the parallel saving is real for the selected architecture |
 | Seed replication of the conditional-length scaffold | `FRONTIER_REENCODE.md` | **Done:** three controller seeds on each of two backbones, `0.2512+/-0.0079` and `0.3137+/-0.0062` identifiable nats, positive in 6/6 with non-overlapping families. Only the controller seed varies; each family's lexical backbone is a single seed-17 checkpoint |
 | Backbone scale for the scaffold | `FRONTIER_REENCODE.md` | **Done:** roberta-base moves matched token accuracy `20.34% -> 29.39%` and conditional length `+0.063` nats, against a `0.96` point and `0.008` nat seed spread. Four times the training data moves neither |
-| Unconditional generation comparison against the masked baseline | `FRONTIER_REENCODE.md` | **Open:** the `29.39%` lead is on the length-matched subset (`416`--`421` of `4096`). Over all samples expected edit similarity is `0.2074` against `0.3280`. Closing this is a `length_match_probability` problem, currently `24.83%` |
+| Unconditional generation comparison against the masked baseline | `FRONTIER_REENCODE.md` | **Open, and now localized:** the `29.39%` lead is on the length-matched subset (`416`--`421` of `4096`); over all samples expected edit similarity is `0.2074` against `0.3280`. An oracle-length arm reaches `0.3324`, so length selection accounts for the entire gap |
+| Decoding at the exact chart's mode | `FRONTIER_REENCODE.md` | **Done, positive on its own metric and negative downstream:** length match `22.72% -> 27.89%` and `24.83% -> 32.55%` in 6/6 runs, matching the chart's argmax accuracy within noise, but expected edit similarity moves only `-0.004` and `+0.012` because conditioning on the mode costs `0.5`--`1.4` points of token accuracy |
 
 ### 3. Generation quality (deficit attributed to the encoder, not the objective)
 
@@ -470,12 +471,19 @@ similarity over every sample, and there the scaffold is `0.2074` against
 length. Each family's baseline is also one checkpoint, so this is three
 scaffold seeds against one baseline point estimate.
 
-That fixes what the remaining work is. The quality clause turns entirely on
-`length_match_probability`, which is `24.83%` at roberta-base and is the single
-number standing between the matched-subset lead and an unconditional one. The
-length-extrapolation and gap-composition slices still have not been run on the
-scaffold, and the compute comparison is still rounds-versus-tokens rather than
-wall clock. The hold stands on those three.
+That fixes what the remaining work is, and one attempt at it has now been made
+and measured. The quality clause turns entirely on `length_match_probability`:
+an oracle-length arm reaches `0.3324` expected edit similarity against the
+ancestral `0.2074`, a `0.1250` swing that exceeds the whole `0.1206` gap to the
+oracle-length masked baseline. Length selection is the deficit, not a part of
+it. Decoding at the exact chart's mode raises the metric to `32.55%` in 6/6 runs
+and is provably extracting everything the chart knows, but it recovers only
+about a tenth of the prize, because the chart's mode is right `32.8%` of the
+time. The constraint is the length distribution itself, not the decoder.
+
+The hold therefore stands on three things: a better `p(length | prompt)`, the
+length-extrapolation and gap-composition slices on the scaffold, and a wall-clock
+rather than rounds-versus-tokens compute comparison.
 
 ## Recommended order
 
@@ -642,12 +650,29 @@ wall clock. The hold stands on those three.
    `29.39%+/-0.96` against `27.45%`, the latter above baseline in 3/3. Backbone
    scale moves the metric `9.05` points where seed moves it `0.96`
    (`research/FRONTIER_REENCODE.md`).
-30. **Next:** raise `length_match_probability` above its current `24.83%`. It is
-   the single quantity separating a matched-subset lead from an unconditional
-   one, since expected edit similarity over all samples is still `0.2074`
-   against the baseline's `0.3280`. Then run the length-extrapolation and
-   gap-composition slices on the scaffold, and replace rounds-versus-tokens with
-   a wall-clock comparison. Those three are what the scale-up gate now waits on.
+30. **Completed on the decoder, which relocates the problem.** The scaffold
+   computes `p(length | prompt)` exactly and then samples from it, so its length
+   agreement was the chart's mass rather than its mode. Decoding at the chart's
+   mode instead raises length match `22.72% -> 27.89%` and `24.83% -> 32.55%` in
+   6/6 runs, landing on the chart's own argmax accuracy to within noise: the
+   decoder now extracts everything the chart knows. It does not convert —
+   expected edit similarity moves `-0.004` and `+0.012`, because conditioning on
+   the mode costs `0.5`--`1.4` points of matched token accuracy. The oracle-length
+   arm sizes what is left: true length is worth `0.1250` of expected edit
+   similarity at roberta-base against a `0.1206` total gap to the masked
+   baseline, so length selection is not one contributor to the deficit but the
+   whole of it, and modal guidance recovers about a tenth
+   (`research/FRONTIER_REENCODE.md`).
+31. **Next:** improve `p(length | prompt)` itself, since the decoder that reads
+   it is now optimal and its mode is right only `32.8%` of the time. Every lever
+   measured so far is encoder access — pooled to GAP state is `+0.09` nats,
+   distilroberta to roberta-base is `+0.063`, and four times the data is `0` —
+   so the candidates are unfreezing the backbone for shape, or reading more than
+   one position at round zero, both of which keep the chart exact because it only
+   requires the context be fixed at round zero.
+32. **Also open:** run the length-extrapolation and gap-composition slices on the
+   scaffold, and replace rounds-versus-tokens with a wall-clock comparison.
+   Together with item 31 these are what the scale-up gate now waits on.
 
 ## Currently claimable
 

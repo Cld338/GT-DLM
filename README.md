@@ -124,6 +124,7 @@ python experiment_conditional_length.py --device cuda --epochs 8 --max-train-exa
 python probe_conditional_length_context.py --device cuda --train-examples 4096
 python experiment_conditional_length.py --device cuda --context-source gap --unified-lexical-artifact-dir artifacts/text_pretrained_masked_roberta_base --artifact-dir artifacts/text_conditional_length_gap_local_unified_roberta_base_seed23 --seed 23
 python evaluate_conditional_scaffold.py --device cuda --unified --chunk-size 16 --conditional-artifact-dir artifacts/text_conditional_length_gap_local_unified_roberta_base_seed23 --lexical-artifact-dir artifacts/text_pretrained_masked_roberta_base
+python evaluate_length_guided_rollout.py --device cuda --unified --chunk-size 16 --conditional-artifact-dir artifacts/text_conditional_length_gap_local_unified_roberta_base --lexical-artifact-dir artifacts/text_pretrained_masked_roberta_base
 ```
 
 The experiment writes its metrics and checkpoints to `artifacts/`.
@@ -804,6 +805,24 @@ length-matched subset (`416`--`421` of `4096` samples) while the baseline is
 scored on all 128 oracle-length prompts; over every sample the scaffold's
 expected edit similarity is `0.2074` against `0.3280`, because only about a
 quarter of its samples hit the target length. And each family's baseline is a
-single checkpoint. Raising that match rate is the one quantity separating a
-matched-subset lead from an unconditional one. See
-`research/FRONTIER_REENCODE.md`.
+single checkpoint.
+
+Raising that match rate is the one quantity separating a matched-subset lead
+from an unconditional one, and attacking it directly has now located the real
+constraint. The scaffold computes `p(length | prompt)` exactly and then samples
+from it, so its length agreement is the chart's mass rather than its mode.
+Decoding at the mode instead — no target information, nothing retrained —
+raises length match `22.72% -> 27.89%` and `24.83% -> 32.55%` in 6/6 runs, and
+lands on the chart's own argmax accuracy to within noise, so the decoder now
+extracts everything the chart knows. It does not convert into text quality:
+expected edit similarity moves `-0.004` and `+0.012`, because conditioning on
+the mode costs `0.5`--`1.4` points of matched token accuracy.
+
+An oracle-length arm sizes what remains. At roberta-base, true length is worth
+`0.2074 -> 0.3324` expected edit similarity, a `0.1250` swing against a `0.1206`
+total gap to the oracle-length masked baseline — length selection is not one
+contributor to the deficit but the whole of it. Modal guidance recovers about a
+tenth of that, because the chart's mode is right only `32.8%` of the time. The
+binding constraint is the length distribution itself rather than the decoder
+that reads it, and every lever measured against it so far is encoder access.
+See `research/FRONTIER_REENCODE.md`.

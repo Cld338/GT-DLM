@@ -893,3 +893,79 @@ What replication does establish is the ordering of the two effects. Backbone
 scale moves matched accuracy by `9.05` points and controller seed by `0.96`;
 the conditional-length gain moves by `0.063` nats between backbones and `0.008`
 within one. Both headline effects are an order of magnitude above their noise.
+
+## Decoding at the model's own modal length
+
+The scaffold computes `p(length | prompt)` exactly and then throws part of it
+away: ancestral rollout *samples* a length from that chart, so its agreement
+with the target is the chart's own mass rather than its mode. Held-out argmax
+length accuracy sits several points above the sampled rate, which is the same
+distributional-versus-modal dissociation `research/LIKELIHOOD_DECOMPOSITION.md`
+measured for tokens — except that here the exact chart is in hand, so the gap
+is addressable at decode time.
+
+`evaluate_length_guided_rollout.py` closes it. It computes the chart, takes its
+mode, and keeps the rollouts that realized that length. No target information
+enters, nothing is retrained, and the same 128 prompts, checkpoints, rollout
+seed and 32-sample pools are used as in the ancestral evaluation, so the arms
+are paired. A prompt with no rollout at the modal length falls back to the full
+pool; that happens on `0.3%`--`0.5%` of prompts. An oracle-length arm selecting
+on the *true* length is reported alongside, purely as a reference ceiling.
+
+Metrics are averaged per prompt and then across prompts, not across sample
+pairs, because the arms retain different numbers of samples and pair-weighting
+would silently reweight prompts.
+
+| Backbone | Arm | Length match | Expected edit | Exact | Matched token accuracy |
+|---|---|---:|---:|---:|---:|
+| distilroberta | ancestral | `22.72%+/-0.67` | `0.1513` | `1.02%` | `20.34%` |
+| distilroberta | modal-guided | `27.89%+/-1.20` | `0.1471` | `1.98%` | `19.84%` |
+| distilroberta | oracle-length | `94.27%` | `0.2337` | `6.93%` | `20.34%` |
+| roberta-base | ancestral | `24.83%+/-0.20` | `0.2074` | `1.70%` | `29.39%` |
+| roberta-base | modal-guided | `32.55%+/-2.51` | `0.2196` | `2.31%` | `28.00%` |
+| roberta-base | oracle-length | `97.14%` | `0.3324` | `9.90%` | `29.39%` |
+
+**The decoder works exactly as designed, and that is the useful part of the
+result.** Modal guidance raises length match by `5.17` and `7.72` points in 6/6
+runs, and the value it reaches is the chart's own argmax accuracy to within
+noise (`27.89%` against `27.86%`, `32.55%` against `32.81%`). Whatever the chart
+knows about length, the decoder now extracts all of it. The gate's named
+quantity moved, and it moved for a reason that is understood.
+
+**It does not convert into unconditional quality.** Expected edit similarity
+goes `-0.004` at distilroberta and `+0.012` at roberta-base. Conditioning on the
+mode restricts the rollout to trees the model scores lower, which costs matched
+token accuracy `0.50` and `1.39` points, and that roughly cancels the length
+gain. The honest summary is that modal decoding buys the length metric and not
+the text.
+
+The oracle arm explains why, and sizes what is left. At roberta-base, moving
+from self-generated to true length is worth `0.2074 -> 0.3324` expected edit
+similarity — `0.1250`, which is *larger* than the entire `0.1206` gap to the
+oracle-length masked baseline. At distilroberta it is worth `0.0824` of a
+`0.0967` gap, or `85%`, leaving a real `0.0143` residual there. Length selection
+is therefore not one contributor to the remaining deficit; at the larger
+backbone it is the whole of it. Modal guidance recovers about a tenth of that
+prize, because the chart's mode is right only `32.8%` of the time.
+
+So the binding constraint is `p(length | prompt)` itself, not the decoder that
+reads it. This closes the decoding question the way item 20 of
+`research/ROADMAP.md` closed reranking, but with the opposite lesson: reranking
+failed because the objective was not the problem, whereas modal length
+selection succeeds at its own task and reveals that the chart is the problem.
+
+Two things are worth recording about the oracle arm before it is quoted. Its
+length match is `94%`--`97%` rather than `100%`, because `2.9%`--`5.7%` of
+prompts produce no rollout at the true length in a 32-sample pool and fall back;
+its edit similarity is that much understated. And at oracle length the unified
+scaffold ties the masked baseline on decoded text (`0.3324` against `0.3280`,
+`9.90%` exact against `9.90%`) while leading on token accuracy (`29.39%` against
+`27.45%`) — but the two share a backbone and MLM head, and the final fill is
+`argmax` rather than sampled, so given the same length they are running closely
+related computations. The informative content is that tree growth does not
+damage the fill, not that a separate model was beaten.
+
+That last point also explains the sample statistics elsewhere in this document:
+because the fill is greedy, every sample's diversity comes from shape alone,
+which is why unique-sequence fractions sit near `0.23` and why the oracle arm's
+exact-match rate is identical across all three seeds.

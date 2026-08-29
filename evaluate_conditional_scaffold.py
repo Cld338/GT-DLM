@@ -25,26 +25,12 @@ from gtdlm.text_data import random_length_windows, sample_text_infilling_example
 from gtdlm.text_tokenizer import vocabulary_from_pretrained_tokenizer
 
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--conditional-artifact-dir",
-        default="artifacts/text_conditional_length_gap_local",
-    )
-    parser.add_argument(
-        "--lexical-artifact-dir",
-        default="artifacts/text_pretrained_masked_native",
-    )
-    parser.add_argument(
-        "--device", choices=("auto", "cpu", "cuda"), default="auto"
-    )
-    parser.add_argument("--examples", type=int, default=128)
-    parser.add_argument("--samples-per-prompt", type=int, default=32)
-    parser.add_argument("--chunk-size", type=int, default=64)
-    parser.add_argument("--seed", type=int, default=1901)
-    parser.add_argument("--unified", action="store_true")
-    args = parser.parse_args()
+def build_setup(args):
+    """Load the models, prompts and shape constants a conditional arm needs.
 
+    Extracted so that decoders other than plain ancestral sampling can be
+    evaluated against exactly the same checkpoints, prompts and constants.
+    """
     with open(
         os.path.join(args.conditional_artifact_dir, "results.json"),
         encoding="utf-8",
@@ -143,6 +129,55 @@ def main():
         map_location=device,
         weights_only=True,
     ))
+    return {
+        "device": device,
+        "tokenizer": tokenizer,
+        "vocab": vocab,
+        "examples": examples,
+        "lexical_model": lexical_model,
+        "topology_model": topology_model,
+        "max_span": max_span,
+        "max_rounds": max_rounds,
+        "max_decode_span": int(source_config["max_decode_span"]),
+        "context_source": str(
+            conditional_config.get("context_source", "pooled")
+        ),
+    }
+
+
+def add_common_arguments(parser):
+    parser.add_argument(
+        "--conditional-artifact-dir",
+        default="artifacts/text_conditional_length_gap_local",
+    )
+    parser.add_argument(
+        "--lexical-artifact-dir",
+        default="artifacts/text_pretrained_masked_native",
+    )
+    parser.add_argument(
+        "--device", choices=("auto", "cpu", "cuda"), default="auto"
+    )
+    parser.add_argument("--examples", type=int, default=128)
+    parser.add_argument("--samples-per-prompt", type=int, default=32)
+    parser.add_argument("--chunk-size", type=int, default=64)
+    parser.add_argument("--seed", type=int, default=1901)
+    parser.add_argument("--unified", action="store_true")
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    add_common_arguments(parser)
+    args = parser.parse_args()
+
+    setup = build_setup(args)
+    device = setup["device"]
+    vocab = setup["vocab"]
+    examples = setup["examples"]
+    lexical_model = setup["lexical_model"]
+    topology_model = setup["topology_model"]
+    max_span = setup["max_span"]
+    max_rounds = setup["max_rounds"]
+
     print(
         "device={} prompts={} topology_parameters={} lexical_parameters={}".format(
             device,
@@ -153,7 +188,7 @@ def main():
         flush=True,
     )
 
-    context_source = str(conditional_config.get("context_source", "pooled"))
+    context_source = setup["context_source"]
     if args.unified:
         predictions, rounds, unfinished = sample_unified_scaffolds(
             topology_model,
@@ -163,7 +198,7 @@ def main():
             samples_per_prompt=args.samples_per_prompt,
             chunk_size=args.chunk_size,
             max_rounds=max_rounds,
-            max_decode_span=int(source_config["max_decode_span"]),
+            max_decode_span=setup["max_decode_span"],
             seed=args.seed,
             conditional_context_source=context_source,
         )
@@ -176,7 +211,7 @@ def main():
             samples_per_prompt=args.samples_per_prompt,
             chunk_size=args.chunk_size,
             max_rounds=max_rounds,
-            max_decode_span=int(source_config["max_decode_span"]),
+            max_decode_span=setup["max_decode_span"],
             seed=args.seed,
             conditional_context_source=context_source,
         )
