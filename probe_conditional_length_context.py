@@ -14,6 +14,14 @@ they call for different fixes:
 This probe reads the very same tensors the shape policy reads and predicts the
 length directly.  It is deliberately unconstrained: whatever it recovers is an
 upper bound on what the branching policy could recover from that input.
+
+`--lexical-artifact-dir` swaps in a *fine-tuned* backbone before encoding.  This
+matters more than it sounds: the unified controller trains on the frozen lexical
+baseline's backbone, not on the base pretrained one this probe defaults to, and
+it reaches several times the identifiable nats any probe on base-backbone
+features does.  Measuring the ceiling on the representation the controller
+actually reads is the only way to tell whether its remaining error is a missing
+signal or an unexpressed one.
 """
 
 import argparse
@@ -27,7 +35,10 @@ from transformers import AutoTokenizer
 from experiment import choose_device, seed_everything
 from experiment_conditional_length import length_targets, render_prompts
 from frontier_reencode import scaffold_length_distribution
-from gtdlm.model import PretrainedScaffoldTopologyModel
+from gtdlm.model import (
+    PretrainedLengthMaskedModel,
+    PretrainedScaffoldTopologyModel,
+)
 from gtdlm.text_data import (
     DynamicTextExampleDataset,
     random_length_windows,
@@ -145,6 +156,11 @@ def main():
         "--artifact-dir",
         default="artifacts/text_conditional_length_gap_local_probe",
     )
+    parser.add_argument(
+        "--lexical-artifact-dir",
+        default="",
+        help="encode with this fine-tuned backbone instead of the base one",
+    )
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--train-examples", type=int, default=4096)
@@ -202,6 +218,35 @@ def main():
         map_location=device,
         weights_only=True,
     ))
+    if args.lexical_artifact_dir:
+        with open(
+            os.path.join(args.lexical_artifact_dir, "results.json"),
+            encoding="utf-8",
+        ) as handle:
+            lexical_config = json.load(handle)["config"]
+        lexical_model = PretrainedLengthMaskedModel(
+            vocab.vocab_size,
+            int(lexical_config["max_span"]),
+            vocab.GAP,
+            vocab.PAD,
+            tokenizer,
+            model_name=str(lexical_config["model_name"]),
+            cache_dir=str(lexical_config["cache_dir"]),
+            max_length=int(lexical_config["max_length"]),
+            local_files_only=True,
+            native_vocabulary=True,
+        ).to(device)
+        lexical_model.load_state_dict(torch.load(
+            os.path.join(args.lexical_artifact_dir, "masked.pt"),
+            map_location=device,
+            weights_only=True,
+        ))
+        if (
+            lexical_model.encoder.backbone.config.hidden_size
+            != model.backbone.config.hidden_size
+        ):
+            raise ValueError("backbone hidden sizes must agree")
+        model.backbone = lexical_model.encoder.backbone
     model.eval()
 
     dynamic = DynamicTextExampleDataset(

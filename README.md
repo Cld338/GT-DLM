@@ -125,6 +125,7 @@ python probe_conditional_length_context.py --device cuda --train-examples 4096
 python experiment_conditional_length.py --device cuda --context-source gap --unified-lexical-artifact-dir artifacts/text_pretrained_masked_roberta_base --artifact-dir artifacts/text_conditional_length_gap_local_unified_roberta_base_seed23 --seed 23
 python evaluate_conditional_scaffold.py --device cuda --unified --chunk-size 16 --conditional-artifact-dir artifacts/text_conditional_length_gap_local_unified_roberta_base_seed23 --lexical-artifact-dir artifacts/text_pretrained_masked_roberta_base
 python evaluate_length_guided_rollout.py --device cuda --unified --chunk-size 16 --conditional-artifact-dir artifacts/text_conditional_length_gap_local_unified_roberta_base --lexical-artifact-dir artifacts/text_pretrained_masked_roberta_base
+python probe_conditional_length_context.py --device cuda --lexical-artifact-dir artifacts/text_pretrained_masked_roberta_base --artifact-dir artifacts/text_length_probe_finetuned_roberta_base
 ```
 
 The experiment writes its metrics and checkpoints to `artifacts/`.
@@ -824,5 +825,25 @@ total gap to the oracle-length masked baseline — length selection is not one
 contributor to the deficit but the whole of it. Modal guidance recovers about a
 tenth of that, because the chart's mode is right only `32.8%` of the time. The
 binding constraint is the length distribution itself rather than the decoder
-that reads it, and every lever measured against it so far is encoder access.
-See `research/FRONTIER_REENCODE.md`.
+that reads it.
+
+Locating that constraint required fixing the instrument. The probe used to bound
+what the shape path could know was reading the *base* pretrained backbone, while
+the controller reads the frozen lexical baseline's fine-tuned one — which is why
+it reported a `+0.0918` nat ceiling under a controller that scores `+0.3137`.
+Re-measured on the representation the controller actually reads, three probe
+seeds give `+0.3207+/-0.0322` linear and `+0.3111+/-0.0149` MLP against that
+`+0.3137+/-0.0062`. An unconstrained categorical probe, with no branching
+constraint and no exactness requirement, does not beat a 102,450-parameter
+total-progeny policy on the same tensor: the branching parameterization is at
+its input's ceiling and has no headroom left. Reading more positions at round
+zero is refuted outright, scoring `0.056` and `0.019` nats *below* the single
+GAP state.
+
+What does move the quantity is what the backbone was fine-tuned on. The same GAP
+position carries `+0.0918` nats before MLM fine-tuning and `+0.3404` after, a
+factor of `3.7`, while pooled states stay at zero either way. The length signal
+is concentrated at the mask position, which is where the corruption is and where
+masked-filling training applies its pressure. The remaining direction is to do
+deliberately what that fine-tuning did by accident. See
+`research/FRONTIER_REENCODE.md`.

@@ -481,9 +481,18 @@ and is provably extracting everything the chart knows, but it recovers only
 about a tenth of the prize, because the chart's mode is right `32.8%` of the
 time. The constraint is the length distribution itself, not the decoder.
 
-The hold therefore stands on three things: a better `p(length | prompt)`, the
-length-extrapolation and gap-composition slices on the scaffold, and a wall-clock
-rather than rounds-versus-tokens compute comparison.
+A better `p(length | prompt)` has since been localized to the encoder, and not
+to anything the shape path controls. An unconstrained probe on the exact tensor
+the controller reads scores `+0.3207+/-0.0322` against the controller's
+`+0.3137+/-0.0062`, so the branching policy is already at its input's ceiling;
+reading more positions at round zero scores *below* the single GAP state; and
+the largest effect on the quantity is what the backbone was fine-tuned on
+(`+0.0918` nats at the GAP before MLM fine-tuning, `+0.3404` after).
+
+The hold therefore stands on three things: a backbone carrying more length
+information at the GAP, the length-extrapolation and gap-composition slices on
+the scaffold, and a wall-clock rather than rounds-versus-tokens compute
+comparison.
 
 ## Recommended order
 
@@ -663,16 +672,29 @@ rather than rounds-versus-tokens compute comparison.
    baseline, so length selection is not one contributor to the deficit but the
    whole of it, and modal guidance recovers about a tenth
    (`research/FRONTIER_REENCODE.md`).
-31. **Next:** improve `p(length | prompt)` itself, since the decoder that reads
-   it is now optimal and its mode is right only `32.8%` of the time. Every lever
-   measured so far is encoder access — pooled to GAP state is `+0.09` nats,
-   distilroberta to roberta-base is `+0.063`, and four times the data is `0` —
-   so the candidates are unfreezing the backbone for shape, or reading more than
-   one position at round zero, both of which keep the chart exact because it only
-   requires the context be fixed at round zero.
-32. **Also open:** run the length-extrapolation and gap-composition slices on the
+31. **Completed as measurement; it closes the controller and one of the two
+   candidate fixes.** The probe used to bound this was reading the *base*
+   backbone while the controller reads the fine-tuned lexical one, which is why
+   it reported a `+0.0918` ceiling under a controller scoring `+0.3137`.
+   Re-measured on the representation the controller actually reads, three probe
+   seeds give `+0.3207+/-0.0322` linear and `+0.3111+/-0.0149` MLP against the
+   controller's `+0.3137+/-0.0062`: an unconstrained categorical probe does not
+   beat the 102,450-parameter total-progeny policy, so the branching
+   parameterization has no measurable headroom. Reading more positions at round
+   zero — the leading candidate, because it keeps the chart exact — is refuted:
+   left/GAP/right scores `0.056` and `0.019` nats *below* the GAP state alone.
+   What does move the quantity is what the backbone was fine-tuned on: the same
+   GAP position carries `+0.0918` nats before MLM fine-tuning and `+0.3404`
+   after (`research/FRONTIER_REENCODE.md`).
+32. **Next:** give the backbone more length information at the GAP deliberately,
+   since its MLM fine-tuning already did so by accident at `3.7x`. Unfreezing the
+   backbone for shape, or adding a length-aware auxiliary to the lexical
+   fine-tuning, are the two forms. Both carry a cost the earlier attempts did
+   not: in the unified model the backbone is shared with the MLM head, so shape
+   and lexical would have to be trained together rather than in sequence.
+33. **Also open:** run the length-extrapolation and gap-composition slices on the
    scaffold, and replace rounds-versus-tokens with a wall-clock comparison.
-   Together with item 31 these are what the scale-up gate now waits on.
+   Together with item 32 these are what the scale-up gate now waits on.
 
 ## Currently claimable
 

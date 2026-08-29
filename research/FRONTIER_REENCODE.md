@@ -969,3 +969,71 @@ That last point also explains the sample statistics elsewhere in this document:
 because the fill is greedy, every sample's diversity comes from shape alone,
 which is why unique-sequence fractions sit near `0.23` and why the oracle arm's
 exact-match rate is identical across all three seeds.
+
+## Where the conditional length chart's error actually lives
+
+The modal-decoding result above leaves `p(length | prompt)` as the binding
+constraint, with two candidate fixes: a richer branching policy, or a richer
+input to it. Both were measured before either was built, and both are now
+closed — the second negatively, the first by showing there is nothing there to
+win.
+
+The instrument needed one correction first. `probe_conditional_length_context.py`
+built its features from the *base* pretrained backbone, while the unified
+controller trains on the frozen **lexical baseline's** backbone. That is why the
+probe table earlier in this document reports a `+0.0918` nat ceiling under which
+the controller then scored `+0.2512` and `+0.3137` — the probe was measuring a
+representation the controller does not read. A `--lexical-artifact-dir` flag now
+swaps the fine-tuned backbone in before encoding, leaving the splits, the shared
+context-free prior and the probe family untouched, so the numbers stay directly
+comparable to the controller's identifiable nats.
+
+Re-measured there, test identifiable nats are:
+
+| Input | roberta-base | distilroberta |
+|---|---:|---:|
+| Pooled backbone state | `+0.0191` | `+0.0056` |
+| Shape context (adapter over pooled) | `-0.0023` | `-0.0034` |
+| GAP hidden state, linear | `+0.3404` | `+0.2443` |
+| GAP hidden state, MLP | `+0.3242` | `+0.2600` |
+| Left/GAP/right | `+0.2844` | `+0.2254` |
+| Left/GAP/right plus boundary difference | `+0.3064` | `+0.2226` |
+| *Trained controller, 3 seeds* | *`+0.3137+/-0.0062`* | *`+0.2512+/-0.0079`* |
+
+**The controller is at the ceiling of its own input, and the branching
+parameterization has no measurable headroom left.** Three probe seeds on the
+fine-tuned roberta-base GAP state give `+0.3207+/-0.0322` linear and
+`+0.3111+/-0.0149` MLP against the controller's `+0.3137+/-0.0062`: the
+controller sits inside both intervals. At distilroberta it sits between the
+linear (`+0.2443`) and MLP (`+0.2600`) probes, above the linear one. An
+unconstrained categorical probe with no branching constraint, no exactness
+requirement and free access to the same tensor does not beat a 102,450-parameter
+total-progeny policy. Probe seed noise is `0.032`, five times the controller's
+`0.006`, so a single-seed comparison would have manufactured a gap that three
+seeds show is not there.
+
+**Reading more positions is refuted.** Left/GAP/right scores `0.056` and `0.019`
+nats *below* the GAP state alone in the two families, and adding the boundary
+difference does not recover it. This was the leading candidate for a richer
+round-zero context precisely because it keeps the chart exact; it does not
+survive measurement. More context at round zero is not the fix.
+
+**What the fine-tuning does is the largest single effect measured on this
+quantity.** The same GAP position on the base backbone carries `+0.0918` nats
+and on the MLM-fine-tuned backbone carries `+0.3404`, a factor of `3.7`. Pooling
+remains at zero either way (`+0.0191` after fine-tuning), so the `+0.32` nat
+GAP-versus-pooled gap is not something fine-tuning creates at the sequence level
+— it is concentrated at the mask position, which is exactly where the corruption
+is and where masked-filling training puts its pressure.
+
+That leaves one lever, and it is neither of the two this section set out to
+test. Since the controller extracts everything its input holds and the input's
+content is set by what the backbone was trained on, the only way to a better
+length law is a backbone that carries more length information at the GAP. Its
+own MLM fine-tuning already supplied a `3.7x` improvement as a side effect.
+Doing this deliberately — unfreezing the backbone for shape, or adding a
+length-aware auxiliary to the lexical fine-tuning — is the remaining direction.
+It carries a cost the previous attempts did not: in the unified model the
+backbone is shared with the MLM head, so anything that moves it for shape moves
+the lexical fill too, and the two would have to be trained together rather than
+in sequence.
