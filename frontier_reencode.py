@@ -1636,6 +1636,7 @@ def sample_unified_scaffolds(
     max_decode_span: int = 16,
     seed: int = 1901,
     conditional_context_source: Optional[str] = None,
+    skip_round_encoding: bool = False,
 ) -> Tuple[List[List[List[int]]], List[List[int]], List[List[bool]]]:
     """Grow shape and token beliefs together, then decode in parallel.
 
@@ -1643,7 +1644,19 @@ def sample_unified_scaffolds(
     topology decision and a soft lexical state for the same node.  Once the
     branching process terminates, the same MLM head fills every completed slot
     simultaneously.
+
+    `skip_round_encoding` drops the per-round backbone pass.  It is available
+    only in the conditional mode, where the shape policy reads a context fixed
+    at round zero and therefore never consults the evolving canvas: the only
+    thing that pass produces is the node-local token posterior carried into the
+    final fill.  With it off, growth costs no backbone passes at all and a
+    complete generation is two passes -- one for the round-zero context and one
+    for the fill -- whatever length it produces.
     """
+    if skip_round_encoding and conditional_context_source is None:
+        raise ValueError(
+            "skipping the round encoding requires a conditional context"
+        )
     if samples_per_prompt < 1 or chunk_size < 1:
         raise ValueError("sampling and chunk sizes must be positive")
     if any(len(example.spans) != 1 for example in examples):
@@ -1751,14 +1764,17 @@ def sample_unified_scaffolds(
                 )
                 stops, degrees, directions, _, posterior_states = sampled[:5]
             else:
-                token_logits = model.unified_logits(
-                    tokens,
-                    padding,
-                    steps,
-                    open_mask,
-                    slot_semantics=slot_semantics,
-                )[0]
-                posterior_states = model.posterior_states(token_logits)
+                if skip_round_encoding:
+                    posterior_states = None
+                else:
+                    token_logits = model.unified_logits(
+                        tokens,
+                        padding,
+                        steps,
+                        open_mask,
+                        slot_semantics=slot_semantics,
+                    )[0]
+                    posterior_states = model.posterior_states(token_logits)
                 stops = torch.zeros_like(tokens, dtype=torch.bool)
                 degrees = torch.zeros_like(tokens)
                 directions = torch.zeros_like(tokens)
@@ -1800,7 +1816,8 @@ def sample_unified_scaffolds(
             stops = stops.cpu()
             degrees = degrees.cpu()
             directions = directions.cpu()
-            posterior_states = posterior_states.float().cpu()
+            if posterior_states is not None:
+                posterior_states = posterior_states.float().cpu()
 
             for row, index in enumerate(active):
                 expanded = []
@@ -1827,7 +1844,9 @@ def sample_unified_scaffolds(
                         vocab.GAP,
                         region,
                         False,
-                        posterior_states[row, position].clone(),
+                        None
+                        if posterior_states is None
+                        else posterior_states[row, position].clone(),
                     ))
                     if right_child:
                         expanded.append((vocab.GAP, region, True, None))

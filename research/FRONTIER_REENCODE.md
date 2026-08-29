@@ -1037,3 +1037,69 @@ It carries a cost the previous attempts did not: in the unified model the
 backbone is shared with the MLM head, so anything that moves it for shape moves
 the lexical fill too, and the two would have to be trained together rather than
 in sequence.
+
+## The per-round backbone pass is dead computation
+
+Every cost statement in this document counts growth in rounds: "`2.84` shape
+rounds plus one lexical pass". Each of those rounds runs a backbone pass over
+the evolving canvas, so the accounting has been `2.85 + 1 = 3.85` passes to emit
+about `3.6` tokens — roughly one pass per token, which is what a sequential
+filler costs. On that accounting the parallel saving is nearly nothing.
+
+The accounting is wrong, and the reason is visible in the code rather than in a
+measurement. `unified_logits` calls
+
+```python
+root, regime, degree, direction, hidden = self.structure_logits(
+    tokens, padding_mask, clipped_steps, open_mask,
+)
+```
+
+without forwarding `slot_semantics`. The node-local token posterior therefore
+never enters the backbone encode and never reaches the token head; it reaches
+only the `posterior_query/key/value` attention path, which adds to the
+*topology* logits. The conditional model discards those logits, because its
+shape decisions come from `conditional_shape_logits` on a context fixed at round
+zero. So the per-round pass computes a quantity that nothing downstream can
+read.
+
+Dropping it must then be exactly output-preserving, and it is. Across three
+seeds at 128 prompts and 32 samples each, every quality metric is identical to
+the digit:
+
+| Seed | Backbone passes | Matched token accuracy | Expected edit | Length TV |
+|---|---:|---:|---:|---:|
+| 17 | `4.855 -> 2.000` | `0.3024 -> 0.3024` | `0.2069 -> 0.2069` | `0.0859 -> 0.0859` |
+| 23 | `4.906 -> 2.000` | `0.2835 -> 0.2835` | `0.2046 -> 0.2046` | `0.0549 -> 0.0549` |
+| 41 | `4.960 -> 2.000` | `0.2958 -> 0.2958` | `0.2106 -> 0.2106` | `0.0613 -> 0.0613` |
+
+The control arm also reproduces the stored ancestral evaluation exactly, so the
+comparison carries its own regression check.
+
+**A complete generation therefore costs two backbone passes: one for the
+round-zero context, one for the parallel fill, whatever length it emits.** The
+count is `2.000` and not merely close to it, because growth now touches the
+backbone zero times. Against a sequential filler needing one pass per token,
+this is the parallel-expansion property the project has been trying to establish
+since the fixed mask bank collapsed generation into a chain — except that it no
+longer degrades with length at all, since the round count has left the cost
+model entirely.
+
+Two tests hold the invariant. One runs both paths on the same seed and asserts
+identical output with the backbone call counter going `4 -> 2`; it passes with
+*randomly initialized* posterior heads, so the property comes from the wiring
+rather than from the zeroed coupling gate. The other rejects the flag outside
+conditional mode, where the shape policy does read the canvas and the pass is
+load-bearing.
+
+Three things this result is not. It is **not** evidence that node-local token
+beliefs fail to help the fill: they were never connected to it, so that
+hypothesis is untested rather than refuted, and wiring `slot_semantics` into
+`structure_logits` — or conditioning the fill on the growth passes some other
+way — remains open and is now cheap to try against a two-pass baseline. It is
+**not** a throughput study: measured wall clock is `2.04x`, `1.61x` and `4.93x`
+across the three seeds, and that spread is dominated by contention on a shared
+desktop GPU rather than by anything in the model, so only the pass count should
+be quoted. And the two passes are per sample; every sample of one prompt encodes
+the same round-zero context independently, so caching it per prompt would take
+the amortized cost to about `1.03` passes, which has not been implemented.

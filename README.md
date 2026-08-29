@@ -126,6 +126,7 @@ python experiment_conditional_length.py --device cuda --context-source gap --uni
 python evaluate_conditional_scaffold.py --device cuda --unified --chunk-size 16 --conditional-artifact-dir artifacts/text_conditional_length_gap_local_unified_roberta_base_seed23 --lexical-artifact-dir artifacts/text_pretrained_masked_roberta_base
 python evaluate_length_guided_rollout.py --device cuda --unified --chunk-size 16 --conditional-artifact-dir artifacts/text_conditional_length_gap_local_unified_roberta_base --lexical-artifact-dir artifacts/text_pretrained_masked_roberta_base
 python probe_conditional_length_context.py --device cuda --lexical-artifact-dir artifacts/text_pretrained_masked_roberta_base --artifact-dir artifacts/text_length_probe_finetuned_roberta_base
+python ablate_round_encoding.py --device cuda --unified --chunk-size 16 --conditional-artifact-dir artifacts/text_conditional_length_gap_local_unified_roberta_base --lexical-artifact-dir artifacts/text_pretrained_masked_roberta_base
 ```
 
 The experiment writes its metrics and checkpoints to `artifacts/`.
@@ -845,5 +846,25 @@ position carries `+0.0918` nats before MLM fine-tuning and `+0.3404` after, a
 factor of `3.7`, while pooled states stay at zero either way. The length signal
 is concentrated at the mask position, which is where the corruption is and where
 masked-filling training applies its pressure. The remaining direction is to do
-deliberately what that fine-tuning did by accident. See
+deliberately what that fine-tuning did by accident.
+
+Separately, the cost model this project has used throughout turns out to have
+been counting passes that do nothing. Growth was billed at one backbone pass per
+round, but `unified_logits` does not forward `slot_semantics` into
+`structure_logits`, so the node-local token posterior that pass produces reaches
+neither the backbone encode nor the token head — only a topology coupling path
+that the conditional model discards in favour of its round-zero context.
+Dropping the pass is exactly output-preserving: every quality metric is
+identical to the digit in 3/3 seeds at 4,096 samples each, while backbone passes
+fall from `4.907+/-0.053` to exactly `2.000`.
+
+**A complete generation is therefore two backbone passes — one for the
+round-zero context, one for the parallel fill — whatever length it emits**,
+against one pass per token for a sequential filler. Two tests hold the
+invariant, one of which passes with randomly initialized coupling heads, so the
+property comes from the wiring rather than from a gate setting. This is not
+evidence that node-local token beliefs fail to help the fill: they were never
+connected to it, so that remains untested and is now cheap to try against a
+two-pass baseline. Nor is it a throughput claim — measured wall clock spans
+`1.61x`--`4.93x` across seeds, which is contention on a shared GPU. See
 `research/FRONTIER_REENCODE.md`.

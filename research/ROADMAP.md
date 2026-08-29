@@ -307,6 +307,7 @@ matched intervention isolating the surviving twin. See
 | Native pretrained vocabulary and MLM head | `NATIVE_VOCABULARY.md` | **Done at seed 17:** the full native path is implemented for corpus, chart, baseline and evaluation. It raises the lexical floor but leaves the native masked baseline well ahead (`20.04%` vs `8.71%` token accuracy; `0.410` vs `0.281` decoded character similarity) |
 | Fixed length-blind native mask bank | `FIXED_MASK_BANK.md` | **Done at seed 17:** exact and topology-prior NLL improve by `4.526` and `5.317` nats, with TV `0.126`; generation improves only modestly and remains below the native masked baseline |
 | Matched control for the exposure-gap auxiliary | `EXPOSURE_GAP.md` | **Done at seed 17:** the control keeps the auxiliary and its record draw but restores gold boundaries, and reproduces the entire length-TV gain, so the substitution contributes nothing but `+0.433` nats of cost |
+| Backbone passes per generation, the parallel claim in its final form | `FRONTIER_REENCODE.md` | **Done:** growth touches the backbone zero times, so a generation costs `2.000` passes at any length. Dropping the per-round pass is exactly output-preserving in 3/3 seeds because it fed only the discarded coupling path |
 | Expected rollout rounds, the parallel claim itself | `GENERATION_THEORY.md` | **Done, then superseded:** `5.758` rounds for `5.758` tokens on the fixed-mask-bank model, a pure chain. The scaffold that replaced it emits `3.5`--`3.8` tokens in `2.82`--`2.97` rounds in 6/6 replicated runs, so the parallel saving is real for the selected architecture |
 | Seed replication of the conditional-length scaffold | `FRONTIER_REENCODE.md` | **Done:** three controller seeds on each of two backbones, `0.2512+/-0.0079` and `0.3137+/-0.0062` identifiable nats, positive in 6/6 with non-overlapping families. Only the controller seed varies; each family's lexical backbone is a single seed-17 checkpoint |
 | Backbone scale for the scaffold | `FRONTIER_REENCODE.md` | **Done:** roberta-base moves matched token accuracy `20.34% -> 29.39%` and conditional length `+0.063` nats, against a `0.96` point and `0.008` nat seed spread. Four times the training data moves neither |
@@ -489,10 +490,20 @@ reading more positions at round zero scores *below* the single GAP state; and
 the largest effect on the quantity is what the backbone was fine-tuned on
 (`+0.0918` nats at the GAP before MLM fine-tuning, `+0.3404` after).
 
-The hold therefore stands on three things: a backbone carrying more length
-information at the GAP, the length-extrapolation and gap-composition slices on
-the scaffold, and a wall-clock rather than rounds-versus-tokens compute
-comparison.
+The compute clause has since resolved, and in the gate's favour. Counting
+rounds understated the saving in one direction and overstated the cost in
+another: each growth round ran a backbone pass, but that pass fed nothing the
+conditional model reads, so removing it is exactly output-preserving in 3/3
+seeds and takes a complete generation to `2.000` backbone passes regardless of
+length. Against a sequential filler at one pass per token, the parallel property
+now holds and does not decay with span length. What is not established is a
+wall-clock ratio: measured speedups range `1.61x`--`4.93x` on a shared desktop
+GPU, which is contention, not measurement.
+
+The hold therefore stands on two things: a backbone carrying more length
+information at the GAP, and the length-extrapolation and gap-composition slices
+— neither of which is a mechanical re-run, since the first needs a new slice
+designed and the second needs the scaffold extended past one gap.
 
 ## Recommended order
 
@@ -692,9 +703,22 @@ comparison.
    fine-tuning, are the two forms. Both carry a cost the earlier attempts did
    not: in the unified model the backbone is shared with the MLM head, so shape
    and lexical would have to be trained together rather than in sequence.
-33. **Also open:** run the length-extrapolation and gap-composition slices on the
-   scaffold, and replace rounds-versus-tokens with a wall-clock comparison.
-   Together with item 32 these are what the scale-up gate now waits on.
+33. **Completed, and it removes the compute question rather than answering it
+   as posed.** The per-round backbone pass was dead computation: `unified_logits`
+   does not forward `slot_semantics` into `structure_logits`, so the node-local
+   token posterior reaches only the topology coupling path, which the
+   conditional model discards in favour of its round-zero context. Dropping the
+   pass is exactly output-preserving — every quality metric identical to the
+   digit in 3/3 seeds at 4,096 samples — and takes backbone passes from
+   `4.907+/-0.053` to exactly `2.000`, independent of generated length. Growth
+   touches the backbone zero times (`research/FRONTIER_REENCODE.md`).
+34. **Still open:** the length-extrapolation and gap-composition slices. Neither
+   is the mechanical re-run this document previously implied. `anchored_copy` is
+   already recorded as unusable as a long-span slice on this corpus, so
+   length-extrapolation needs a new slice designed first. And the scaffold is
+   single-gap by construction — `prompt_shape_context` requires exactly one mask
+   and reads its position — so gap-composition is an architecture extension
+   (a context per gap, with the chart running per gap), not an evaluation.
 
 ## Currently claimable
 
@@ -742,7 +766,21 @@ encoder integration rather than the objective: bottlenecking the baseline's
 encoder to the tree model's single pooled vector, objective untouched, removes
 `84%` of the gap.
 
-**Parallel expansion is claimable only away from the fixed mask bank.** The
+**Parallel expansion is claimable, and no longer as a count of rounds.** In the
+selected conditional configuration growth touches the backbone zero times: the
+shape policy reads a context fixed at round zero, and the per-round pass that
+used to run fed only a coupling path the model discards, so removing it is
+exactly output-preserving in 3/3 seeds. A complete generation is `2.000`
+backbone passes — one for the context, one for the parallel fill — at any
+length, against one pass per token for a sequential filler. Claim the pass
+count, not a wall-clock ratio: measured speedups span `1.61x`--`4.93x` on a
+shared GPU.
+
+The paragraph below is the earlier form of this claim and is kept for the
+record.
+
+**Parallel expansion was previously claimable only away from the fixed mask
+bank.** The
 synthetic result keeps its `2.95` NFE. On natural text the pooled native model
 reaches `1.261` tokens per round, so the mechanism does work there, but the
 selected fixed-mask-bank model spends one round per emitted token — `5.758` for

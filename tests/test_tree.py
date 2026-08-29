@@ -2531,6 +2531,100 @@ class ReencodedFrontierTests(unittest.TestCase):
             token in vocab.generated_token_ids for token in samples[0][0]
         ))
 
+    def test_conditional_growth_needs_no_per_round_backbone_pass(self):
+        """Growth passes are dead computation once shape cannot read them.
+
+        In the conditional mode the shape policy reads a context fixed at round
+        zero, and `unified_logits` does not forward `slot_semantics` into
+        `structure_logits`, so the node-local token posterior reaches only the
+        topology coupling path -- never the backbone encode and never the token
+        head. Dropping the per-round pass must therefore be exactly
+        output-preserving, leaving two backbone passes for a whole generation
+        no matter how many tokens it emits.
+        """
+        tokenizer, backbone, head, _ = self.build_native_model()
+        vocab = TextVocabulary(
+            len(tokenizer), PAD=1, GAP=9, MASK=9, LEFT=0, RIGHT=2,
+            EXTRA_STRUCTURAL=(3,),
+        )
+        model = PretrainedUnifiedScaffoldModel(
+            vocab.vocab_size,
+            vocab.GAP,
+            vocab.PAD,
+            pretrained_lm_head=head,
+            generated_token_ids=vocab.generated_token_ids,
+            backbone=backbone,
+            pretrained_tokenizer=tokenizer,
+            regimes=1,
+            residual_dim=4,
+            posterior_topk=4,
+            prompt_conditioned=True,
+            dropout=0.0,
+        )
+        with torch.no_grad():
+            model.root_stop_prior.fill_(-20.0)
+            model.degree_prior.fill_(-20.0)
+            model.degree_prior[0, 0, 1] = 20.0
+            model.degree_prior[1:, 0, 0] = 20.0
+        examples = [TextInfillingExample(((5,), (6,)), ((10, 11),))]
+
+        def rollout(skip):
+            before = backbone.calls
+            outputs = sample_unified_scaffolds(
+                model,
+                examples,
+                vocab,
+                torch.device("cpu"),
+                samples_per_prompt=1,
+                chunk_size=1,
+                max_rounds=4,
+                max_decode_span=8,
+                seed=3,
+                conditional_context_source="gap",
+                skip_round_encoding=skip,
+            )
+            return outputs, backbone.calls - before
+
+        control, control_calls = rollout(False)
+        ablated, ablated_calls = rollout(True)
+        self.assertEqual(control, ablated)
+        self.assertEqual(control_calls, 4)
+        # Round-zero context plus the final parallel fill, and nothing between.
+        self.assertEqual(ablated_calls, 2)
+
+    def test_skipping_round_encoding_requires_a_conditional_context(self):
+        tokenizer, backbone, head, _ = self.build_native_model()
+        vocab = TextVocabulary(
+            len(tokenizer), PAD=1, GAP=9, MASK=9, LEFT=0, RIGHT=2,
+            EXTRA_STRUCTURAL=(3,),
+        )
+        model = PretrainedUnifiedScaffoldModel(
+            vocab.vocab_size,
+            vocab.GAP,
+            vocab.PAD,
+            pretrained_lm_head=head,
+            generated_token_ids=vocab.generated_token_ids,
+            backbone=backbone,
+            pretrained_tokenizer=tokenizer,
+            regimes=1,
+            residual_dim=4,
+            posterior_topk=4,
+            dropout=0.0,
+        )
+        with self.assertRaises(ValueError):
+            sample_unified_scaffolds(
+                model,
+                [TextInfillingExample(((5,), (6,)), ((10, 11),))],
+                vocab,
+                torch.device("cpu"),
+                samples_per_prompt=1,
+                chunk_size=1,
+                max_rounds=4,
+                max_decode_span=8,
+                seed=3,
+                skip_round_encoding=True,
+            )
+
     def test_exact_scaffold_length_dp_tracks_total_progeny(self):
         tokenizer, backbone, _, _ = self.build_native_model()
         model = PretrainedScaffoldTopologyModel(
