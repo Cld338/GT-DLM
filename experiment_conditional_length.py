@@ -14,7 +14,11 @@ from frontier_reencode import (
     initial_region_canvas,
     scaffold_length_distribution,
 )
-from gtdlm.model import PretrainedScaffoldTopologyModel
+from gtdlm.model import (
+    PretrainedLengthMaskedModel,
+    PretrainedScaffoldTopologyModel,
+    PretrainedUnifiedScaffoldModel,
+)
 from gtdlm.text_data import (
     DynamicTextExampleDataset,
     random_length_windows,
@@ -60,7 +64,9 @@ def evaluate(model, examples, vocab, device, args, max_span, max_rounds):
         batch = examples[start : start + args.eval_batch_size]
         tokens, padding = render_prompts(batch, vocab, device)
         targets = length_targets(batch, max_span, device)
-        context = model.prompt_shape_context(tokens, padding)
+        context = model.prompt_shape_context(
+            tokens, padding, source=args.context_source
+        )
         probabilities = conditional_scaffold_length_distribution(
             model, context, max_span, max_rounds=max_rounds
         ).detach()
@@ -100,6 +106,11 @@ def main():
     parser.add_argument(
         "--artifact-dir", default="artifacts/text_conditional_length"
     )
+    parser.add_argument(
+        "--unified-lexical-artifact-dir",
+        default="",
+        help="train the controller on the unified model's actual lexical backbone",
+    )
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
     parser.add_argument("--epochs", type=int, default=4)
     parser.add_argument("--batch-size", type=int, default=16)
@@ -112,6 +123,12 @@ def main():
     parser.add_argument(
         "--residual-init", choices=("output_zero", "gate_zero"),
         default="output_zero",
+    )
+    parser.add_argument(
+        "--context-source",
+        choices=("pooled", "gap"),
+        default="pooled",
+        help="fixed round-zero feature used by the exact conditional chart",
     )
     parser.add_argument("--seed", type=int, default=17)
     args = parser.parse_args()
@@ -145,19 +162,62 @@ def main():
     window_max = int(source_config["random_window_max"])
     data_seed = int(topology_config["data_seed"])
 
-    model = PretrainedScaffoldTopologyModel(
-        vocab.vocab_size,
-        vocab.GAP,
-        vocab.PAD,
-        model_name=str(source_config["model_name"]),
-        cache_dir=str(source_config["cache_dir"]),
-        regimes=int(topology_config["regimes"]),
-        residual_dim=int(topology_config["residual_dim"]),
-        state_feedback=bool(topology_config.get("state_feedback", False)),
-        prompt_conditioned=True,
-        local_files_only=True,
-        pretrained_tokenizer=tokenizer,
-    ).to(device)
+    if args.unified_lexical_artifact_dir:
+        with open(
+            os.path.join(
+                args.unified_lexical_artifact_dir, "results.json"
+            ),
+            encoding="utf-8",
+        ) as handle:
+            lexical_config = json.load(handle)["config"]
+        lexical_model = PretrainedLengthMaskedModel(
+            vocab.vocab_size,
+            int(lexical_config["max_span"]),
+            vocab.GAP,
+            vocab.PAD,
+            tokenizer,
+            model_name=str(lexical_config["model_name"]),
+            cache_dir=str(lexical_config["cache_dir"]),
+            max_length=int(lexical_config["max_length"]),
+            local_files_only=True,
+            native_vocabulary=True,
+        ).to(device)
+        lexical_model.load_state_dict(torch.load(
+            os.path.join(
+                args.unified_lexical_artifact_dir, "masked.pt"
+            ),
+            map_location=device,
+            weights_only=True,
+        ))
+        model = PretrainedUnifiedScaffoldModel(
+            vocab.vocab_size,
+            vocab.GAP,
+            vocab.PAD,
+            pretrained_lm_head=lexical_model.token_head,
+            generated_token_ids=vocab.generated_token_ids,
+            backbone=lexical_model.encoder.backbone,
+            pretrained_tokenizer=tokenizer,
+            regimes=int(topology_config["regimes"]),
+            residual_dim=int(topology_config["residual_dim"]),
+            state_feedback=bool(topology_config.get("state_feedback", False)),
+            prompt_conditioned=True,
+            max_steps=max_rounds,
+            dropout=0.0,
+        ).to(device)
+    else:
+        model = PretrainedScaffoldTopologyModel(
+            vocab.vocab_size,
+            vocab.GAP,
+            vocab.PAD,
+            model_name=str(source_config["model_name"]),
+            cache_dir=str(source_config["cache_dir"]),
+            regimes=int(topology_config["regimes"]),
+            residual_dim=int(topology_config["residual_dim"]),
+            state_feedback=bool(topology_config.get("state_feedback", False)),
+            prompt_conditioned=True,
+            local_files_only=True,
+            pretrained_tokenizer=tokenizer,
+        ).to(device)
     model.load_topology_state_dict(torch.load(
         os.path.join(args.topology_artifact_dir, "topology.pt"),
         map_location=device,
@@ -258,7 +318,9 @@ def main():
             batch = [dynamic[index] for index in indices[start : start + args.batch_size]]
             tokens, padding = render_prompts(batch, vocab, device)
             targets = length_targets(batch, max_span, device)
-            context = model.prompt_shape_context(tokens, padding)
+            context = model.prompt_shape_context(
+                tokens, padding, source=args.context_source
+            )
             probabilities = conditional_scaffold_length_distribution(
                 model, context, max_span, max_rounds=max_rounds
             )
@@ -315,6 +377,10 @@ def main():
             "length_head": False,
             "prompt_conditioned_shape": True,
             "context_fixed_at_round_zero": True,
+            "context_source": args.context_source,
+            "single_backbone_and_lm_head": bool(
+                args.unified_lexical_artifact_dir
+            ),
         },
         "total_parameters": parameter_count(model),
         "trainable_parameters": sum(p.numel() for p in trainable),

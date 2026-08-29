@@ -36,11 +36,33 @@ from gtdlm.text_data import (
 from gtdlm.text_tokenizer import vocabulary_from_pretrained_tokenizer
 
 
+def gap_local_features(hidden, tokens, gap_id):
+    """Read the mask position and its immediate contextual neighbors."""
+    gaps = tokens.eq(gap_id)
+    if not bool(gaps.any(dim=1).all()):
+        raise ValueError("every prompt must contain a gap")
+    positions = gaps.to(torch.long).argmax(dim=1)
+    rows = torch.arange(tokens.size(0), device=tokens.device)
+    left_positions = (positions - 1).clamp_min(0)
+    right_positions = (positions + 1).clamp_max(tokens.size(1) - 1)
+    gap = hidden[rows, positions]
+    left = hidden[rows, left_positions]
+    right = hidden[rows, right_positions]
+    boundary = torch.cat((left, gap, right), dim=-1)
+    boundary_difference = torch.cat(
+        (left, gap, right, left - right), dim=-1
+    )
+    return gap, boundary, boundary_difference
+
+
 @torch.no_grad()
 def encode(model, examples, vocab, device, batch_size, max_span):
-    """Return pooled backbone states, shape contexts, and length targets."""
+    """Return pooled and gap-local states with their length targets."""
     pooled_rows = []
     context_rows = []
+    gap_rows = []
+    boundary_rows = []
+    boundary_difference_rows = []
     target_rows = []
     for start in range(0, len(examples), batch_size):
         batch = examples[start : start + batch_size]
@@ -52,12 +74,21 @@ def encode(model, examples, vocab, device, batch_size, max_span):
         ).last_hidden_state
         observed = (~padding).to(hidden.dtype).unsqueeze(-1)
         pooled = (hidden * observed).sum(1) / observed.sum(1).clamp_min(1.0)
+        gap, boundary, boundary_difference = gap_local_features(
+            hidden, tokens, vocab.GAP
+        )
         pooled_rows.append(pooled.float())
         context_rows.append(model.global_adapter(pooled).float())
+        gap_rows.append(gap.float())
+        boundary_rows.append(boundary.float())
+        boundary_difference_rows.append(boundary_difference.float())
         target_rows.append(length_targets(batch, max_span, device))
     return (
         torch.cat(pooled_rows),
         torch.cat(context_rows),
+        torch.cat(gap_rows),
+        torch.cat(boundary_rows),
+        torch.cat(boundary_difference_rows),
         torch.cat(target_rows),
     )
 
@@ -111,7 +142,8 @@ def main():
         default="artifacts/text_scaffold_topology_feedback_exact",
     )
     parser.add_argument(
-        "--artifact-dir", default="artifacts/text_conditional_length_probe"
+        "--artifact-dir",
+        default="artifacts/text_conditional_length_gap_local_probe",
     )
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
     parser.add_argument("--batch-size", type=int, default=32)
@@ -216,17 +248,23 @@ def main():
         model, max_span, max_rounds=max_rounds
     ).detach()
     shared_nll = {
-        name: float(-shared[values[2]].clamp_min(1e-9).log().mean())
+        name: float(-shared[values[5]].clamp_min(1e-9).log().mean())
         for name, values in encoded.items()
     }
 
     result = {"config": vars(args), "shared_prior_nll": shared_nll, "probes": {}}
-    for label, column in (("pooled_backbone", 0), ("shape_context", 1)):
+    for label, column in (
+        ("pooled_backbone", 0),
+        ("shape_context", 1),
+        ("gap_hidden", 2),
+        ("left_gap_right", 3),
+        ("left_gap_right_difference", 4),
+    ):
         for units in (0, args.probe_hidden):
             probe = fit_probe(
-                (encoded["train"][column], encoded["train"][2]),
-                (encoded["validation"][column], encoded["validation"][2]),
-                (encoded["test"][column], encoded["test"][2]),
+                (encoded["train"][column], encoded["train"][5]),
+                (encoded["validation"][column], encoded["validation"][5]),
+                (encoded["test"][column], encoded["test"][5]),
                 classes,
                 args,
                 device,

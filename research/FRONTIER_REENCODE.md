@@ -601,3 +601,295 @@ then asking whether total progeny can carry it. Until that is done, the
 prompt-independent length law stands as the honest description of this
 architecture, and the exact per-prompt chart is available for the moment the
 input changes.
+
+## Token-conditioned topology (one decision, not two)
+
+The joint frontier model already emits a token at every expansion, but its
+branching heads deliberately did not read that token. Making growth and token
+generation genuinely one decision means conditioning topology on the emitted
+token, so the action at a node is a pair `(token, marker)` with the marker in
+`{close, left, right, both}` — a product with the vocabulary, not a union,
+because every expansion emits exactly one token.
+
+`PretrainedGapFrontierModel` gains `token_conditioned_topology`. A
+zero-initialized projection of the emitted token's embedding is added to the
+structure adapter's input, so the model starts as the token-independent policy
+and the coupling is attributable. Training teacher-forces the gold pivot;
+inference samples the token and recomputes only the small structure adapter, so
+a round still costs one backbone pass.
+
+One detail had to be fixed before any number was trustworthy. The root head
+decides whether the span is empty, and an empty span is exactly the case with
+no gold pivot to feed, so conditioning the root on the token hands it its own
+label through the absence of a token id. Measured, root loss collapsed from
+`0.523` to `0.015` while the feature it exploited cannot exist at inference,
+where a token is always sampled first. The root head is therefore held
+token-independent, which is also the correct generative order: root stop
+precedes emission, and only degree and direction may read the token. After the
+fix root loss returns to `0.523`, matching the control.
+
+Two arms were trained from the same seed, differing only in the coupling, and
+evaluated on 128 prompts with 32 ancestral samples each.
+
+| Metric | Control | Token-conditioned |
+|---|---:|---:|
+| Validation objective | 5.5718 | **5.5650** |
+| Frontier token NLL | 4.3179 | **4.3140** |
+| Degree loss | 0.6760 | **0.6673** |
+| Matched token accuracy, sampled tokens | 5.39% | **6.55%** |
+| Matched token accuracy, greedy tokens | **13.74%** | 11.84% |
+| Matched edit similarity, greedy tokens | **0.179** | 0.157 |
+| Length TV to empirical | 0.235 | **0.230** |
+| Tokens per round | 1.279 | **1.310** |
+
+The token does carry a little information about how to branch: degree loss
+improves by `0.009` nats, which is the quantity the coupling directly targets.
+Everything downstream of that is not robust. Matched token accuracy moves
+`+1.15` points under sampled tokens and `-1.90` points under greedy tokens, so
+the sign of the lexical effect is decided by the decoder rather than by the
+model. Matched-pair counts also differ between arms (`235` against `290`
+sampled, `285` against `297` greedy) because the coupled arm generates slightly
+longer spans, so the two arms are not scored on identical subsets.
+
+The more important comparison is against the split factorization, and it is not
+close. Both joint arms sit at `11.8%`--`13.7%` matched token accuracy where the
+shape-then-lexical scaffold reaches `21.32%` under the same protocol, and both
+carry length TV near `0.23` where the exact-calibrated scaffold reaches
+`0.0718`. Unifying the two decisions costs about eight points of lexical
+accuracy and a factor of three in length calibration, and the coupling does not
+recover either.
+
+Neither arm collapses to a chain (`1.28` and `1.31` tokens per round), so this
+is not the fixed-bank failure returning. It is the plainer result that letting
+one process do both jobs is worse at both of them here, and that the exact
+total-progeny objective — available only when shape is blind to content — is
+what the split buys.
+
+## Marginal-preserving joint actions (works mechanically, coupling is negative)
+
+The token-conditioned arm above has two avoidable defects: it is trained with
+the gold pivot but rolled out with its own token, and its conditional topology
+is free to move the degree marginal that controls length.  The next arm removes
+both.  At every active node it constructs one joint distribution over
+`(token, marker)`, where the four markers are `leaf`, `left`, `right`, and
+`both`.  A learned rank-16 interaction is projected by log-domain Sinkhorn
+scaling so that
+
+```
+sum_marker J(token, marker) = native MLM token marginal
+sum_token  J(token, marker) = existing topology marker marginal.
+```
+
+Training and rollout now use exactly the same joint table; there is no gold
+token fed into a separate structure pass.  The token marginal is detached in
+the coupling loss, so the ordinary token NLL remains its only lexical gradient
+path.  Zero interaction is exactly the independent product.  Three tests cover
+the zero case, both marginals after a nonzero interaction, gradient routing,
+and a one-backbone-pass joint rollout.  The complete suite is 105 tests.
+
+The first end-to-end run trained the MLM, topology marginals, and interaction
+together.  It is not a clean coupling test because its base policy follows a
+different optimization trajectory.  Even so, the interaction fails its direct
+held-out criterion: its independent marker NLL is about `0.7104`, while the
+joint conditional marker NLL is `0.7195`, a `-0.0091` nat coupling gain.
+
+A clean arm then loads the existing control checkpoint, freezes every lexical
+and topology parameter, and trains only the 61,504 interaction parameters.
+This holds the four base validation losses exactly fixed across all epochs.
+
+| Quantity | Frozen control marginal | Best coupling-only epoch |
+|---|---:|---:|
+| Token NLL | 4.3179 | 4.3179 |
+| Root NLL | 0.5230 | 0.5230 |
+| Degree NLL | 0.6760 | 0.6760 |
+| Direction NLL | 0.2196 | 0.2196 |
+| Independent marker NLL | 0.71675 | 0.71675 |
+| Joint conditional marker NLL | 0.71675 at zero interaction | 0.72257 |
+| Held-out coupling gain | 0 | **-0.00582 nats** |
+
+The 4,096-sample rollout is correspondingly inconclusive.  Under the same
+seed and chunking, the frozen-control arm has length TV `0.2261` and matched
+token accuracy `7.39%`; coupling-only gives `0.2244` and `8.41%`.  Those small
+sample-metric moves are not supported by the likelihood criterion and use
+different matched subsets, so they are not evidence for the interaction.
+The end-to-end marginal arm is also below control (`6.83%` matched token
+accuracy and `0.2341` length TV), while greedy tokens give `12.74%` against
+the control's `13.53%`.
+
+One distinction is important.  Sinkhorn preserves the marker marginal at the
+current node and hidden state.  The current frontier shape head still reads an
+evolving scaffold, so correlating a token with its marker can change later
+hidden states and therefore later marker marginals.  Local marginal preservation
+does not by itself prove that the complete total-progeny law is invariant.  A
+global guarantee requires plugging this same joint head into the calibrated
+context-free shape prior.  That integration is now mechanically available,
+but the clean negative coupling gain says not to add its complexity yet: with
+no held-out token/marker association, its selected interaction would be zero
+and it would reduce to the already-kept exact-calibrated unified scaffold.
+
+## Oracle screening redirects coupling to the GAP context
+
+Two oracle probes now separate a missing signal from a weak controller. The
+first asks whether the gold pivot token, not a noisy soft prediction, helps
+predict the node marker after the ordinary structure state is known. It does
+not. On 894 held-out marker records and three probe seeds, adding the gold
+token embedding changes marker NLL by -0.0181 nats for a linear probe and
+-0.0301 nats for an MLP (base NLL minus oracle NLL). Every seed is negative.
+The failed joint heads are therefore not merely suffering from a poor token
+posterior: the artificial midpoint/mixed topology has no robust lexical-marker
+association for them to recover.
+
+The second probe reads fixed round-zero prompt features and predicts the
+corrupted span length. The shared exact prior has test NLL 2.1563.
+
+| Fixed prompt feature | Linear identifiable nats | MLP identifiable nats |
+|---|---:|---:|
+| Sequence mean | -0.0021 | -0.0145 |
+| Old shape context | -0.0015 | +0.0051 |
+| GAP hidden state | **+0.0918** | **+0.0790** |
+| Left/GAP/right | +0.0642 | +0.0413 |
+| Left/GAP/right plus boundary difference | +0.0547 | **+0.0954** |
+
+The bottleneck was thus the sequence-wide pooling operation. The native mask
+state already concentrates the local boundary evidence that the corruption
+length is statistically associated with, while the mean largely erases it.
+
+## GAP-local exact Unified scaffold
+
+The conditional controller now encodes the original prompt once, extracts the
+hidden state at its single native GAP, and keeps that vector fixed during tree
+growth. The exact total-progeny chart and the ancestral rollout both call the
+same conditional shape logits. Length remains the number of emitted tree
+nodes: there is no length head, target-length input, fixed mask bank, or
+preallocated output canvas.
+
+For the Unified variant, the controller is trained on the actual frozen
+lexical baseline backbone. This detail matters: a controller trained on the
+base pretrained backbone and copied onto the fine-tuned lexical backbone sees
+a shifted feature distribution and fails. The aligned variant holds the
+backbone and MLM head fixed, trains only 102,450 shape parameters, and uses the
+same model instance for growth and the final parallel MLM fill. Token
+posteriors do not steer topology; the gold-token oracle above says that path
+should stay gated off.
+
+The exact held-out chart improves length NLL from 2.1563 to 1.8961, or +0.2602
+identifiable nats. Test argmax length accuracy is 29.69%, and the mean
+conditional distribution has TV 0.0577 to the test histogram.
+
+The matched 128-prompt, 32-sample rollout gives:
+
+| Unified model | Length match | Conditional Brier | Marginal TV | Matched token accuracy | Matched edit | Expected edit |
+|---|---:|---:|---:|---:|---:|---:|
+| Exact-init, prompt blind | 11.30% | 0.9203 | 0.0742 | **21.04%** | **0.2628** | 0.1304 |
+| Fixed GAP-context shape | **23.02%** | **0.7959** | **0.0620** | 19.61% | 0.2525 | **0.1497** |
+
+There are no unfinished samples. Mean length is 3.541 against target 3.586,
+and mean shape depth is 2.819 rounds. The conditional controller more than
+doubles per-prompt length matching while slightly improving marginal
+calibration. Matched-subset lexical accuracy falls by 1.43 points, but the MLM
+parameters are unchanged and overall expected edit similarity improves because
+far more samples have the right length. This is the first direction here that
+adds prompt dependence, keeps the unknown-length generative advantage, works
+inside one Unified MLM, and improves the main conditional generation metrics.
+
+The next controlled work should be multi-seed replication and a small
+marginal-calibration penalty or post-hoc bias fit. Token-to-marker coupling
+should remain off unless a future natural topology produces a positive
+gold-token oracle gain.
+
+## Monte-Carlo length calibration for the joint family
+
+The joint frontier model has no exact chart to calibrate against: its branching
+reads the evolving canvas, and with the coupling on it also reads the token it
+just emitted, so the process is not context-free and total progeny has no closed
+form. `calibrate_frontier_length.py` fits the same kind of additive logit biases
+the scaffold calibrates — a root bias plus depth-indexed degree biases, seven
+search parameters — against the training length histogram, estimating the length
+law by rollout. A fixed rollout seed makes the objective deterministic so the
+coordinate search compares paired estimates rather than sampling noise. The
+search uses validation prompts only; test is scored once at the end.
+
+| Arm | Validation TV | Test TV | Matched token accuracy | Mean length |
+|---|---:|---:|---:|---:|
+| Control, uncalibrated | 0.198 | 0.239 | 13.53% | 2.659 |
+| Control, calibrated | **0.148** | **0.201** | 10.97% | 3.970 |
+| Coupled, uncalibrated | 0.210 | **0.231** | **12.67%** | 2.827 |
+| Coupled, calibrated | 0.185 | 0.238 | 8.01% | 4.644 |
+
+Calibration does not rescue the joint family, and it is not free. The control
+gains `0.038` test TV; the coupled arm gains `0.025` on validation and then
+*loses* `0.007` on test, so its calibration does not transfer at all. Both arms
+pay for whatever they gain in lexical accuracy, `-2.6` and `-4.7` points, and
+the mechanism is visible in the mean length: matching the target's mass at
+longer spans pushes generations from about `2.7` to about `4.0`--`4.6` tokens,
+and longer spans are harder to match token by token.
+
+The best length calibration reachable anywhere in the joint family is therefore
+`0.201`, against the exact-calibrated scaffold's `0.0718` — still worse by a
+factor of about three, now with a lexical cost attached. This closes the
+question the split-versus-joint comparison left open: the scaffold's length
+advantage is not an artifact of the joint arms being uncalibrated.
+
+Two limits on this result. The search plateaued after one sweep in both arms,
+with the halved grid finding nothing further, which at `512` rollouts per
+evaluation may be noise-limited rather than converged; a larger sample budget or
+a richer bias family could do better. And the uncalibrated rows here read
+`12.67%` and `13.53%` where the previous section's greedy evaluation of the same
+checkpoints read `11.84%` and `13.74%`, the difference being the rollout seed
+alone. That `0.8`--`0.9` point spread is most of the coupled-versus-control gap
+being discussed, and is the reason no lexical ranking within this family is
+claimed.
+
+## Seed replication and backbone scale for the GAP-local scaffold
+
+The previous section left the GAP-local conditional controller resting on one
+training seed and one backbone. Both are now varied. Three controller seeds
+(`17`, `23`, `41`) were trained at identical settings on each of two frozen
+lexical backbones, and every checkpoint was rolled out under the same protocol
+as before: 128 test prompts, 32 ancestral samples each, rollout seed `1901`.
+Only the shape controller's seed varies; the masked lexical backbone underneath
+each family is a single seed-17 checkpoint, so this replicates the controller,
+not the whole stack.
+
+| Backbone | Seeds | Identifiable nats | Matched token accuracy | Length match | Marginal TV | Conditional Brier | Expected edit |
+|---|---|---:|---:|---:|---:|---:|---:|
+| distilroberta | 17/23/41 | `0.2512+/-0.0079` | `20.34%+/-0.63` | `22.72%+/-0.67` | `0.0733+/-0.0165` | `0.795` | `0.1513+/-0.0025` |
+| roberta-base | 17/23/41 | `0.3137+/-0.0062` | `29.39%+/-0.96` | `24.83%+/-0.20` | `0.0674+/-0.0164` | `0.770` | `0.2074+/-0.0030` |
+
+The conditional length result replicates cleanly. Every seed is positive on
+held-out identifiable nats, and the two backbone families do not overlap:
+`+0.0625` nats separates them against a within-family spread of `0.006`--`0.008`.
+The GAP-local diagnosis therefore does not depend on the particular encoder that
+motivated it, and the signal grows with the encoder rather than saturating.
+Four times the training data was also run at seed 17 and gave `0.2499` test
+nats against `0.2602`, so what the controller is short of is encoder access, not
+examples — the same conclusion the pooled-probe result reached from the other
+side.
+
+The generation comparison is the one that changes a claim. Against each
+family's own oracle-length masked baseline:
+
+| Backbone | Scaffold matched accuracy | Oracle-length baseline | Seeds above baseline |
+|---|---:|---:|---:|
+| distilroberta | `20.34%+/-0.63` | `20.04%` | 2/3 |
+| roberta-base | `29.39%+/-0.96` | `27.45%` | 3/3 |
+
+At distilroberta the earlier single-seed reading of `19.61%` against `20.04%`
+was inside seed noise; three seeds make it a tie, not a `1.43` point deficit.
+At roberta-base the same architecture is `1.94` points ahead with all three
+seeds above the baseline's value. A model that is never told the target length
+matches, then beats, a baseline that is handed it — and the margin appears only
+at the larger encoder.
+
+Two limits keep this from being a generation claim. The comparison is on the
+length-matched subset (`416`--`421` of `4096` samples), which is selected, while
+the baseline is scored on all `128` oracle-length prompts; the unbiased view is
+expected edit similarity, where the scaffold is `0.2074` against the baseline's
+`0.3280` because only about a quarter of its samples hit the target length. And
+each family's baseline is a single checkpoint, so the `+1.94` points is three
+scaffold seeds against one baseline point estimate, not a paired comparison.
+
+What replication does establish is the ordering of the two effects. Backbone
+scale moves matched accuracy by `9.05` points and controller seed by `0.96`;
+the conditional-length gain moves by `0.063` nats between backbones and `0.008`
+within one. Both headline effects are an order of magnitude above their noise.

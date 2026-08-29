@@ -32,6 +32,12 @@ from gtdlm.text_tokenizer import vocabulary_from_pretrained_tokenizer
 
 
 def combined_loss(losses, args):
+    if args.marginal_preserving_joint:
+        return (
+            losses["token"]
+            + args.root_weight * losses["root"]
+            + args.degree_weight * losses["joint"]
+        )
     return (
         losses["token"]
         + args.root_weight * losses["root"]
@@ -48,7 +54,12 @@ def evaluate_frontiers(model, dataset, vocab, device, batch_size, args):
         shuffle=False,
         collate_fn=partial(collate_compact_frontiers, pad_id=vocab.PAD),
     )
-    totals = {name: 0.0 for name in ("token", "root", "degree", "direction")}
+    totals = {
+        name: 0.0
+        for name in (
+            "token", "root", "degree", "direction", "marker", "joint"
+        )
+    }
     counts = {name: 0 for name in totals}
     model.eval()
     for batch in loader:
@@ -61,12 +72,22 @@ def evaluate_frontiers(model, dataset, vocab, device, batch_size, args):
         name + "_nll": totals[name] / max(1, counts[name])
         for name in totals
     }
-    result["objective"] = (
-        result["token_nll"]
-        + args.root_weight * result["root_nll"]
-        + args.degree_weight * result["degree_nll"]
-        + args.direction_weight * result["direction_nll"]
-    )
+    if args.marginal_preserving_joint:
+        result["objective"] = (
+            result["token_nll"]
+            + args.root_weight * result["root_nll"]
+            + args.degree_weight * result["joint_nll"]
+        )
+        result["coupling_gain_nats"] = (
+            result["marker_nll"] - result["joint_nll"]
+        )
+    else:
+        result["objective"] = (
+            result["token_nll"]
+            + args.root_weight * result["root_nll"]
+            + args.degree_weight * result["degree_nll"]
+            + args.direction_weight * result["direction_nll"]
+        )
     result["counts"] = counts
     return result
 
@@ -83,12 +104,17 @@ def train(model, source, validation, vocab, device, args):
         for parameter in model.parameters()
         if id(parameter) not in backbone_ids and parameter.requires_grad
     ]
+    parameter_groups = []
+    if backbone_parameters:
+        parameter_groups.append({
+            "params": backbone_parameters, "lr": args.backbone_lr
+        })
+    if head_parameters:
+        parameter_groups.append({
+            "params": head_parameters, "lr": args.head_lr
+        })
     optimizer = torch.optim.AdamW(
-        [
-            {"params": backbone_parameters, "lr": args.backbone_lr},
-            {"params": head_parameters, "lr": args.head_lr},
-        ],
-        weight_decay=args.weight_decay,
+        parameter_groups, weight_decay=args.weight_decay
     )
     steps_per_epoch = math.ceil(len(source) / args.batch_size)
     total_steps = max(1, steps_per_epoch * args.epochs)
@@ -113,6 +139,10 @@ def train(model, source, validation, vocab, device, args):
             collate_fn=partial(collate_compact_frontiers, pad_id=vocab.PAD),
         )
         model.train()
+        if args.joint_only:
+            model.backbone.eval()
+            model.token_head.eval()
+            model.structure_adapter.eval()
         running = 0.0
         seen = 0
         for batch in loader:
@@ -125,6 +155,14 @@ def train(model, source, validation, vocab, device, args):
             with autocast:
                 losses = frontier_losses(model, batch, vocab, device)
                 loss = combined_loss(losses, args)
+            batch_size = int(batch["tokens"].size(0))
+            running += float(loss.detach()) * batch_size
+            seen += batch_size
+            # A joint-only batch can contain only empty roots and therefore no
+            # token/marker pair. All contributing base terms are frozen, so
+            # there is intentionally no coupling gradient or optimizer step.
+            if not loss.requires_grad:
+                continue
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -135,9 +173,6 @@ def train(model, source, validation, vocab, device, args):
             # the learning-rate schedule aligned with actual parameter updates.
             if scaler.get_scale() >= previous_scale:
                 scheduler.step()
-            batch_size = int(batch["tokens"].size(0))
-            running += float(loss.detach()) * batch_size
-            seen += batch_size
 
         validation_metrics = evaluate_frontiers(
             model, validation, vocab, device, args.eval_batch_size, args
@@ -248,6 +283,12 @@ def main():
         action="store_false",
         dest="detach_structure_encoder",
     )
+    parser.add_argument("--token-conditioned-topology", action="store_true")
+    parser.add_argument("--marginal-preserving-joint", action="store_true")
+    parser.add_argument("--joint-rank", type=int, default=32)
+    parser.add_argument("--joint-sinkhorn-iterations", type=int, default=12)
+    parser.add_argument("--initial-checkpoint", default="")
+    parser.add_argument("--joint-only", action="store_true")
     parser.add_argument(
         "--no-mixed-precision",
         action="store_false",
@@ -255,6 +296,13 @@ def main():
     )
     parser.set_defaults(mixed_precision=True, detach_structure_encoder=True)
     args = parser.parse_args()
+    if args.token_conditioned_topology and args.marginal_preserving_joint:
+        parser.error(
+            "--token-conditioned-topology and --marginal-preserving-joint "
+            "are mutually exclusive"
+        )
+    if args.joint_only and not args.marginal_preserving_joint:
+        parser.error("--joint-only requires --marginal-preserving-joint")
     if not 0.0 <= args.midpoint_probability <= 1.0:
         parser.error("--midpoint-probability must be in [0,1]")
 
@@ -332,10 +380,38 @@ def main():
         random_init_backbone=args.random_init_backbone,
         pretrained_tokenizer=tokenizer,
         detach_structure_encoder=args.detach_structure_encoder,
+        token_conditioned_topology=args.token_conditioned_topology,
+        marginal_preserving_joint=args.marginal_preserving_joint,
+        joint_rank=args.joint_rank,
+        joint_sinkhorn_iterations=args.joint_sinkhorn_iterations,
     ).to(device)
+    if args.initial_checkpoint:
+        state = torch.load(
+            args.initial_checkpoint, map_location=device, weights_only=True
+        )
+        missing, unexpected = model.load_state_dict(state, strict=False)
+        invalid_missing = [
+            name for name in missing if not name.startswith("joint_")
+        ]
+        if invalid_missing or unexpected:
+            raise RuntimeError(
+                "incompatible initial checkpoint: missing={} unexpected={}".format(
+                    invalid_missing, unexpected
+                )
+            )
+    if args.joint_only:
+        for parameter in model.parameters():
+            parameter.requires_grad_(False)
+        for name, parameter in model.named_parameters():
+            if name.startswith("joint_"):
+                parameter.requires_grad_(True)
     print(
-        "device={} train_documents={} parameters={} d_model={}".format(
-            device, len(source), parameter_count(model), model.d_model
+        "device={} train_documents={} parameters={} trainable={} d_model={}".format(
+            device,
+            len(source),
+            parameter_count(model),
+            sum(p.numel() for p in model.parameters() if p.requires_grad),
+            model.d_model,
         ),
         flush=True,
     )
@@ -370,7 +446,11 @@ def main():
             "training_seed": training_seed,
             "random_window_min": window_min,
             "random_window_max": window_max,
-            "objective": "balanced_dynamic_frontier_joint",
+            "objective": (
+                "marginal_preserving_dynamic_frontier_joint"
+                if args.marginal_preserving_joint
+                else "balanced_dynamic_frontier_joint"
+            ),
             "target_length_input": False,
             "preallocated_canvas": False,
         },

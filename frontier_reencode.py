@@ -813,10 +813,20 @@ def frontier_losses(
     position_weights = sample_weights.unsqueeze(1).expand_as(tokens)
     degree_targets, direction_targets = topology_targets(left, right)
 
-    token_logits, root_stop, degree_logits, direction_logits, _ = model(
-        tokens, padding, steps
-    )
     token_valid = targets.ge(0) & targets.lt(vocab.vocab_size)
+    # Teacher-force the gold pivot into the branching heads when the model
+    # treats emitting a token and growing the tree as one decision.
+    structure_token_ids = (
+        torch.where(token_valid, targets, torch.full_like(targets, -1))
+        if getattr(model, "token_conditioned_topology", False)
+        else None
+    )
+    outputs = (
+        model(tokens, padding, steps, structure_token_ids)
+        if structure_token_ids is not None
+        else model(tokens, padding, steps)
+    )
+    token_logits, root_stop, degree_logits, direction_logits, _ = outputs
     root_valid = tokens.eq(vocab.GAP) & steps.unsqueeze(1).eq(0)
     root_targets = targets.eq(vocab.stop_action).to(root_stop.dtype)
     degree_valid = degree_targets.ge(0) & token_valid
@@ -875,15 +885,95 @@ def frontier_losses(
         if bool(direction_valid.any())
         else zero
     )
+    if bool(degree_valid.any()):
+        node_degree = degree_targets[degree_valid]
+        node_direction = direction_targets[degree_valid]
+        marker_targets = torch.where(
+            node_degree.eq(0),
+            torch.zeros_like(node_degree),
+            torch.where(
+                node_degree.eq(2),
+                torch.full_like(node_degree, 3),
+                1 + node_direction,
+            ),
+        )
+        node_degree_logp = degree_logits[degree_valid].log_softmax(dim=-1)
+        node_direction_logp = direction_logits[degree_valid].log_softmax(dim=-1)
+        independent_marker_logp = torch.stack((
+            node_degree_logp[..., 0],
+            node_degree_logp[..., 1] + node_direction_logp[..., 0],
+            node_degree_logp[..., 1] + node_direction_logp[..., 1],
+            node_degree_logp[..., 2],
+        ), dim=-1)
+        marker_terms = F.nll_loss(
+            independent_marker_logp,
+            marker_targets,
+            reduction="none",
+        )
+        marker_weights = position_weights[degree_valid]
+        marker_loss = (
+            marker_terms * marker_weights
+        ).sum() / marker_weights.sum().clamp_min(1.0)
+        marker_count = degree_valid.sum()
+    else:
+        marker_loss = zero
+        marker_count = torch.zeros((), dtype=torch.long, device=device)
+    if getattr(model, "marginal_preserving_joint", False) and bool(
+        degree_valid.any()
+    ):
+        generated_ids = torch.tensor(
+            vocab.generated_token_ids, dtype=torch.long, device=device
+        )
+        token_to_generated = torch.full(
+            (vocab.vocab_size,), -1, dtype=torch.long, device=device
+        )
+        token_to_generated[generated_ids] = torch.arange(
+            generated_ids.numel(), device=device
+        )
+        node_steps = steps.unsqueeze(1).expand_as(tokens)[degree_valid]
+        joint_logp = model.joint_action_log_probs(
+            # The separate token loss is the only lexical gradient path. The
+            # copula learns association without pulling the MLM marginal.
+            token_logits[degree_valid].detach(),
+            degree_logits[degree_valid],
+            direction_logits[degree_valid],
+            outputs[-1][degree_valid],
+            node_steps,
+            generated_ids,
+        )
+        token_indices = token_to_generated[targets[degree_valid]]
+        if bool(token_indices.lt(0).any()):
+            raise ValueError("frontier target is outside generated vocabulary")
+        rows = torch.arange(token_indices.numel(), device=device)
+        gold_joint = joint_logp[
+            rows, token_indices, marker_targets
+        ]
+        allowed_logp = token_logits[degree_valid].detach().index_select(
+            -1, generated_ids
+        ).log_softmax(dim=-1)
+        gold_token = allowed_logp[rows, token_indices]
+        joint_terms = -(gold_joint - gold_token)
+        joint_weights = position_weights[degree_valid]
+        joint_loss = (
+            joint_terms * joint_weights
+        ).sum() / joint_weights.sum().clamp_min(1.0)
+        joint_count = degree_valid.sum()
+    else:
+        joint_loss = zero
+        joint_count = torch.zeros((), dtype=torch.long, device=device)
     return {
         "token": token_loss,
         "root": root_loss,
         "degree": degree_loss,
         "direction": direction_loss,
+        "marker": marker_loss,
+        "joint": joint_loss,
         "token_count": token_valid.sum(),
         "root_count": root_valid.sum(),
         "degree_count": degree_valid.sum(),
         "direction_count": direction_valid.sum(),
+        "marker_count": marker_count,
+        "joint_count": joint_count,
     }
 
 
@@ -950,11 +1040,50 @@ def decode_frontier_model(
             tokens[row, : len(raw)] = torch.tensor(raw, device=device)
             padding[row, : len(raw)] = False
 
-        token_logits, root_stop, degree_logits, direction_logits, _ = model(
+        token_logits, root_stop, degree_logits, direction_logits, hidden = model(
             tokens, padding, steps
         )
         allowed = token_logits.index_select(-1, generated_ids)
-        if stochastic and sample_tokens:
+        joint_markers = None
+        if getattr(model, "marginal_preserving_joint", False):
+            gap_mask = tokens.eq(vocab.GAP) & ~padding
+            gap_steps = steps.unsqueeze(1).expand_as(tokens)[gap_mask]
+            joint_logp = model.joint_action_log_probs(
+                token_logits[gap_mask],
+                degree_logits[gap_mask],
+                direction_logits[gap_mask],
+                hidden[gap_mask],
+                gap_steps,
+                generated_ids,
+            )
+            chosen_device = generated_ids[allowed.argmax(dim=-1)]
+            joint_markers_device = torch.zeros_like(tokens)
+            nodes = int(gap_mask.sum())
+            if stochastic and sample_tokens:
+                samples = torch.multinomial(
+                    joint_logp.exp().reshape(nodes, -1),
+                    1,
+                    generator=generator,
+                ).squeeze(-1)
+                token_indices = torch.div(samples, 4, rounding_mode="floor")
+                marker_values = samples.remainder(4)
+            elif stochastic:
+                token_indices = allowed[gap_mask].argmax(dim=-1)
+                rows = torch.arange(nodes, device=device)
+                marker_values = torch.multinomial(
+                    joint_logp[rows, token_indices].softmax(dim=-1),
+                    1,
+                    generator=generator,
+                ).squeeze(-1)
+            else:
+                samples = joint_logp.reshape(nodes, -1).argmax(dim=-1)
+                token_indices = torch.div(samples, 4, rounding_mode="floor")
+                marker_values = samples.remainder(4)
+            chosen_device[gap_mask] = generated_ids[token_indices]
+            joint_markers_device[gap_mask] = marker_values
+            chosen = chosen_device.cpu()
+            joint_markers = joint_markers_device.cpu()
+        elif stochastic and sample_tokens:
             token_probabilities = allowed.softmax(dim=-1)
             token_samples = torch.multinomial(
                 token_probabilities.reshape(-1, token_probabilities.size(-1)),
@@ -964,6 +1093,18 @@ def decode_frontier_model(
             chosen = generated_ids[token_samples].cpu()
         else:
             chosen = generated_ids[allowed.argmax(dim=-1)].cpu()
+        if getattr(model, "token_conditioned_topology", False):
+            # The node decides how to branch after seeing what it just emitted,
+            # which needs no second backbone pass: only the small structure
+            # adapter is recomputed.
+            structure_token_ids = torch.full_like(tokens, -1)
+            emitted = tokens.eq(vocab.GAP)
+            structure_token_ids[emitted] = chosen.to(device)[emitted]
+            root_stop, degree_logits, direction_logits = (
+                model.structure_logits_from_hidden(
+                    hidden, steps, structure_token_ids
+                )
+            )
         if stochastic:
             stop = (
                 torch.rand(
@@ -973,22 +1114,35 @@ def decode_frontier_model(
                 )
                 < root_stop.sigmoid()
             ).cpu()
-            degree_probabilities = degree_logits.softmax(dim=-1)
-            degree = torch.multinomial(
-                degree_probabilities.reshape(-1, 3),
-                1,
-                generator=generator,
-            ).reshape(degree_probabilities.shape[:-1]).cpu()
-            direction_probabilities = direction_logits.softmax(dim=-1)
-            direction = torch.multinomial(
-                direction_probabilities.reshape(-1, 2),
-                1,
-                generator=generator,
-            ).reshape(direction_probabilities.shape[:-1]).cpu()
+            if joint_markers is None:
+                degree_probabilities = degree_logits.softmax(dim=-1)
+                degree = torch.multinomial(
+                    degree_probabilities.reshape(-1, 3),
+                    1,
+                    generator=generator,
+                ).reshape(degree_probabilities.shape[:-1]).cpu()
+                direction_probabilities = direction_logits.softmax(dim=-1)
+                direction = torch.multinomial(
+                    direction_probabilities.reshape(-1, 2),
+                    1,
+                    generator=generator,
+                ).reshape(direction_probabilities.shape[:-1]).cpu()
         else:
             stop = root_stop.gt(0).cpu()
-            degree = degree_logits.argmax(dim=-1).cpu()
-            direction = direction_logits.argmax(dim=-1).cpu()
+            if joint_markers is None:
+                degree = degree_logits.argmax(dim=-1).cpu()
+                direction = direction_logits.argmax(dim=-1).cpu()
+        if joint_markers is not None:
+            degree = torch.where(
+                joint_markers.eq(0),
+                torch.zeros_like(joint_markers),
+                torch.where(
+                    joint_markers.eq(3),
+                    torch.full_like(joint_markers, 2),
+                    torch.ones_like(joint_markers),
+                ),
+            )
+            direction = joint_markers.eq(2).to(torch.long)
 
         for row, index in enumerate(active):
             expanded: List[Tuple[int, int]] = []
@@ -1110,6 +1264,7 @@ def sample_frontier_scaffolds(
     markov_regime: bool = False,
     return_codes: bool = False,
     return_states: bool = False,
+    conditional_context_source: Optional[str] = None,
 ):
     """Sample topology while keeping every emitted token as a native mask slot.
 
@@ -1123,6 +1278,10 @@ def sample_frontier_scaffolds(
         raise ValueError("persistent and Markov regimes are mutually exclusive")
     if return_codes and return_states:
         raise ValueError("return only one semantic representation")
+    if conditional_context_source is not None and (
+        persistent_regime or markov_regime
+    ):
+        raise ValueError("conditional context uses an independent regime per round")
     if any(len(example.spans) != 1 for example in examples):
         raise ValueError("scaffold evaluation currently requires one gap")
     lengths: List[List[int]] = [[] for _ in examples]
@@ -1160,6 +1319,31 @@ def sample_frontier_scaffolds(
             )
             canvas.append((vocab.RIGHT, -1, False, -1, None))
             canvases.append(canvas)
+        fixed_context = None
+        if conditional_context_source is not None:
+            if bool(getattr(model, "semantic_codes", 0)) or bool(
+                getattr(model, "continuous_semantic", False)
+            ):
+                raise ValueError("conditional scaffold does not use semantic slots")
+            width = max(len(canvas) for canvas in canvases)
+            prompt_tokens = torch.full(
+                (len(canvases), width),
+                vocab.PAD,
+                dtype=torch.long,
+                device=device,
+            )
+            prompt_padding = torch.ones_like(prompt_tokens, dtype=torch.bool)
+            for row, canvas in enumerate(canvases):
+                values = [token for token, _, _, _, _ in canvas]
+                prompt_tokens[row, : len(values)] = torch.tensor(
+                    values, device=device
+                )
+                prompt_padding[row, : len(values)] = False
+            fixed_context = model.prompt_shape_context(
+                prompt_tokens,
+                prompt_padding,
+                source=conditional_context_source,
+            )
         rounds = [0] * len(batch)
         unfinished = [False] * len(batch)
         persistent_regimes = [-1] * len(batch)
@@ -1221,7 +1405,59 @@ def sample_frontier_scaffolds(
                             slot_semantics[row, position] = state.to(device)
             semantic_codes = None
             semantic_states = None
-            if hasattr(model, "sample_structure"):
+            if conditional_context_source is not None:
+                stops = torch.zeros_like(tokens, dtype=torch.bool)
+                degrees = torch.zeros_like(tokens)
+                directions = torch.zeros_like(tokens)
+                sampled_regimes = torch.zeros(
+                    len(active), dtype=torch.long, device=device
+                )
+                for row, index in enumerate(active):
+                    open_count = int(open_mask[row].sum())
+                    completed_count = sum(
+                        region >= 0 and not is_gap
+                        for _, region, is_gap, _, _ in canvases[index]
+                    )
+                    root, regime, degree, direction = (
+                        model.conditional_shape_logits(
+                            fixed_context[index : index + 1],
+                            rounds[index],
+                            open_count,
+                            completed_count,
+                        )
+                    )
+                    regime_index = int(torch.multinomial(
+                        regime[0].softmax(dim=-1),
+                        1,
+                        generator=generator,
+                    ))
+                    sampled_regimes[row] = regime_index
+                    positions = open_mask[row].nonzero().flatten()
+                    if rounds[index] == 0:
+                        stop = torch.rand((), device=device, generator=generator)
+                        stops[row, positions] = stop < root[0].sigmoid()
+                    degree_probability = degree[
+                        0, regime_index
+                    ].softmax(dim=-1)
+                    direction_probability = direction[
+                        0, regime_index
+                    ].softmax(dim=-1)
+                    degrees[row, positions] = torch.multinomial(
+                        degree_probability,
+                        positions.numel(),
+                        replacement=True,
+                        generator=generator,
+                    )
+                    directions[row, positions] = torch.multinomial(
+                        direction_probability,
+                        positions.numel(),
+                        replacement=True,
+                        generator=generator,
+                    )
+                stops = stops.cpu()
+                degrees = degrees.cpu()
+                directions = directions.cpu()
+            elif hasattr(model, "sample_structure"):
                 previous = torch.tensor(
                     [persistent_regimes[index] for index in active],
                     dtype=torch.long,
@@ -1399,6 +1635,7 @@ def sample_unified_scaffolds(
     max_rounds: int = 16,
     max_decode_span: int = 16,
     seed: int = 1901,
+    conditional_context_source: Optional[str] = None,
 ) -> Tuple[List[List[List[int]]], List[List[int]], List[List[bool]]]:
     """Grow shape and token beliefs together, then decode in parallel.
 
@@ -1441,6 +1678,27 @@ def sample_unified_scaffolds(
             )
             canvas.append((vocab.RIGHT, -1, False, None))
             canvases.append(canvas)
+        fixed_context = None
+        if conditional_context_source is not None:
+            width = max(len(canvas) for canvas in canvases)
+            prompt_tokens = torch.full(
+                (len(canvases), width),
+                vocab.PAD,
+                dtype=torch.long,
+                device=device,
+            )
+            prompt_padding = torch.ones_like(prompt_tokens, dtype=torch.bool)
+            for row, canvas in enumerate(canvases):
+                values = [token for token, _, _, _ in canvas]
+                prompt_tokens[row, : len(values)] = torch.tensor(
+                    values, device=device
+                )
+                prompt_padding[row, : len(values)] = False
+            fixed_context = model.prompt_shape_context(
+                prompt_tokens,
+                prompt_padding,
+                source=conditional_context_source,
+            )
         rounds = [0] * len(batch)
         unfinished = [False] * len(batch)
 
@@ -1482,15 +1740,63 @@ def sample_unified_scaffolds(
                     if state is not None:
                         slot_semantics[row, position] = state.to(device)
 
-            sampled = model.sample_unified_structure(
-                tokens,
-                padding,
-                steps,
-                open_mask,
-                slot_semantics=slot_semantics,
-                generator=generator,
-            )
-            stops, degrees, directions, _, posterior_states = sampled[:5]
+            if conditional_context_source is None:
+                sampled = model.sample_unified_structure(
+                    tokens,
+                    padding,
+                    steps,
+                    open_mask,
+                    slot_semantics=slot_semantics,
+                    generator=generator,
+                )
+                stops, degrees, directions, _, posterior_states = sampled[:5]
+            else:
+                token_logits = model.unified_logits(
+                    tokens,
+                    padding,
+                    steps,
+                    open_mask,
+                    slot_semantics=slot_semantics,
+                )[0]
+                posterior_states = model.posterior_states(token_logits)
+                stops = torch.zeros_like(tokens, dtype=torch.bool)
+                degrees = torch.zeros_like(tokens)
+                directions = torch.zeros_like(tokens)
+                for row, index in enumerate(active):
+                    open_count = int(open_mask[row].sum())
+                    completed_count = sum(
+                        region >= 0 and not is_open
+                        for _, region, is_open, _ in canvases[index]
+                    )
+                    root, regime, degree, direction = (
+                        model.conditional_shape_logits(
+                            fixed_context[index : index + 1],
+                            rounds[index],
+                            open_count,
+                            completed_count,
+                        )
+                    )
+                    regime_index = int(torch.multinomial(
+                        regime[0].softmax(dim=-1),
+                        1,
+                        generator=generator,
+                    ))
+                    positions = open_mask[row].nonzero().flatten()
+                    if rounds[index] == 0:
+                        stop = torch.rand((), device=device, generator=generator)
+                        stops[row, positions] = stop < root[0].sigmoid()
+                    degrees[row, positions] = torch.multinomial(
+                        degree[0, regime_index].softmax(dim=-1),
+                        positions.numel(),
+                        replacement=True,
+                        generator=generator,
+                    )
+                    directions[row, positions] = torch.multinomial(
+                        direction[0, regime_index].softmax(dim=-1),
+                        positions.numel(),
+                        replacement=True,
+                        generator=generator,
+                    )
             stops = stops.cpu()
             degrees = degrees.cpu()
             directions = directions.cpu()

@@ -1047,8 +1047,18 @@ class PretrainedGapFrontierModel(nn.Module):
         pretrained_tokenizer=None,
         pretrained_lm_head=None,
         detach_structure_encoder: bool = True,
+        token_conditioned_topology: bool = False,
+        marginal_preserving_joint: bool = False,
+        joint_rank: int = 32,
+        joint_sinkhorn_iterations: int = 12,
     ) -> None:
         super().__init__()
+        if token_conditioned_topology and marginal_preserving_joint:
+            raise ValueError(
+                "token-conditioned and marginal-preserving coupling are exclusive"
+            )
+        if joint_rank < 1 or joint_sinkhorn_iterations < 1:
+            raise ValueError("joint rank and Sinkhorn iterations must be positive")
         if backbone is None or pretrained_lm_head is None:
             from transformers import (
                 AutoConfig,
@@ -1111,6 +1121,47 @@ class PretrainedGapFrontierModel(nn.Module):
         self.root_stop_head = nn.Linear(d_model, 1)
         self.degree_head = nn.Linear(d_model, 3)
         self.direction_head = nn.Linear(d_model, 2)
+        # Growing the tree and emitting a token become one decision when the
+        # branching heads read the token the node just emitted.  The projection
+        # is zero-initialized, so the model starts as the token-independent
+        # frontier policy and any difference is attributable to the coupling.
+        # Held-out length calibration lives outside the policy, as it does for
+        # the scaffold model.  These are non-persistent so every checkpoint
+        # written before calibration existed still loads strictly.
+        self.register_buffer(
+            "calibration_root_bias", torch.zeros(()), persistent=False
+        )
+        self.register_buffer(
+            "calibration_degree_bias",
+            torch.zeros(max_steps, 3),
+            persistent=False,
+        )
+        self.token_conditioned_topology = bool(token_conditioned_topology)
+        self.token_condition = (
+            nn.Linear(d_model, d_model, bias=False)
+            if self.token_conditioned_topology
+            else None
+        )
+        if self.token_condition is not None:
+            nn.init.zeros_(self.token_condition.weight)
+        self.marginal_preserving_joint = bool(marginal_preserving_joint)
+        self.joint_rank = int(joint_rank)
+        self.joint_sinkhorn_iterations = int(joint_sinkhorn_iterations)
+        self.joint_token_projection = (
+            nn.Linear(d_model, self.joint_rank, bias=False)
+            if self.marginal_preserving_joint
+            else None
+        )
+        self.joint_marker_projection = (
+            nn.Linear(d_model, 4 * self.joint_rank)
+            if self.marginal_preserving_joint
+            else None
+        )
+        if self.joint_marker_projection is not None:
+            # Zero interaction gives the independent product of the native MLM
+            # marginal and the existing marker marginal exactly at init.
+            nn.init.zeros_(self.joint_marker_projection.weight)
+            nn.init.zeros_(self.joint_marker_projection.bias)
 
         if gradient_checkpointing:
             self.backbone.gradient_checkpointing_enable()
@@ -1122,25 +1173,20 @@ class PretrainedGapFrontierModel(nn.Module):
     def d_model(self) -> int:
         return int(self.backbone.config.hidden_size)
 
-    def forward(
+    def structure_logits_from_hidden(
         self,
-        tokens: torch.Tensor,
-        padding_mask: Optional[torch.Tensor] = None,
-        steps: Optional[torch.Tensor] = None,
+        hidden: torch.Tensor,
+        steps: torch.Tensor,
+        structure_token_ids: Optional[torch.Tensor] = None,
     ):
-        if padding_mask is None:
-            padding_mask = tokens.eq(self.pad_id)
-        if steps is None:
-            steps = torch.zeros(
-                tokens.size(0), dtype=torch.long, device=tokens.device
-            )
-        steps = steps.clamp(0, self.step_embedding.num_embeddings - 1)
-        hidden = self.backbone(
-            input_ids=tokens.masked_fill(padding_mask, self.pad_id),
-            attention_mask=(~padding_mask).to(torch.long),
-        ).last_hidden_state
-        token_logits = self.token_head(hidden)
+        """Branching logits, optionally conditioned on each node's own token.
 
+        `structure_token_ids` carries the emitted token at every open gap and a
+        negative value elsewhere.  During training that is the gold pivot; at
+        inference it is the token the node just sampled, so one backbone pass
+        still serves both decisions.
+        """
+        steps = steps.clamp(0, self.step_embedding.num_embeddings - 1)
         structure_input = hidden.detach() if self.detach_structure_encoder else hidden
         root_types = steps.eq(0).to(torch.long)
         structure_input = (
@@ -1149,13 +1195,133 @@ class PretrainedGapFrontierModel(nn.Module):
             + self.gap_type_embedding(root_types).unsqueeze(1)
         )
         structure = self.structure_adapter(structure_input)
-        return (
-            token_logits,
-            self.root_stop_head(structure).squeeze(-1),
-            self.degree_head(structure),
-            self.direction_head(structure),
-            hidden,
+        # The root decides emptiness *before* any token exists, so it must not
+        # read one.  Conditioning it would also leak the label during training,
+        # where an empty span is exactly the case with no gold pivot to feed.
+        root_stop = (
+            self.root_stop_head(structure).squeeze(-1)
+            + self.calibration_root_bias
         )
+        if self.token_condition is not None and structure_token_ids is not None:
+            valid = structure_token_ids.ge(0)
+            vectors = self.token_embedding(
+                structure_token_ids.clamp_min(0)
+            ).detach()
+            structure = self.structure_adapter(
+                structure_input
+                + self.token_condition(vectors)
+                * valid.unsqueeze(-1).to(structure_input.dtype)
+            )
+        return (
+            root_stop,
+            self.degree_head(structure)
+            + self.calibration_degree_bias[steps].unsqueeze(1),
+            self.direction_head(structure),
+        )
+
+    @staticmethod
+    def marker_log_probs(
+        degree_logits: torch.Tensor,
+        direction_logits: torch.Tensor,
+    ) -> torch.Tensor:
+        """Convert degree/direction logits to leaf/left/right/both log masses."""
+        degree = degree_logits.log_softmax(dim=-1)
+        direction = direction_logits.log_softmax(dim=-1)
+        return torch.stack((
+            degree[..., 0],
+            degree[..., 1] + direction[..., 0],
+            degree[..., 1] + direction[..., 1],
+            degree[..., 2],
+        ), dim=-1)
+
+    def joint_action_log_probs(
+        self,
+        token_logits: torch.Tensor,
+        degree_logits: torch.Tensor,
+        direction_logits: torch.Tensor,
+        hidden: torch.Tensor,
+        steps: torch.Tensor,
+        generated_token_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """Return a token/marker joint with both supplied marginals preserved.
+
+        Inputs contain only active non-empty nodes, so the returned tensor is
+        ``[nodes, generated vocabulary, 4]``. Iterative proportional fitting
+        turns a learned low-rank interaction into a discrete copula whose row
+        marginal is the native MLM and whose column marginal is the existing
+        topology policy. Root emptiness remains a preceding independent event.
+        """
+        if not self.marginal_preserving_joint:
+            raise ValueError("marginal-preserving joint actions are disabled")
+        if token_logits.dim() != 2 or hidden.dim() != 2:
+            raise ValueError("joint action inputs must be flattened node tensors")
+        generated_token_ids = generated_token_ids.to(token_logits.device)
+        token_logp = token_logits.index_select(
+            -1, generated_token_ids
+        ).log_softmax(dim=-1)
+        marker_logp = self.marker_log_probs(
+            degree_logits, direction_logits
+        )
+        clipped_steps = steps.clamp(
+            0, self.step_embedding.num_embeddings - 1
+        )
+        root_types = clipped_steps.eq(0).to(torch.long)
+        context = (
+            hidden.detach()
+            + self.step_embedding(clipped_steps)
+            + self.gap_type_embedding(root_types)
+        )
+        marker_features = self.joint_marker_projection(context).view(
+            context.size(0), 4, self.joint_rank
+        )
+        token_vectors = self.token_embedding(generated_token_ids).detach()
+        token_features = self.joint_token_projection(token_vectors)
+        interaction = torch.einsum(
+            "vr,nmr->nvm", token_features, marker_features
+        ) / math.sqrt(self.joint_rank)
+        log_joint = (
+            token_logp.unsqueeze(-1)
+            + marker_logp.unsqueeze(-2)
+            + interaction
+        )
+        # Alternating log-domain row/column scaling is stable in mixed
+        # precision and differentiable through the interaction and marker head.
+        for _ in range(self.joint_sinkhorn_iterations):
+            log_joint = log_joint + (
+                token_logp - torch.logsumexp(log_joint, dim=-1)
+            ).unsqueeze(-1)
+            log_joint = log_joint + (
+                marker_logp - torch.logsumexp(log_joint, dim=-2)
+            ).unsqueeze(-2)
+        # Finish on the token marginal, which is the lexical invariant. With
+        # four marker columns the preceding iterations make column error tiny.
+        log_joint = log_joint + (
+            token_logp - torch.logsumexp(log_joint, dim=-1)
+        ).unsqueeze(-1)
+        return log_joint
+
+    def forward(
+        self,
+        tokens: torch.Tensor,
+        padding_mask: Optional[torch.Tensor] = None,
+        steps: Optional[torch.Tensor] = None,
+        structure_token_ids: Optional[torch.Tensor] = None,
+    ):
+        if padding_mask is None:
+            padding_mask = tokens.eq(self.pad_id)
+        if steps is None:
+            steps = torch.zeros(
+                tokens.size(0), dtype=torch.long, device=tokens.device
+            )
+        hidden = self.backbone(
+            input_ids=tokens.masked_fill(padding_mask, self.pad_id),
+            attention_mask=(~padding_mask).to(torch.long),
+        ).last_hidden_state
+        token_logits = self.token_head(hidden)
+        root_stop, degree, direction = self.structure_logits_from_hidden(
+            hidden, steps, structure_token_ids
+        )
+        return token_logits, root_stop, degree, direction, hidden
 
 
 class PretrainedScaffoldTopologyModel(nn.Module):
@@ -1414,14 +1580,19 @@ class PretrainedScaffoldTopologyModel(nn.Module):
         self,
         tokens: torch.Tensor,
         padding_mask: Optional[torch.Tensor] = None,
+        source: str = "pooled",
     ) -> torch.Tensor:
         """Encode the round-zero canvas once into a fixed per-prompt context.
 
         Every later round reuses this vector, so the shape policy depends on
         the prompt but not on the partially grown scaffold.  That is what makes
         `conditional_scaffold_length_distribution` exact rather than an
-        approximation of an evolving process.
+        approximation of an evolving process. source="gap" retains the
+        backbone state at the native mask position instead of diluting it with
+        a sequence-wide mean. It still does not reveal or predict a length.
         """
+        if source not in ("pooled", "gap"):
+            raise ValueError("prompt shape context source must be pooled or gap")
         if padding_mask is None:
             padding_mask = tokens.eq(self.pad_id)
         input_ids = tokens.masked_fill(padding_mask, self.pad_id)
@@ -1430,9 +1601,19 @@ class PretrainedScaffoldTopologyModel(nn.Module):
                 input_ids=input_ids,
                 attention_mask=(~padding_mask).to(torch.long),
             ).last_hidden_state
-        observed = (~padding_mask).to(hidden.dtype).unsqueeze(-1)
-        pooled = (hidden * observed).sum(1) / observed.sum(1).clamp_min(1.0)
-        return self.global_adapter(pooled)
+        if source == "gap":
+            gaps = tokens.eq(self.gap_id) & ~padding_mask
+            if not bool(gaps.any(dim=1).all()):
+                raise ValueError("every prompt must contain a gap")
+            positions = gaps.to(torch.long).argmax(dim=1)
+            rows = torch.arange(tokens.size(0), device=tokens.device)
+            prompt_hidden = hidden[rows, positions]
+        else:
+            observed = (~padding_mask).to(hidden.dtype).unsqueeze(-1)
+            prompt_hidden = (
+                (hidden * observed).sum(1) / observed.sum(1).clamp_min(1.0)
+            )
+        return self.global_adapter(prompt_hidden)
 
     def conditional_shape_logits(
         self,

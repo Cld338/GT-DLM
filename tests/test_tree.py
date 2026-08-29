@@ -78,6 +78,8 @@ from measure_pretrained_span_identifiability import (
     unique_token_positions,
 )
 from measure_twin_intervention import paired_statistics
+from probe_conditional_length_context import gap_local_features
+from probe_token_marker_information import topology_marker_targets
 from evaluate_multigap_sampling import multigap_distribution_metrics
 from evaluate_multigap_sampling import (
     bootstrap_target_length_covariance,
@@ -1833,6 +1835,26 @@ class ReencodedFrontierTests(unittest.TestCase):
         )
         return tokenizer, backbone, head, model
 
+    def test_gap_local_probe_reads_mask_and_immediate_boundaries(self):
+        tokens = torch.tensor([[0, 5, 9, 6, 2], [0, 7, 8, 9, 2]])
+        hidden = torch.arange(2 * 5 * 3, dtype=torch.float).view(2, 5, 3)
+        gap, boundary, difference = gap_local_features(hidden, tokens, 9)
+        self.assertTrue(torch.equal(gap[0], hidden[0, 2]))
+        self.assertTrue(torch.equal(gap[1], hidden[1, 3]))
+        self.assertTrue(torch.equal(boundary[0, :3], hidden[0, 1]))
+        self.assertTrue(torch.equal(boundary[0, -3:], hidden[0, 3]))
+        self.assertTrue(torch.equal(
+            difference[1, -3:], hidden[1, 2] - hidden[1, 4]
+        ))
+
+    def test_oracle_probe_marker_mapping_matches_joint_action_order(self):
+        degree = torch.tensor([0, 1, 1, 2])
+        direction = torch.tensor([-100, 0, 1, -100])
+        self.assertEqual(
+            topology_marker_targets(degree, direction).tolist(),
+            [0, 1, 2, 3],
+        )
+
     def test_frontier_reencodes_generated_tokens_and_separates_gradients(self):
         tokenizer, backbone, head, model = self.build_native_model()
         first = torch.tensor([[0, 5, 9, 6, 2]])
@@ -2462,6 +2484,53 @@ class ReencodedFrontierTests(unittest.TestCase):
             token in vocab.generated_token_ids for token in samples[0][0]
         ))
 
+    def test_unified_gap_context_grows_and_fills_with_one_model(self):
+        tokenizer, backbone, head, _ = self.build_native_model()
+        vocab = TextVocabulary(
+            len(tokenizer), PAD=1, GAP=9, MASK=9, LEFT=0, RIGHT=2,
+            EXTRA_STRUCTURAL=(3,),
+        )
+        model = PretrainedUnifiedScaffoldModel(
+            vocab.vocab_size,
+            vocab.GAP,
+            vocab.PAD,
+            pretrained_lm_head=head,
+            generated_token_ids=vocab.generated_token_ids,
+            backbone=backbone,
+            pretrained_tokenizer=tokenizer,
+            regimes=1,
+            residual_dim=4,
+            posterior_topk=4,
+            prompt_conditioned=True,
+            dropout=0.0,
+        )
+        with torch.no_grad():
+            model.root_stop_prior.fill_(-20.0)
+            model.degree_prior.fill_(-20.0)
+            model.degree_prior[0, 0, 1] = 20.0
+            model.degree_prior[1:, 0, 0] = 20.0
+        before = backbone.calls
+        samples, rounds, unfinished = sample_unified_scaffolds(
+            model,
+            [TextInfillingExample(((5,), (6,)), ((10, 11),))],
+            vocab,
+            torch.device("cpu"),
+            samples_per_prompt=1,
+            chunk_size=1,
+            max_rounds=4,
+            max_decode_span=8,
+            seed=3,
+            conditional_context_source="gap",
+        )
+        self.assertEqual(len(samples[0][0]), 2)
+        self.assertEqual(rounds, [[2]])
+        self.assertEqual(unfinished, [[False]])
+        # One fixed GAP encode, two grow passes, and one final parallel fill.
+        self.assertEqual(backbone.calls - before, 4)
+        self.assertTrue(all(
+            token in vocab.generated_token_ids for token in samples[0][0]
+        ))
+
     def test_exact_scaffold_length_dp_tracks_total_progeny(self):
         tokenizer, backbone, _, _ = self.build_native_model()
         model = PretrainedScaffoldTopologyModel(
@@ -2484,6 +2553,240 @@ class ReencodedFrontierTests(unittest.TestCase):
         )
         self.assertAlmostEqual(float(probabilities.sum()), 1.0, places=5)
         self.assertGreater(float(probabilities[2]), 0.999)
+
+    def test_token_conditioned_topology_nests_and_uses_the_emitted_token(self):
+        tokenizer, backbone, head, _ = self.build_native_model()
+        model = PretrainedGapFrontierModel(
+            len(tokenizer),
+            tokenizer.mask_token_id,
+            tokenizer.pad_token_id,
+            backbone=backbone,
+            pretrained_tokenizer=tokenizer,
+            pretrained_lm_head=head,
+            token_conditioned_topology=True,
+            dropout=0.0,
+        )
+        model.eval()
+        tokens = torch.tensor([[0, 5, 9, 6, 2]])
+        steps = torch.tensor([1])
+        ids = torch.full_like(tokens, -1)
+        ids[0, 2] = 10
+        with torch.no_grad():
+            plain = model(tokens, tokens.eq(1), steps)
+            conditioned = model(tokens, tokens.eq(1), steps, ids)
+        # Zero-initialized coupling must reproduce the token-independent policy.
+        for left, right in zip(plain[1:4], conditioned[1:4]):
+            self.assertTrue(torch.allclose(left, right, atol=1e-6))
+        with torch.no_grad():
+            model.token_condition.weight.normal_(std=0.5)
+            shifted = model(tokens, tokens.eq(1), steps, ids)
+            other = ids.clone()
+            other[0, 2] = 11
+            shifted_other = model(tokens, tokens.eq(1), steps, other)
+        self.assertFalse(
+            torch.allclose(shifted[2][0, 2], conditioned[2][0, 2], atol=1e-5)
+        )
+        # A different emitted token must give a different branching decision.
+        self.assertFalse(
+            torch.allclose(shifted[2][0, 2], shifted_other[2][0, 2], atol=1e-5)
+        )
+        # Positions with no emitted token stay untouched by the coupling.
+        self.assertTrue(
+            torch.allclose(shifted[2][0, 0], conditioned[2][0, 0], atol=1e-6)
+        )
+
+    def test_root_head_never_reads_the_emitted_token(self):
+        tokenizer, backbone, head, _ = self.build_native_model()
+        model = PretrainedGapFrontierModel(
+            len(tokenizer),
+            tokenizer.mask_token_id,
+            tokenizer.pad_token_id,
+            backbone=backbone,
+            pretrained_tokenizer=tokenizer,
+            pretrained_lm_head=head,
+            token_conditioned_topology=True,
+            dropout=0.0,
+        )
+        model.eval()
+        with torch.no_grad():
+            model.token_condition.weight.normal_(std=1.0)
+        tokens = torch.tensor([[0, 5, 9, 6, 2]])
+        steps = torch.tensor([0])
+        absent = torch.full_like(tokens, -1)
+        present = absent.clone()
+        present[0, 2] = 10
+        with torch.no_grad():
+            without = model(tokens, tokens.eq(1), steps, absent)
+            with_token = model(tokens, tokens.eq(1), steps, present)
+        # An empty root span is exactly the case with no gold pivot to feed, so
+        # a root head that saw the conditioning would read its own label.
+        self.assertTrue(torch.allclose(without[1], with_token[1], atol=1e-6))
+        self.assertFalse(
+            torch.allclose(without[2][0, 2], with_token[2][0, 2], atol=1e-5)
+        )
+
+    def test_token_conditioned_topology_gradient_reaches_the_coupling(self):
+        tokenizer, backbone, head, _ = self.build_native_model()
+        model = PretrainedGapFrontierModel(
+            len(tokenizer),
+            tokenizer.mask_token_id,
+            tokenizer.pad_token_id,
+            backbone=backbone,
+            pretrained_tokenizer=tokenizer,
+            pretrained_lm_head=head,
+            token_conditioned_topology=True,
+            dropout=0.0,
+        )
+        tokens = torch.tensor([[0, 5, 9, 6, 2]])
+        ids = torch.full_like(tokens, -1)
+        ids[0, 2] = 10
+        outputs = model(tokens, tokens.eq(1), torch.tensor([1]), ids)
+        outputs[2][0, 2].sum().backward()
+        self.assertIsNotNone(model.token_condition.weight.grad)
+        self.assertGreater(
+            float(model.token_condition.weight.grad.abs().sum()), 0.0
+        )
+        # The coupling reads a detached embedding, so it must not pull the
+        # backbone's input embeddings along with it.
+        self.assertTrue(
+            model.token_embedding.weight.grad is None
+            or float(model.token_embedding.weight.grad.abs().sum()) == 0.0
+        )
+
+    def test_marginal_joint_preserves_token_and_marker_distributions(self):
+        tokenizer, backbone, head, _ = self.build_native_model()
+        vocab = TextVocabulary(
+            len(tokenizer), PAD=1, GAP=9, MASK=9, LEFT=0, RIGHT=2,
+            EXTRA_STRUCTURAL=(3,),
+        )
+        model = PretrainedGapFrontierModel(
+            vocab.vocab_size,
+            vocab.GAP,
+            vocab.PAD,
+            backbone=backbone,
+            pretrained_tokenizer=tokenizer,
+            pretrained_lm_head=head,
+            marginal_preserving_joint=True,
+            joint_rank=4,
+            joint_sinkhorn_iterations=24,
+            dropout=0.0,
+        )
+        model.eval()
+        tokens = torch.tensor([[0, 5, 9, 6, 2]])
+        padding = tokens.eq(vocab.PAD)
+        steps = torch.tensor([1])
+        generated = torch.tensor(vocab.generated_token_ids)
+        with torch.no_grad():
+            outputs = model(tokens, padding, steps)
+            node = tokens.eq(vocab.GAP)
+            independent = model.joint_action_log_probs(
+                outputs[0][node], outputs[2][node], outputs[3][node],
+                outputs[4][node], steps.unsqueeze(1).expand_as(tokens)[node],
+                generated,
+            )
+            token_logp = outputs[0][node].index_select(
+                -1, generated
+            ).log_softmax(dim=-1)
+            marker_logp = model.marker_log_probs(
+                outputs[2][node], outputs[3][node]
+            )
+        expected = token_logp.unsqueeze(-1) + marker_logp.unsqueeze(-2)
+        self.assertTrue(torch.allclose(independent, expected, atol=1e-6))
+
+        with torch.no_grad():
+            model.joint_marker_projection.weight.normal_(std=0.5)
+            model.joint_marker_projection.bias.normal_(std=0.5)
+            coupled = model.joint_action_log_probs(
+                outputs[0][node], outputs[2][node], outputs[3][node],
+                outputs[4][node], steps.unsqueeze(1).expand_as(tokens)[node],
+                generated,
+            )
+        self.assertFalse(torch.allclose(coupled, independent, atol=1e-5))
+        self.assertTrue(torch.allclose(
+            torch.logsumexp(coupled, dim=-1), token_logp, atol=2e-5
+        ))
+        self.assertTrue(torch.allclose(
+            torch.logsumexp(coupled, dim=-2), marker_logp, atol=2e-5
+        ))
+
+    def test_marginal_joint_loss_trains_copula_without_teacher_forcing(self):
+        tokenizer, backbone, head, _ = self.build_native_model()
+        vocab = TextVocabulary(
+            len(tokenizer), PAD=1, GAP=9, MASK=9, LEFT=0, RIGHT=2,
+            EXTRA_STRUCTURAL=(3,),
+        )
+        model = PretrainedGapFrontierModel(
+            vocab.vocab_size,
+            vocab.GAP,
+            vocab.PAD,
+            backbone=backbone,
+            pretrained_tokenizer=tokenizer,
+            pretrained_lm_head=head,
+            marginal_preserving_joint=True,
+            joint_rank=4,
+            joint_sinkhorn_iterations=12,
+            dropout=0.0,
+        )
+        example = TextInfillingExample(((5,), (6,)), ((10, 11, 12),))
+        states = TextGapProposalDataset(
+            [example], vocab, strategy="midpoint", seed=17
+        )
+        batch = collate_compact_frontiers(
+            [states[index] for index in range(len(states))], vocab.PAD
+        )
+        losses = frontier_losses(
+            model, batch, vocab, torch.device("cpu")
+        )
+        self.assertTrue(torch.isfinite(losses["joint"]))
+        self.assertEqual(
+            int(losses["joint_count"]), int(losses["degree_count"])
+        )
+        (losses["root"] + losses["token"] + losses["joint"]).backward()
+        self.assertIsNotNone(model.joint_marker_projection.weight.grad)
+        self.assertGreater(
+            float(model.joint_marker_projection.weight.grad.abs().sum()), 0.0
+        )
+        self.assertIsNotNone(model.degree_head.weight.grad)
+
+    def test_marginal_joint_rollout_draws_one_token_marker_action(self):
+        tokenizer, backbone, head, _ = self.build_native_model()
+        vocab = TextVocabulary(
+            len(tokenizer), PAD=1, GAP=9, MASK=9, LEFT=0, RIGHT=2,
+            EXTRA_STRUCTURAL=(3,),
+        )
+        model = PretrainedGapFrontierModel(
+            vocab.vocab_size,
+            vocab.GAP,
+            vocab.PAD,
+            backbone=backbone,
+            pretrained_tokenizer=tokenizer,
+            pretrained_lm_head=head,
+            marginal_preserving_joint=True,
+            joint_rank=4,
+            dropout=0.0,
+        )
+        with torch.no_grad():
+            model.root_stop_head.weight.zero_()
+            model.root_stop_head.bias.fill_(-20.0)
+            model.degree_head.weight.zero_()
+            model.degree_head.bias.copy_(torch.tensor([20.0, -20.0, -20.0]))
+            model.joint_marker_projection.weight.normal_(std=0.5)
+        before = backbone.calls
+        predictions, rounds, unfinished = decode_frontier_model(
+            model,
+            [TextInfillingExample(((5,), (6,)), ((10,),))],
+            vocab,
+            torch.device("cpu"),
+            max_rounds=4,
+            max_decode_span=8,
+            stochastic=True,
+            generator=torch.Generator().manual_seed(3),
+        )
+        self.assertEqual(len(predictions[0][0]), 1)
+        self.assertEqual(rounds, [1])
+        self.assertEqual(unfinished, [False])
+        self.assertEqual(backbone.calls - before, 1)
+        self.assertIn(predictions[0][0][0], vocab.generated_token_ids)
 
     def build_conditional_scaffold(self, regimes=2, state_feedback=True):
         tokenizer, backbone, _, _ = self.build_native_model()
@@ -2523,6 +2826,68 @@ class ReencodedFrontierTests(unittest.TestCase):
         self.assertEqual(tuple(probabilities.shape), (2, 8))
         for row in probabilities:
             self.assertAlmostEqual(float(row.sum()), 1.0, places=5)
+
+    def test_gap_prompt_context_reads_native_mask_state(self):
+        model, tokens = self.build_conditional_scaffold()
+        with torch.no_grad():
+            hidden = model.backbone(
+                input_ids=tokens,
+                attention_mask=torch.ones_like(tokens),
+            ).last_hidden_state
+            rows = torch.arange(tokens.size(0))
+            gaps = tokens.eq(model.gap_id).to(torch.long).argmax(dim=1)
+            expected = model.global_adapter(hidden[rows, gaps])
+            actual = model.prompt_shape_context(tokens, source="gap")
+        self.assertTrue(torch.allclose(actual, expected, atol=1e-6))
+
+    def test_gap_context_zero_gate_still_matches_shared_chart(self):
+        model, tokens = self.build_conditional_scaffold()
+        with torch.no_grad():
+            context = model.prompt_shape_context(tokens, source="gap")
+            conditional = conditional_scaffold_length_distribution(
+                model, context, max_length=6, max_rounds=6
+            )
+            shared = scaffold_length_distribution(
+                model, max_length=6, max_rounds=6
+            )
+        for row in conditional:
+            self.assertTrue(torch.allclose(row, shared, atol=1e-6))
+
+    def test_gap_conditional_scaffold_rollout_uses_one_fixed_encode(self):
+        model, _ = self.build_conditional_scaffold(
+            regimes=1, state_feedback=False
+        )
+        vocab = TextVocabulary(
+            model.backbone.get_input_embeddings().num_embeddings,
+            PAD=1,
+            GAP=9,
+            MASK=9,
+            LEFT=0,
+            RIGHT=2,
+            EXTRA_STRUCTURAL=(3,),
+        )
+        with torch.no_grad():
+            model.root_stop_prior.fill_(-100.0)
+            model.degree_prior.fill_(-100.0)
+            model.degree_prior[:, 0, 0] = 100.0
+        example = TextInfillingExample(((5,), (6,)), ((7,),))
+        before = model.backbone.calls
+        lengths, rounds, unfinished = sample_frontier_scaffolds(
+            model,
+            [example],
+            vocab,
+            torch.device("cpu"),
+            samples_per_prompt=2,
+            chunk_size=2,
+            max_rounds=4,
+            max_decode_span=8,
+            seed=3,
+            conditional_context_source="gap",
+        )
+        self.assertEqual(lengths, [[1, 1]])
+        self.assertEqual(rounds, [[1, 1]])
+        self.assertEqual(unfinished, [[False, False]])
+        self.assertEqual(model.backbone.calls - before, 1)
 
     def test_zero_gate_conditional_chart_matches_context_free_chart(self):
         model, tokens = self.build_conditional_scaffold()
