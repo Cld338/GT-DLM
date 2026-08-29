@@ -455,13 +455,19 @@ def collate_compact_frontiers(
     width = batch["tokens"].size(1)
     left = torch.full((len(examples), width), -100, dtype=torch.long)
     right = torch.full((len(examples), width), -100, dtype=torch.long)
+    semantic = torch.full((len(examples), width), -100, dtype=torch.long)
     for row, example in enumerate(examples):
         left_values = example["left_targets"]  # type: ignore[assignment]
         right_values = example["right_targets"]  # type: ignore[assignment]
         left[row, : len(left_values)] = torch.tensor(left_values, dtype=torch.long)  # type: ignore[arg-type]
         right[row, : len(right_values)] = torch.tensor(right_values, dtype=torch.long)  # type: ignore[arg-type]
+        semantic_values = example.get("semantic_tokens", [])  # type: ignore[union-attr]
+        semantic[row, : len(semantic_values)] = torch.tensor(
+            semantic_values, dtype=torch.long
+        )
     batch["left_targets"] = left
     batch["right_targets"] = right
+    batch["semantic_tokens"] = semantic
     batch["sample_weights"] = torch.tensor(
         [float(example.get("sample_weight", 1.0)) for example in examples],
         dtype=torch.float,

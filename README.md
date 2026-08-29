@@ -102,6 +102,26 @@ python evaluate_native_inside_readout.py --device cuda
 python evaluate_prompt_attention.py --device cuda --local-files-only
 python experiment_text_depth_inside_pretrained.py --device cuda --data-dir artifacts/wikitext_native --native-vocabulary --fixed-mask-bank 8 --local-files-only --artifact-dir artifacts/text_depth_inside_fixed_mask_bank
 python analyze_single_gap_tree_scoring.py --device cuda
+python measure_exposure_gap.py --device cuda --artifact-dir artifacts/text_depth_inside_fixed_mask_bank
+python experiment_text_depth_inside_pretrained.py --device cuda --data-dir artifacts/wikitext_native --native-vocabulary --fixed-mask-bank 8 --local-files-only --self-boundary-weight 1 --artifact-dir artifacts/text_exposure_self_boundary
+python experiment_text_depth_inside_pretrained.py --device cuda --data-dir artifacts/wikitext_native --native-vocabulary --fixed-mask-bank 8 --local-files-only --self-boundary-weight 1 --self-boundary-control --artifact-dir artifacts/text_exposure_boundary_control
+python aggregate_exposure_gap.py
+python analyze_branching_length_family.py
+python analyze_length_parallelism_frontier.py
+python evaluate_rerank_decoding.py --device cuda --artifact-dir artifacts/text_depth_inside_fixed_mask_bank
+python diagnose_chain_collapse.py --device cuda --artifact-dir artifacts/text_depth_inside_fixed_mask_bank
+python diagnose_chain_collapse.py --device cuda --artifact-dir artifacts/text_depth_inside_native --output-dir artifacts/text_chain_collapse_pooled
+python experiment_text_depth_inside_pretrained.py --device cuda --data-dir artifacts/wikitext_native --native-vocabulary --fixed-mask-bank 8 --local-files-only --shape-prior-weight 2 --artifact-dir artifacts/text_shape_prior_w2p0
+python experiment_text_frontier_reencode.py --device cuda --local-files-only --epochs 5 --artifact-dir artifacts/text_frontier_reencode_weighted
+python evaluate_frontier_scaffold.py --device cuda
+python experiment_scaffold_topology.py --device cuda --local-files-only --regimes 4 --artifact-dir artifacts/text_scaffold_topology
+python experiment_scaffold_topology.py --device cuda --local-files-only --regimes 4 --state-feedback --artifact-dir artifacts/text_scaffold_topology_feedback
+python calibrate_scaffold_length_distribution.py --device cuda --topology-artifact-dir artifacts/text_scaffold_topology_feedback --artifact-dir artifacts/text_scaffold_topology_feedback_exact
+python evaluate_semantic_scaffold.py --device cuda
+python evaluate_continuous_scaffold.py --device cuda
+python experiment_unified_scaffold.py --device cuda --local-files-only --state-feedback --shape-checkpoint artifacts/text_scaffold_topology_feedback_exact/topology.pt --posterior-only --artifact-dir artifacts/text_scaffold_unified_exact_posterior
+python experiment_conditional_length.py --device cuda --epochs 8 --max-train-examples 2048 --artifact-dir artifacts/text_conditional_length_output_zero
+python probe_conditional_length_context.py --device cuda --train-examples 4096
 ```
 
 The experiment writes its metrics and checkpoints to `artifacts/`.
@@ -565,6 +585,187 @@ prior ELBO NLL improves `25.829 -> 20.512`, and length TV improves
 `0.157 -> 0.126`. This is not a gold-posterior artifact. Generation moves much
 less: oracle-midpoint token accuracy is `9.80%`, while topology-aligned sampled
 rollout reaches `12.24%` on length-matched pairs against the native masked
-baseline's `20.04%`. The next blocker is gold-token/boundary exposure in the
-topology training path, not encoder likelihood. See
-`research/FIXED_MASK_BANK.md`.
+baseline's `20.04%`. See `research/FIXED_MASK_BANK.md`.
+
+That document named gold-token/boundary exposure as the next blocker. Measuring
+it first shows it is not. Dropping the gold pivot token from the topology head
+costs `0.005` nats, so the head barely uses it; self-generated boundaries do
+cost `0.487` nats of token NLL, but training against them loses `0.454` nats of
+test exact NLL, and a matched control that keeps the gold boundaries while
+adding the identical auxiliary reproduces the entire `-0.028` length-TV gain.
+The substitution therefore contributes nothing except cost. Without that control
+the treatment alone would have been recorded as a success. A measured train/test
+discrepancy is not by itself a reason to train against it. See
+`research/EXPOSURE_GAP.md`.
+
+Treating the rollout as the branching process it is then explains two older
+results and produces one new one. The generated length is the total progeny of a
+binary Galton-Watson tree, so the reachable length laws form a family. A
+depth-homogeneous process has `P(N=2) = b * P(N=1) < P(N=1)` for every parameter
+setting, so it cannot represent a flat corpus law at all; its TV floor is
+`0.2234`, and the depth-free exact model sat at `0.234`. That model failed the
+`TV < 0.20` gate for a representational reason, not a training one, and adding
+root-relative depth — recorded in `research/DEPTH_INSIDE.md` as an empirical
+repair — is exactly the minimal fix, since it frees `P(N=2) = b_0 a_1` from
+`P(N=1) = a_0`. Depth-indexing reaches TV `0` exactly, through a chain whose
+stop hazard is `1/(8-d)`, at a cost of `4.5` rollout rounds.
+
+That cost is the new result. Counting the expansion rounds the greedy rollout
+actually consumes gives `5.758` rounds for `5.758` emitted tokens, equal on all
+128 test prompts. A depth holding `k` open nodes emits `k` tokens while costing
+one round, so equality forces one open node per depth: **the model never selects
+the two-child topology, and natural-text generation is a pure chain at the same
+sequential cost as an autoregressive filler.** The opening claim of this file —
+logarithmically many evaluations rather than one per inserted token — holds on
+the synthetic task at `2.95` NFE and does not hold here. It also removes the
+excuse for the length defect: at `5.758` rounds the chain-only TV floor is zero,
+so the model's `0.126` is entirely fitting failure.
+
+The collapse has since been diagnosed, and it is not the decoder. The two-child
+topology carries `1.07%` of the model's own chart posterior, `1.90%` on the
+nodes wide enough to use it and `0.06%` at the root, so greedy is not discarding
+mass it holds; ancestral sampling does not branch either, at `0.937` tokens per
+round over 512 rollouts. At the root the posterior places `99.59%` on "right
+only", which recursed is left-to-right generation: that checkpoint has
+rediscovered autoregressive decoding.
+
+**The cause is the fixed mask bank.** The pooled native model shares corpus,
+tokenizer, seed, epochs, batch size and optimization settings with the bank
+model and differs only in whether each node reads eight native mask states or
+one pooled vector. It branches: `61.83%` two-child posterior at the root,
+`84.42%` two-child argmax there, `1.261` tokens per round, and posterior mean
+token depth `1.5428` against the chain's maximum of `2.3115`. The bank model
+gets `0.06%`, `0.00%`, `1.000` and `2.2748`. So the bank buys `4.5` nats of
+exact NLL and `0.03` of length TV, and spends the entire parallel saving — a
+trade that stayed invisible because rollout rounds had never been measured.
+
+An earlier reading of this blamed the objective: summing over every derivation
+makes tree shape invisible to the loss, so a sequential model sits at an
+optimum. That is necessary but not sufficient, and the pooled model refutes it
+as a complete explanation — same indifferent objective, and it branches anyway.
+Indifference lets the model concentrate on whichever shape it scores best; the
+encoder decides which shape that is.
+
+The mechanism is still open, and the obvious hypothesis is already dead.
+Bank slots are ordered left to right, and in a left-to-right chain a node's
+root-relative depth equals the position of the token it emits, so depth could
+have served as a slot index — which no other tree shape permits under
+length-blindness. Measured, the correlation between node depth and selected slot
+is `-0.104`. The bank is not a position index. See `research/CHAIN_COLLAPSE.md`.
+
+Decoding by the trained objective was then tried, since the exact chart is
+available once a candidate's length is known even though it is unavailable
+during generation. Sampling 16 candidates per prompt and selecting by the exact
+marginal, or by minimum Bayes risk, does not beat greedy on decoded character
+similarity (`0.214` and `0.288` against `0.308`); unrestricted MAP reranking
+collapses onto the empty string. That test is not clean — the candidate pool
+scores below greedy to begin with, and matched-pair counts are `10` to `17` — so
+it is recorded as negative-but-inconclusive. See
+`research/GENERATION_THEORY.md`.
+
+The replacement architecture removes the mask bank entirely. In
+`experiment_text_frontier_reencode.py` the model state is the current partial
+sequence: every open gap is one native mask token at its own position, all open
+gaps are scored in one backbone pass, and the partial sequence is re-encoded
+each round. No node reads a shared linear bank, and no target length enters the
+input. Trained jointly on tokens and topology it reaches only `13.74%`
+matched-length token accuracy, because emitting a token at every structural
+expansion and feeding it back compounds exposure.
+
+Splitting the two factors fixes that. Writing generation as
+`p(shape scaffold | prompt) * p(tokens | completed scaffold, prompt)`, the first
+factor expands gaps in parallel but emits native mask slots rather than lexical
+tokens, and the second fills every dynamically created slot in one native-MLM
+pass. Length is still the total progeny of the branching process, not a
+prediction. On 128 prompts with 32 samples each the scaffold reaches `21.32%`
+matched token accuracy against the oracle-length native masked baseline's
+`20.04%`, in `2.18` parallel shape rounds plus one lexical pass, with no
+unfinished samples. Lexical feasibility therefore passes without giving the
+model target length; length TV was `0.201` against the fixed bank's `0.126`, so
+shape became the isolated bottleneck.
+
+Shape was then given its own model: depth-indexed priors, zero-gated prompt
+residuals, and one categorical regime sampled per round and shared by all open
+gaps, with only `204,107` trainable shape parameters over a frozen encoder.
+Four shared regimes beat one (`0.155` against `0.164` TV). Regime scope
+ablations follow in `research/FRONTIER_REENCODE.md`: a single persistent regime
+(`0.195` empirical TV) and a Markov regime across depths (`0.190`) are both
+worse than independent per-round regimes (`0.181`), and validation-only
+calibration of local topology likelihood failed at `0.231`, because a better
+local topology score need not calibrate total progeny.
+
+What does calibrate it is exposing the already-realized process state
+`(completed slots, open gaps, depth)` and training against an exact total-progeny
+likelihood rather than local topology loss alone. This is not length prediction:
+the state is readable from the current scaffold at inference and carries no
+target information. Exactly marginalizing the context-free state-feedback
+process over those states and optimizing `657` shape parameters against the
+training length histogram reaches exact train TV `0.00069`; a 4,096-sample
+rollout obtains `0.0718` TV to the finite test histogram against `0.1812` for
+the previous best scaffold, with overflow at `0.024%` and `2.84` shape rounds.
+The architecture passes the shape criterion while remaining at roughly baseline
+lexical quality (`19.07%` on 300 matched pairs).
+
+Two attempts to reintroduce lexical information into shape then failed their
+validation gates. A node-local 16-way discrete code is learnable (code NLL
+`2.477` against `log 16 = 2.773`) and preserves lexical quality at `21.30%`, but
+every positive code logit bias reduced validation accuracy, so validation
+selected zero bias. A node-local continuous vector trained to reconstruct the
+frozen gold-token embedding reaches `23.01%` while the MLM ignores it, but every
+nonzero residual scale also lost on validation. A vector resembling an input
+token embedding is not a valid residual for a pretrained MLM's contextual
+computation; post-hoc semantic coupling is rejected, node-local state itself is
+not. See `research/FRONTIER_REENCODE.md`.
+
+A third coupling attempt inverts the direction: instead of injecting a node
+state into the final MLM, the shared backbone pass that already runs each round
+supplies a native token posterior for every open node, and that posterior
+reaches the *topology* heads through an attention path with a zero-initialized
+gate. The lexical path is untouched, and the measured KL to the native masked
+baseline stays at `0.000000`. It also fails. Trained on top of the exactly
+calibrated shape model, the coupling lowers validation frontier topology NLL
+from `1.712` to `1.229` and moves matched token accuracy only `21.04% ->
+21.51%`, within this family's sampling spread, while length TV doubles from
+`0.074` to `0.148` and overflow returns from `0.024%` to `2.5%`. Since
+checkpoint selection uses the local frontier objective, it selects against the
+length law the architecture is judged on. **A better local topology likelihood
+is not a better length law** — now shown three independent ways.
+
+Re-calibrating the unified model at equal footing then explains why, and
+settles what a single model can be asked to do. The exact chart fits better
+than it ever has (training TV `0.00030` against the split model's `0.00069`)
+while the sampled rollout gets worse (`0.148 -> 0.187`), because
+`scaffold_length_distribution` marginalizes a *context-free* process and the
+token-posterior coupling is not context-free: the two numbers describe
+different processes. This is not an argument against one model. Every unified
+row is one model — one frozen backbone, one native MLM head, shape heads on
+top, one backbone pass per growth round, and that same head filling the
+completed scaffold — and the unified model with the token-to-shape gate held at
+zero is the best configuration in the project, at `0.074` sampled TV and
+`21.04%` matched token accuracy, matching the two-checkpoint split (`0.0718`,
+`19.07%`) within sampling noise while running as one set of weights. What fails
+is only letting token beliefs steer branching: the moment shape depends on
+lexical content, the length law becomes prompt-conditioned and the project's
+only exact length objective stops applying. See
+`research/FRONTIER_REENCODE.md`.
+
+Conditional length was then made exactly trainable, and the result is negative
+in an informative way. If the shape logits read the prompt only through an
+encoding fixed at round zero, plus the realized state, the process stays
+context-free *given the prompt*, so the same total-progeny dynamic program runs
+per prompt and yields exact differentiable `p(length | prompt)` with no length
+head. That is implemented, and verified against a 20,000-sample Monte-Carlo
+rollout and against exact reduction to the shared chart at zero gate. Training
+only the residual path against `-log p(gold length | prompt)` moves held-out
+identifiable nats to `+0.00074` and `+0.00001` under two different nestings
+whose validation gains (`+0.0084`, `+0.0163`) do not transfer.
+
+An unconstrained categorical probe on the same tensors then locates the cause.
+Linear and MLP probes on the shape context and on the raw pooled backbone state
+also land at zero on test (`-0.0145` to `+0.0051`), so the length information is
+absent from the frozen mean-pooled representation the shape policy reads, and
+the branching parameterization is not what fails. This also corrects the
+comparison to the `+0.235` identifiable nats in
+`research/PRETRAINED_IDENTIFIABILITY.md`: that probe fine-tuned the backbone and
+read every position. The gap is encoder access, not the objective. See
+`research/FRONTIER_REENCODE.md`.

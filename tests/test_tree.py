@@ -32,6 +32,30 @@ from experiment_text_depth_inside import (
     depth_batch_log_likelihoods,
     reachable_depth_intervals,
 )
+from shape_prior import posterior_mean_token_depth
+from exposure_gap import (
+    pivot_posterior_marginals,
+    record_posteriors,
+    self_boundary_sources,
+    self_boundary_token_loss,
+    self_token_topology_loss,
+)
+from frontier_reencode import (
+    decode_frontier_model,
+    FixedScaffoldDerivationDataset,
+    frontier_losses,
+    markov_scaffold_losses,
+    sample_frontier_scaffolds,
+    sample_unified_scaffolds,
+    conditional_scaffold_length_distribution,
+    scaffold_length_distribution,
+    persistent_scaffold_losses,
+    scaffold_topology_losses,
+    ScaffoldProposalDataset,
+    sampled_length_probabilities,
+    topology_targets,
+    unified_scaffold_losses,
+)
 from decompose_multigap_likelihood import decompose_exact_batch
 from experiment_text_depth_inside_multigap import (
     collate_multi_prompt_contexts,
@@ -83,6 +107,9 @@ from gtdlm.model import (
     IntervalInsideBoundaryModel,
     LengthMaskedModel,
     PretrainedIntervalInsideModel,
+    PretrainedGapFrontierModel,
+    PretrainedScaffoldTopologyModel,
+    PretrainedUnifiedScaffoldModel,
     immediate_gap_boundaries,
 )
 from gtdlm.inside import (
@@ -1741,6 +1768,1159 @@ class SpanPolicyTests(unittest.TestCase):
             bootstrap_target_length_covariance(
                 examples[:1], seed=3, bootstrap_samples=20
             ), [0.0, 0.0])
+
+
+class ReencodedFrontierTests(unittest.TestCase):
+    def build_native_model(self):
+        class StubTokenizer:
+            pad_token_id = 1
+            mask_token_id = 9
+            bos_token_id = 0
+            eos_token_id = 2
+            cls_token_id = None
+            sep_token_id = None
+            all_special_ids = [0, 1, 2, 3, 9]
+
+            def __len__(self):
+                return 20
+
+        class ContextualBackbone(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.config = SimpleNamespace(hidden_size=8)
+                self.embedding = torch.nn.Embedding(20, 8)
+                self.calls = 0
+
+            def get_input_embeddings(self):
+                return self.embedding
+
+            def forward(
+                self,
+                input_ids=None,
+                attention_mask=None,
+                inputs_embeds=None,
+                **kwargs,
+            ):
+                del kwargs
+                self.calls += 1
+                hidden = (
+                    inputs_embeds
+                    if inputs_embeds is not None
+                    else self.embedding(input_ids)
+                )
+                mask = attention_mask.unsqueeze(-1).to(hidden.dtype)
+                context = (hidden * mask).sum(1, keepdim=True) / mask.sum(
+                    1, keepdim=True
+                ).clamp_min(1.0)
+                return SimpleNamespace(last_hidden_state=hidden + context)
+
+        tokenizer = StubTokenizer()
+        backbone = ContextualBackbone()
+        head = torch.nn.Sequential(
+            torch.nn.Linear(8, 8),
+            torch.nn.GELU(),
+            torch.nn.LayerNorm(8),
+            torch.nn.Linear(8, len(tokenizer)),
+        )
+        model = PretrainedGapFrontierModel(
+            len(tokenizer),
+            tokenizer.mask_token_id,
+            tokenizer.pad_token_id,
+            backbone=backbone,
+            pretrained_tokenizer=tokenizer,
+            pretrained_lm_head=head,
+            dropout=0.0,
+        )
+        return tokenizer, backbone, head, model
+
+    def test_frontier_reencodes_generated_tokens_and_separates_gradients(self):
+        tokenizer, backbone, head, model = self.build_native_model()
+        first = torch.tensor([[0, 5, 9, 6, 2]])
+        second = torch.tensor([[0, 5, 10, 9, 6, 2]])
+        first_outputs = model(first, first.eq(1), torch.tensor([0]))
+        second_outputs = model(second, second.eq(1), torch.tensor([1]))
+        self.assertEqual(backbone.calls, 2)
+        self.assertFalse(torch.allclose(
+            first_outputs[-1][0, 2], second_outputs[-1][0, 3]
+        ))
+
+        model.zero_grad(set_to_none=True)
+        structure_loss = sum(
+            output.sum() for output in second_outputs[1:4]
+        )
+        structure_loss.backward()
+        self.assertIsNone(backbone.embedding.weight.grad)
+        self.assertIsNotNone(model.degree_head.weight.grad)
+
+        model.zero_grad(set_to_none=True)
+        token_outputs = model(second, second.eq(1), torch.tensor([1]))
+        token_outputs[0][0, 3].mean().backward()
+        self.assertIsNotNone(backbone.embedding.weight.grad)
+        self.assertIsNotNone(head[-1].weight.grad)
+
+    def test_topology_targets_factor_degree_and_unary_direction(self):
+        left = torch.tensor([[0, 1, 0, 1, -100]])
+        right = torch.tensor([[0, 0, 1, 1, -100]])
+        degree, direction = topology_targets(left, right)
+        self.assertEqual(degree.tolist(), [[0, 1, 1, 2, -100]])
+        self.assertEqual(direction.tolist(), [[-100, 0, 1, -100, -100]])
+
+    def test_root_frontier_input_never_contains_hidden_length(self):
+        vocab = TextVocabulary(20, PAD=0, GAP=9, MASK=9, LEFT=1, RIGHT=2)
+        short = TextInfillingExample(((5,), (6,)), ((10,),))
+        long = TextInfillingExample(((5,), (6,)), ((10, 11, 12),))
+        short_root = TextGapProposalDataset(
+            [short], vocab, strategy="midpoint", seed=17
+        )[0]
+        long_root = TextGapProposalDataset(
+            [long], vocab, strategy="midpoint", seed=17
+        )[0]
+        self.assertEqual(short_root["tokens"], long_root["tokens"])
+        self.assertEqual(short_root["tokens"], [1, 5, 9, 6, 2])
+
+    def test_rollout_expands_two_child_gaps_in_one_round(self):
+        vocab = TextVocabulary(
+            20, PAD=0, GAP=9, MASK=9, LEFT=1, RIGHT=2,
+            EXTRA_STRUCTURAL=(3, 4),
+        )
+
+        class ScriptedModel:
+            def __init__(self):
+                self.gap_counts = []
+
+            def eval(self):
+                return self
+
+            def __call__(self, tokens, padding, steps):
+                del padding
+                batch, width = tokens.shape
+                token = torch.full((batch, width, 20), -100.0)
+                root = torch.full((batch, width), -100.0)
+                degree = torch.full((batch, width, 3), -100.0)
+                direction = torch.zeros((batch, width, 2))
+                hidden = torch.zeros((batch, width, 4))
+                for row in range(batch):
+                    gaps = tokens[row].eq(vocab.GAP).nonzero().flatten().tolist()
+                    self.gap_counts.append(len(gaps))
+                    for order, position in enumerate(gaps):
+                        if int(steps[row]) == 0:
+                            token[row, position, 10] = 100.0
+                            degree[row, position, 2] = 100.0
+                        else:
+                            token[row, position, 11 + order] = 100.0
+                            degree[row, position, 0] = 100.0
+                return token, root, degree, direction, hidden
+
+        example = TextInfillingExample(((5,), (6,)), ((11, 10, 12),))
+        model = ScriptedModel()
+        predictions, rounds, unfinished = decode_frontier_model(
+            model, [example], vocab, torch.device("cpu"),
+            max_rounds=4, max_decode_span=8, stochastic=True,
+            generator=torch.Generator().manual_seed(3),
+        )
+        self.assertEqual(predictions, [[[11, 10, 12]]])
+        self.assertEqual(rounds, [2])
+        self.assertEqual(unfinished, [False])
+        self.assertEqual(model.gap_counts, [1, 2])
+
+        lengths, shape_rounds, shape_unfinished = sample_frontier_scaffolds(
+            ScriptedModel(),
+            [example],
+            vocab,
+            torch.device("cpu"),
+            samples_per_prompt=2,
+            chunk_size=2,
+            max_rounds=4,
+            max_decode_span=8,
+            seed=3,
+        )
+        self.assertEqual(lengths, [[3, 3]])
+        self.assertEqual(shape_rounds, [[2, 2]])
+        self.assertEqual(shape_unfinished, [[False, False]])
+
+    def test_sampled_lengths_keep_empty_and_overflow_mass(self):
+        probabilities = sampled_length_probabilities(
+            [
+                [[], [10], [10, 11, 12]],
+                [[10] * 9, [10, 11], [10, 11]],
+            ],
+            [[False, False, False], [False, False, True]],
+            support_max=2,
+        )
+        self.assertEqual(probabilities[0], [1 / 3, 1 / 3, 0.0, 1 / 3])
+        self.assertEqual(probabilities[1], [0.0, 0.0, 1 / 3, 2 / 3])
+
+    def test_frontier_losses_apply_state_importance_weights(self):
+        vocab = TextVocabulary(20, PAD=0, GAP=9, MASK=9, LEFT=1, RIGHT=2)
+
+        class FixedModel:
+            def __call__(self, tokens, padding, steps):
+                del padding, steps
+                batch, width = tokens.shape
+                token = torch.zeros(batch, width, vocab.vocab_size)
+                root = torch.zeros(batch, width)
+                root[:, 1] = 2.0
+                degree = torch.zeros(batch, width, 3)
+                direction = torch.zeros(batch, width, 2)
+                hidden = torch.zeros(batch, width, 4)
+                return token, root, degree, direction, hidden
+
+        batch = {
+            "tokens": torch.tensor([[1, 9, 2], [1, 9, 2]]),
+            "padding": torch.zeros(2, 3, dtype=torch.bool),
+            "steps": torch.zeros(2, dtype=torch.long),
+            "targets": torch.tensor([
+                [-100, vocab.stop_action, -100],
+                [-100, 10, -100],
+            ]),
+            "left_targets": torch.tensor([
+                [-100, -100, -100],
+                [-100, 0, -100],
+            ]),
+            "right_targets": torch.tensor([
+                [-100, -100, -100],
+                [-100, 0, -100],
+            ]),
+            "sample_weights": torch.tensor([1.0, 3.0]),
+        }
+        losses = frontier_losses(
+            FixedModel(), batch, vocab, torch.device("cpu")
+        )
+        expected = (
+            F.binary_cross_entropy_with_logits(
+                torch.tensor(2.0), torch.tensor(1.0)
+            )
+            + 3
+            * F.binary_cross_entropy_with_logits(
+                torch.tensor(2.0), torch.tensor(0.0)
+            )
+        ) / 4
+        self.assertAlmostEqual(float(losses["root"]), float(expected), places=6)
+
+    def test_scaffold_frontier_keeps_completed_nodes_masked(self):
+        vocab = TextVocabulary(20, PAD=0, GAP=9, MASK=9, LEFT=1, RIGHT=2)
+        example = TextInfillingExample(((5,), (6,)), ((10, 11, 12),))
+        states = ScaffoldProposalDataset(
+            [example], vocab, strategy="midpoint", seed=17
+        )
+        second = states[1]
+        gap_positions = [
+            index for index, token in enumerate(second["tokens"])
+            if token == vocab.GAP
+        ]
+        self.assertEqual(len(gap_positions), 3)
+        self.assertEqual(
+            [second["targets"][index] for index in gap_positions],
+            [10, -100, 12],
+        )
+        self.assertEqual(
+            [second["semantic_tokens"][index] for index in gap_positions],
+            [-100, 11, -100],
+        )
+
+    def test_shape_prior_starts_context_free_and_saves_head_only(self):
+        tokenizer, backbone, _, _ = self.build_native_model()
+        model = PretrainedScaffoldTopologyModel(
+            len(tokenizer),
+            tokenizer.mask_token_id,
+            tokenizer.pad_token_id,
+            backbone=backbone,
+            pretrained_tokenizer=tokenizer,
+            regimes=2,
+            residual_dim=4,
+            dropout=0.0,
+        )
+        tokens = torch.tensor([
+            [0, 5, 9, 6, 2],
+            [0, 7, 9, 8, 2],
+        ])
+        padding = tokens.eq(tokenizer.pad_token_id)
+        steps = torch.zeros(2, dtype=torch.long)
+        open_mask = tokens.eq(tokenizer.mask_token_id)
+        root, regime, degree, direction, _ = model.structure_logits(
+            tokens, padding, steps, open_mask
+        )
+        self.assertTrue(torch.allclose(root[0], root[1]))
+        self.assertTrue(torch.allclose(regime[0], regime[1]))
+        self.assertTrue(torch.allclose(degree[0], degree[1]))
+        self.assertTrue(torch.allclose(direction[0], direction[1]))
+        self.assertFalse(any(
+            name.startswith("backbone.")
+            for name in model.topology_state_dict()
+        ))
+        self.assertFalse(any(parameter.requires_grad for parameter in backbone.parameters()))
+
+    def test_scaffold_state_feedback_reads_only_realized_process_state(self):
+        tokenizer, backbone, _, _ = self.build_native_model()
+        model = PretrainedScaffoldTopologyModel(
+            len(tokenizer),
+            tokenizer.mask_token_id,
+            tokenizer.pad_token_id,
+            backbone=backbone,
+            pretrained_tokenizer=tokenizer,
+            regimes=2,
+            residual_dim=4,
+            state_feedback=True,
+            dropout=0.0,
+        )
+        with torch.no_grad():
+            model.completed_degree_prior.weight[1, 0] = 2.0
+        tokens = torch.tensor([
+            [0, 5, 9, 6, 2, 1],
+            [0, 5, 9, 9, 6, 2],
+        ])
+        padding = tokens.eq(tokenizer.pad_token_id)
+        open_mask = torch.tensor([
+            [False, False, True, False, False, False],
+            [False, False, False, True, False, False],
+        ])
+        steps = torch.zeros(2, dtype=torch.long)
+        _, _, degree, _, _ = model.structure_logits(
+            tokens, padding, steps, open_mask
+        )
+        self.assertAlmostEqual(
+            float(degree[1, 3, 0, 0] - degree[0, 2, 0, 0]),
+            2.0,
+            places=5,
+        )
+
+    def test_node_local_semantic_codes_are_reencoded_and_supervised(self):
+        tokenizer, backbone, _, _ = self.build_native_model()
+        vocab = TextVocabulary(
+            len(tokenizer), PAD=1, GAP=9, MASK=9, LEFT=0, RIGHT=2,
+            EXTRA_STRUCTURAL=(3,),
+        )
+        model = PretrainedScaffoldTopologyModel(
+            vocab.vocab_size,
+            vocab.GAP,
+            vocab.PAD,
+            backbone=backbone,
+            pretrained_tokenizer=tokenizer,
+            regimes=2,
+            residual_dim=4,
+            semantic_codes=4,
+            dropout=0.0,
+        )
+        example = TextInfillingExample(
+            ((5,), (6,)), ((10, 11, 12),)
+        )
+        dataset = ScaffoldProposalDataset(
+            [example], vocab, strategy="midpoint", seed=17
+        )
+        batch = collate_compact_frontiers(
+            [dataset[1]], vocab.PAD
+        )
+        losses = scaffold_topology_losses(
+            model, batch, vocab, torch.device("cpu")
+        )
+        self.assertTrue(torch.isfinite(losses["semantic"]))
+        self.assertEqual(int(losses["semantic_count"]), 2)
+        losses["semantic"].backward()
+        self.assertIsNotNone(model.semantic_head.weight.grad)
+        self.assertIsNone(backbone.embedding.weight.grad)
+
+        tokens = batch["tokens"]
+        padding = batch["padding"]
+        steps = batch["steps"]
+        open_mask = batch["targets"].ne(-100)
+        no_codes = torch.full_like(tokens, -1)
+        with_codes = no_codes.clone()
+        completed = batch["semantic_tokens"].ge(0)
+        with_codes[completed] = model.semantic_token_codes[
+            batch["semantic_tokens"][completed]
+        ]
+        first = model.structure_logits(
+            tokens,
+            padding,
+            steps,
+            open_mask,
+            slot_codes=no_codes,
+            return_semantic=True,
+        )[-1]
+        second = model.structure_logits(
+            tokens,
+            padding,
+            steps,
+            open_mask,
+            slot_codes=with_codes,
+            return_semantic=True,
+        )[-1]
+        self.assertFalse(torch.allclose(first, second))
+
+    def test_sampled_semantic_code_reaches_the_next_frontier(self):
+        vocab = TextVocabulary(
+            20, PAD=0, GAP=9, MASK=9, LEFT=1, RIGHT=2,
+            EXTRA_STRUCTURAL=(3, 4),
+        )
+
+        class ScriptedSemanticModel:
+            semantic_codes = 4
+
+            def __init__(self):
+                self.seen_codes = []
+
+            def eval(self):
+                return self
+
+            def sample_structure(
+                self,
+                tokens,
+                padding,
+                steps,
+                open_mask,
+                generator=None,
+                forced_regimes=None,
+                slot_codes=None,
+                slot_semantics=None,
+                return_semantic_codes=False,
+                return_continuous_semantic=False,
+            ):
+                del (
+                    padding,
+                    generator,
+                    forced_regimes,
+                    slot_semantics,
+                    return_continuous_semantic,
+                )
+                self.seen_codes.append(slot_codes.clone())
+                stops = torch.zeros_like(tokens, dtype=torch.bool)
+                degrees = torch.zeros_like(tokens)
+                directions = torch.zeros_like(tokens)
+                regimes = torch.zeros(tokens.size(0), dtype=torch.long)
+                codes = torch.full_like(tokens, 2)
+                for row in range(tokens.size(0)):
+                    if int(steps[row]) == 0:
+                        degrees[row, open_mask[row]] = 1
+                self.assert_semantic_request = return_semantic_codes
+                return stops, degrees, directions, regimes, codes
+
+        model = ScriptedSemanticModel()
+        example = TextInfillingExample(((5,), (6,)), ((10, 11),))
+        lengths, rounds, unfinished = sample_frontier_scaffolds(
+            model,
+            [example],
+            vocab,
+            torch.device("cpu"),
+            samples_per_prompt=1,
+            chunk_size=1,
+            max_rounds=4,
+            max_decode_span=8,
+            seed=3,
+        )
+        self.assertEqual(lengths, [[2]])
+        self.assertEqual(rounds, [[2]])
+        self.assertEqual(unfinished, [[False]])
+        self.assertEqual(len(model.seen_codes), 2)
+        self.assertTrue(bool(model.seen_codes[1].eq(2).any()))
+        self.assertTrue(model.assert_semantic_request)
+
+    def test_continuous_semantic_state_is_reconstructed_and_reencoded(self):
+        tokenizer, backbone, _, _ = self.build_native_model()
+        vocab = TextVocabulary(
+            len(tokenizer), PAD=1, GAP=9, MASK=9, LEFT=0, RIGHT=2,
+            EXTRA_STRUCTURAL=(3,),
+        )
+        model = PretrainedScaffoldTopologyModel(
+            vocab.vocab_size,
+            vocab.GAP,
+            vocab.PAD,
+            backbone=backbone,
+            pretrained_tokenizer=tokenizer,
+            regimes=2,
+            residual_dim=4,
+            continuous_semantic=True,
+            dropout=0.0,
+        )
+        example = TextInfillingExample(
+            ((5,), (6,)), ((10, 11, 12),)
+        )
+        dataset = ScaffoldProposalDataset(
+            [example], vocab, strategy="midpoint", seed=17
+        )
+        batch = collate_compact_frontiers([dataset[1]], vocab.PAD)
+        losses = scaffold_topology_losses(
+            model, batch, vocab, torch.device("cpu")
+        )
+        self.assertTrue(torch.isfinite(losses["semantic"]))
+        self.assertEqual(int(losses["semantic_count"]), 2)
+        losses["semantic"].backward()
+        self.assertIsNotNone(model.semantic_vector_head.weight.grad)
+        self.assertIsNone(backbone.embedding.weight.grad)
+
+        tokens = batch["tokens"]
+        empty_states = torch.zeros(
+            1, tokens.size(1), model.d_model
+        )
+        gold_states = empty_states.clone()
+        completed = batch["semantic_tokens"].ge(0)
+        gold_states[completed] = model.token_semantic_states(
+            batch["semantic_tokens"][completed]
+        )
+        first = model.structure_logits(
+            tokens,
+            batch["padding"],
+            batch["steps"],
+            batch["targets"].ne(-100),
+            slot_semantics=empty_states,
+            return_continuous_semantic=True,
+        )[-1]
+        second = model.structure_logits(
+            tokens,
+            batch["padding"],
+            batch["steps"],
+            batch["targets"].ne(-100),
+            slot_semantics=gold_states,
+            return_continuous_semantic=True,
+        )[-1]
+        self.assertFalse(torch.allclose(first, second))
+
+    def test_sampled_continuous_state_reaches_the_next_frontier(self):
+        vocab = TextVocabulary(
+            20, PAD=0, GAP=9, MASK=9, LEFT=1, RIGHT=2,
+            EXTRA_STRUCTURAL=(3, 4),
+        )
+
+        class ScriptedContinuousModel:
+            semantic_codes = 0
+            continuous_semantic = True
+            d_model = 3
+            semantic_embedding_mean = torch.zeros(3)
+
+            def __init__(self):
+                self.seen_states = []
+
+            def eval(self):
+                return self
+
+            def sample_structure(
+                self,
+                tokens,
+                padding,
+                steps,
+                open_mask,
+                generator=None,
+                forced_regimes=None,
+                slot_codes=None,
+                slot_semantics=None,
+                return_semantic_codes=False,
+                return_continuous_semantic=False,
+            ):
+                del (
+                    padding,
+                    generator,
+                    forced_regimes,
+                    slot_codes,
+                    return_semantic_codes,
+                )
+                self.seen_states.append(slot_semantics.clone())
+                stops = torch.zeros_like(tokens, dtype=torch.bool)
+                degrees = torch.zeros_like(tokens)
+                directions = torch.zeros_like(tokens)
+                regimes = torch.zeros(tokens.size(0), dtype=torch.long)
+                states = torch.ones(
+                    *tokens.shape, self.d_model, device=tokens.device
+                )
+                for row in range(tokens.size(0)):
+                    if int(steps[row]) == 0:
+                        degrees[row, open_mask[row]] = 1
+                self.assert_semantic_request = return_continuous_semantic
+                return stops, degrees, directions, regimes, states
+
+        model = ScriptedContinuousModel()
+        example = TextInfillingExample(((5,), (6,)), ((10, 11),))
+        rollout = sample_frontier_scaffolds(
+            model,
+            [example],
+            vocab,
+            torch.device("cpu"),
+            samples_per_prompt=1,
+            chunk_size=1,
+            max_rounds=4,
+            max_decode_span=8,
+            seed=3,
+            return_states=True,
+        )
+        lengths, rounds, unfinished, states = rollout
+        self.assertEqual(lengths, [[2]])
+        self.assertEqual(rounds, [[2]])
+        self.assertEqual(unfinished, [[False]])
+        self.assertEqual(len(model.seen_states), 2)
+        self.assertTrue(bool(model.seen_states[1].ne(0).any()))
+        self.assertEqual(tuple(states[0][0].shape), (2, 3))
+        self.assertTrue(model.assert_semantic_request)
+
+    def test_unified_scaffold_zero_gate_nests_native_mlm_and_trains_gate(self):
+        tokenizer, backbone, head, _ = self.build_native_model()
+        vocab = TextVocabulary(
+            len(tokenizer), PAD=1, GAP=9, MASK=9, LEFT=0, RIGHT=2,
+            EXTRA_STRUCTURAL=(3,),
+        )
+        model = PretrainedUnifiedScaffoldModel(
+            vocab.vocab_size,
+            vocab.GAP,
+            vocab.PAD,
+            pretrained_lm_head=head,
+            generated_token_ids=vocab.generated_token_ids,
+            backbone=backbone,
+            pretrained_tokenizer=tokenizer,
+            regimes=2,
+            residual_dim=4,
+            posterior_topk=4,
+            dropout=0.0,
+        )
+        tokens = torch.tensor([[0, 5, 9, 9, 6, 2]])
+        padding = tokens.eq(vocab.PAD)
+        steps = torch.tensor([1])
+        open_mask = torch.tensor([[False, False, False, True, False, False]])
+        states = torch.randn(1, tokens.size(1), model.d_model)
+        model.eval()
+        baseline = model.unified_logits(
+            tokens, padding, steps, open_mask
+        )[0]
+        gated_off = model.unified_logits(
+            tokens,
+            padding,
+            steps,
+            open_mask,
+            slot_semantics=states,
+        )[0]
+        self.assertTrue(torch.equal(baseline, gated_off))
+
+        example = TextInfillingExample(((5,), (6,)), ((10, 11, 12),))
+        dataset = ScaffoldProposalDataset(
+            [example], vocab, strategy="midpoint", seed=17
+        )
+        batch = collate_compact_frontiers([dataset[1]], vocab.PAD)
+        model.train()
+        losses = unified_scaffold_losses(
+            model, batch, vocab, torch.device("cpu")
+        )
+        total = losses["root"] + losses["topology"] + losses["lexical"]
+        total.backward()
+        self.assertIsNotNone(model.posterior_gate.grad)
+        self.assertIsNone(backbone.embedding.weight.grad)
+        self.assertTrue(all(
+            parameter.grad is None for parameter in head.parameters()
+        ))
+        self.assertEqual(int(losses["lexical_count"]), 3)
+
+        empty = ScaffoldProposalDataset(
+            [TextInfillingExample(((5,), (6,)), ((),))],
+            vocab,
+            strategy="midpoint",
+            seed=17,
+        )
+        empty_batch = collate_compact_frontiers([empty[0]], vocab.PAD)
+        empty_losses = unified_scaffold_losses(
+            model, empty_batch, vocab, torch.device("cpu")
+        )
+        self.assertTrue(torch.isfinite(empty_losses["lexical"]))
+        self.assertEqual(int(empty_losses["lexical_count"]), 0)
+
+    def test_unified_sampler_grows_without_length_then_fills_in_parallel(self):
+        tokenizer, backbone, head, _ = self.build_native_model()
+        vocab = TextVocabulary(
+            len(tokenizer), PAD=1, GAP=9, MASK=9, LEFT=0, RIGHT=2,
+            EXTRA_STRUCTURAL=(3,),
+        )
+        model = PretrainedUnifiedScaffoldModel(
+            vocab.vocab_size,
+            vocab.GAP,
+            vocab.PAD,
+            pretrained_lm_head=head,
+            generated_token_ids=vocab.generated_token_ids,
+            backbone=backbone,
+            pretrained_tokenizer=tokenizer,
+            regimes=1,
+            residual_dim=4,
+            posterior_topk=4,
+            dropout=0.0,
+        )
+        with torch.no_grad():
+            model.root_stop_prior.fill_(-20.0)
+            model.degree_prior.fill_(-20.0)
+            model.degree_prior[0, 0, 1] = 20.0
+            model.degree_prior[1:, 0, 0] = 20.0
+        before = backbone.calls
+        samples, rounds, unfinished = sample_unified_scaffolds(
+            model,
+            [TextInfillingExample(((5,), (6,)), ((10, 11),))],
+            vocab,
+            torch.device("cpu"),
+            samples_per_prompt=1,
+            chunk_size=1,
+            max_rounds=4,
+            max_decode_span=8,
+            seed=3,
+        )
+        self.assertEqual(len(samples[0][0]), 2)
+        self.assertEqual(rounds, [[2]])
+        self.assertEqual(unfinished, [[False]])
+        # Two grow rounds plus one final parallel lexical pass.
+        self.assertEqual(backbone.calls - before, 3)
+        self.assertTrue(all(
+            token in vocab.generated_token_ids for token in samples[0][0]
+        ))
+
+    def test_exact_scaffold_length_dp_tracks_total_progeny(self):
+        tokenizer, backbone, _, _ = self.build_native_model()
+        model = PretrainedScaffoldTopologyModel(
+            len(tokenizer),
+            tokenizer.mask_token_id,
+            tokenizer.pad_token_id,
+            backbone=backbone,
+            pretrained_tokenizer=tokenizer,
+            regimes=1,
+            residual_dim=4,
+            dropout=0.0,
+        )
+        with torch.no_grad():
+            model.root_stop_prior.fill_(-20.0)
+            model.degree_prior.fill_(-20.0)
+            model.degree_prior[0, 0, 1] = 20.0
+            model.degree_prior[1:, 0, 0] = 20.0
+        probabilities = scaffold_length_distribution(
+            model, max_length=4, max_rounds=4
+        )
+        self.assertAlmostEqual(float(probabilities.sum()), 1.0, places=5)
+        self.assertGreater(float(probabilities[2]), 0.999)
+
+    def build_conditional_scaffold(self, regimes=2, state_feedback=True):
+        tokenizer, backbone, _, _ = self.build_native_model()
+        vocab = TextVocabulary(
+            len(tokenizer), PAD=1, GAP=9, MASK=9, LEFT=0, RIGHT=2,
+            EXTRA_STRUCTURAL=(3,),
+        )
+        model = PretrainedScaffoldTopologyModel(
+            vocab.vocab_size,
+            vocab.GAP,
+            vocab.PAD,
+            backbone=backbone,
+            pretrained_tokenizer=tokenizer,
+            regimes=regimes,
+            residual_dim=4,
+            state_feedback=state_feedback,
+            prompt_conditioned=True,
+            dropout=0.0,
+        )
+        tokens = torch.tensor([
+            [0, 5, 9, 6, 2],
+            [0, 7, 9, 8, 2],
+        ])
+        return model, tokens
+
+    def test_conditional_length_chart_is_normalized_per_prompt(self):
+        model, tokens = self.build_conditional_scaffold()
+        with torch.no_grad():
+            model.root_gate.fill_(0.7)
+            model.degree_gate.fill_(0.5)
+            torch.nn.init.normal_(model.root_residual.weight, std=1.0)
+            torch.nn.init.normal_(model.degree_residual.weight, std=1.0)
+            context = model.prompt_shape_context(tokens)
+            probabilities = conditional_scaffold_length_distribution(
+                model, context, max_length=6, max_rounds=6
+            )
+        self.assertEqual(tuple(probabilities.shape), (2, 8))
+        for row in probabilities:
+            self.assertAlmostEqual(float(row.sum()), 1.0, places=5)
+
+    def test_zero_gate_conditional_chart_matches_context_free_chart(self):
+        model, tokens = self.build_conditional_scaffold()
+        with torch.no_grad():
+            torch.nn.init.normal_(model.degree_prior, std=0.5)
+            torch.nn.init.normal_(model.root_stop_prior, std=0.5)
+            torch.nn.init.normal_(model.open_degree_prior.weight, std=0.3)
+            # Gates stay at zero, so the prompt cannot enter and every prompt
+            # must reproduce the single shared process exactly.
+            context = model.prompt_shape_context(tokens)
+            conditional = conditional_scaffold_length_distribution(
+                model, context, max_length=6, max_rounds=6
+            )
+            shared = scaffold_length_distribution(
+                model, max_length=6, max_rounds=6
+            )
+        for row in conditional:
+            self.assertTrue(torch.allclose(row, shared, atol=1e-6))
+
+    def test_conditional_chart_separates_prompts_and_backpropagates(self):
+        model, tokens = self.build_conditional_scaffold()
+        with torch.no_grad():
+            model.degree_gate.fill_(1.0)
+            model.root_gate.fill_(1.0)
+            torch.nn.init.normal_(model.degree_residual.weight, std=2.0)
+            torch.nn.init.normal_(model.root_residual.weight, std=2.0)
+        context = model.prompt_shape_context(tokens)
+        probabilities = conditional_scaffold_length_distribution(
+            model, context, max_length=6, max_rounds=6
+        )
+        self.assertFalse(
+            torch.allclose(probabilities[0], probabilities[1], atol=1e-4)
+        )
+        loss = -probabilities[torch.arange(2), torch.tensor([2, 3])].log().sum()
+        loss.backward()
+        self.assertIsNotNone(model.degree_residual.weight.grad)
+        self.assertGreater(
+            float(model.degree_residual.weight.grad.abs().sum()), 0.0
+        )
+        # The frozen backbone must stay out of the shape gradient path.
+        self.assertTrue(all(
+            parameter.grad is None
+            for parameter in model.backbone.parameters()
+        ))
+
+    def test_conditional_chart_matches_monte_carlo_rollout(self):
+        model, tokens = self.build_conditional_scaffold(
+            regimes=1, state_feedback=False
+        )
+        with torch.no_grad():
+            model.root_stop_prior.fill_(-1.0)
+            model.degree_prior.fill_(0.0)
+            model.degree_prior[:, 0, 0] = 1.0
+            model.degree_prior[:, 0, 1] = 0.5
+            model.degree_prior[:, 0, 2] = -0.5
+        max_length, max_rounds = 8, 8
+        with torch.no_grad():
+            context = model.prompt_shape_context(tokens[:1])
+            chart = conditional_scaffold_length_distribution(
+                model, context, max_length=max_length, max_rounds=max_rounds
+            )[0]
+        generator = torch.Generator().manual_seed(11)
+        counts = torch.zeros(max_length + 2)
+        trials = 20000
+        for _ in range(trials):
+            root, _, degree, _ = model.conditional_shape_logits(context, 0, 1, 0)
+            if torch.rand((), generator=generator) < root.sigmoid()[0]:
+                counts[0] += 1
+                continue
+            emitted, frontier = 0, 1
+            overflow = False
+            for step in range(max_rounds):
+                if frontier == 0:
+                    break
+                emitted += frontier
+                if emitted > max_length:
+                    overflow = True
+                    break
+                _, _, degree, _ = model.conditional_shape_logits(
+                    context, step, frontier, emitted - frontier
+                )
+                probabilities = degree[0, 0].softmax(dim=-1)
+                children = int(torch.multinomial(
+                    probabilities, frontier, replacement=True,
+                    generator=generator,
+                ).sum())
+                frontier = children
+            if overflow or frontier > 0:
+                counts[max_length + 1] += 1
+            else:
+                counts[emitted] += 1
+        empirical = counts / trials
+        self.assertLess(float(0.5 * (empirical - chart).abs().sum()), 0.02)
+
+    def test_shared_regime_scaffold_loss_trains_shape_prior(self):
+        tokenizer, backbone, _, _ = self.build_native_model()
+        vocab = TextVocabulary(
+            len(tokenizer), PAD=1, GAP=9, MASK=9, LEFT=0, RIGHT=2,
+            EXTRA_STRUCTURAL=(3,),
+        )
+        model = PretrainedScaffoldTopologyModel(
+            vocab.vocab_size,
+            vocab.GAP,
+            vocab.PAD,
+            backbone=backbone,
+            pretrained_tokenizer=tokenizer,
+            regimes=2,
+            residual_dim=4,
+            dropout=0.0,
+        )
+        examples = [
+            TextInfillingExample(((5,), (6,)), ((10, 11, 12),)),
+            TextInfillingExample(((7,), (8,)), ((),)),
+        ]
+        dataset = ScaffoldProposalDataset(
+            examples, vocab, strategy="midpoint", seed=17
+        )
+        batch = collate_compact_frontiers(
+            [dataset[index] for index in range(len(dataset))], vocab.PAD
+        )
+        losses = scaffold_topology_losses(
+            model, batch, vocab, torch.device("cpu")
+        )
+        loss = losses["root"] + losses["topology"]
+        self.assertTrue(torch.isfinite(loss))
+        loss.backward()
+        self.assertIsNotNone(model.degree_prior.grad)
+        self.assertIsNone(backbone.embedding.weight.grad)
+
+    def test_persistent_regime_loss_marginalizes_complete_derivations(self):
+        tokenizer, backbone, _, _ = self.build_native_model()
+        vocab = TextVocabulary(
+            len(tokenizer), PAD=1, GAP=9, MASK=9, LEFT=0, RIGHT=2,
+            EXTRA_STRUCTURAL=(3,),
+        )
+        model = PretrainedScaffoldTopologyModel(
+            vocab.vocab_size,
+            vocab.GAP,
+            vocab.PAD,
+            backbone=backbone,
+            pretrained_tokenizer=tokenizer,
+            regimes=3,
+            residual_dim=4,
+            dropout=0.0,
+        )
+        examples = [
+            TextInfillingExample(((5,), (6,)), ((10, 11, 12),)),
+            TextInfillingExample(((7,), (8,)), ((13, 14),)),
+        ]
+        dataset = FixedScaffoldDerivationDataset(
+            examples, vocab, strategy="midpoint", seed=17
+        )
+        derivations = [dataset[index] for index in range(len(dataset))]
+        self.assertEqual([len(rows) for rows in derivations], [2, 2])
+        losses = persistent_scaffold_losses(
+            model, derivations, vocab, torch.device("cpu")
+        )
+        loss = losses["root"] + losses["topology"]
+        self.assertTrue(torch.isfinite(loss))
+        self.assertEqual(int(losses["derivation_count"]), 2)
+        loss.backward()
+        self.assertIsNotNone(model.regime_prior.weight.grad)
+        self.assertIsNotNone(model.degree_prior.grad)
+        self.assertIsNone(backbone.embedding.weight.grad)
+
+    def test_markov_regime_loss_trains_depth_transitions(self):
+        tokenizer, backbone, _, _ = self.build_native_model()
+        vocab = TextVocabulary(
+            len(tokenizer), PAD=1, GAP=9, MASK=9, LEFT=0, RIGHT=2,
+            EXTRA_STRUCTURAL=(3,),
+        )
+        model = PretrainedScaffoldTopologyModel(
+            vocab.vocab_size,
+            vocab.GAP,
+            vocab.PAD,
+            backbone=backbone,
+            pretrained_tokenizer=tokenizer,
+            regimes=3,
+            residual_dim=4,
+            dropout=0.0,
+        )
+        examples = [
+            TextInfillingExample(((5,), (6,)), ((10, 11, 12),)),
+            TextInfillingExample(((7,), (8,)), ((13, 14),)),
+        ]
+        dataset = FixedScaffoldDerivationDataset(
+            examples, vocab, strategy="midpoint", seed=17
+        )
+        derivations = [dataset[index] for index in range(len(dataset))]
+        losses = markov_scaffold_losses(
+            model, derivations, vocab, torch.device("cpu")
+        )
+        loss = losses["root"] + losses["topology"]
+        self.assertTrue(torch.isfinite(loss))
+        self.assertEqual(int(losses["derivation_count"]), 2)
+        loss.backward()
+        self.assertIsNotNone(model.regime_transition.grad)
+        self.assertTrue(torch.isfinite(model.regime_transition.grad).all())
+        self.assertIsNotNone(model.degree_prior.grad)
+        self.assertIsNone(backbone.embedding.weight.grad)
+
+
+class ExposureGapTests(unittest.TestCase):
+    def build_model(self):
+        vocab = TextVocabulary(40, PAD=0, GAP=1, MASK=2, LEFT=3, RIGHT=4)
+        model = IntervalInsideBoundaryModel(
+            vocab_size=40, gap_id=vocab.GAP, pad_id=vocab.PAD,
+            d_model=16, nhead=4, layers=1, max_positions=32, dropout=0.0,
+        )
+        examples = [
+            corrupt_token_sequence([10, 11, 12, 13, 14, 15], [(2, 4)]),
+            corrupt_token_sequence([20, 21, 22, 23, 24], [(1, 3)]),
+        ]
+        return vocab, model, examples
+
+    def test_pivot_marginals_sum_to_the_span_length(self):
+        """d logZ / d score is the posterior count of each (node, pivot) cell.
+
+        Every tree emits each target token exactly once, so the marginals of
+        one example must sum to its span length whatever the tree posterior is.
+        """
+        vocab, model, examples = self.build_model()
+        exact, _, internals = depth_batch_log_likelihoods(
+            model, examples, vocab, torch.device("cpu"), 2, 0.5,
+            return_internals=True,
+        )
+        marginals = pivot_posterior_marginals(exact, internals["flat_scores"])
+        self.assertTrue(torch.isfinite(marginals).all())
+        self.assertTrue(marginals.ge(-1e-6).all())
+        records = internals["records"]
+        owners = torch.tensor(
+            [records[index][0] for index in internals["pivot_record_indices"]]
+        )
+        for example_index, example in enumerate(examples):
+            total = float(marginals[owners.eq(example_index)].sum())
+            self.assertAlmostEqual(total, len(example.spans[0]), places=4)
+
+    def test_record_posteriors_normalize_over_four_topologies(self):
+        vocab, model, examples = self.build_model()
+        exact, _, internals = depth_batch_log_likelihoods(
+            model, examples, vocab, torch.device("cpu"), 2, 0.0,
+            return_internals=True,
+        )
+        marginals = pivot_posterior_marginals(exact, internals["flat_scores"])
+        usage, topology = record_posteriors(
+            marginals,
+            internals["pivot_record_indices"],
+            internals["targets"],
+            len(internals["records"]),
+        )
+        used = usage.gt(1e-8)
+        self.assertTrue(bool(used.any()))
+        self.assertTrue(torch.allclose(
+            topology[used].sum(dim=-1), torch.ones(int(used.sum())), atol=1e-4
+        ))
+        # The root node of a nonempty span is always used exactly once.
+        roots = [
+            index for index, (_, depth, lo, hi) in enumerate(internals["records"])
+            if depth == 0 and lo == 0
+        ]
+        for index in roots:
+            self.assertAlmostEqual(float(usage[index]), 1.0, places=4)
+
+    def test_self_boundary_sources_point_at_the_emitting_parent(self):
+        records = [
+            (0, 0, 0, 3), (0, 1, 0, 1), (0, 1, 0, 2), (0, 1, 1, 3),
+            (0, 1, 2, 3), (0, 2, 0, 1), (0, 2, 1, 2), (0, 2, 2, 3),
+        ]
+        left, right = self_boundary_sources(records, {0: 3})
+        lookup = {record: index for index, record in enumerate(records)}
+        # The root sees only intact prompt context on both sides.
+        self.assertEqual(left[0], -1)
+        self.assertEqual(right[0], -1)
+        # [1, 3) at depth 1 is the right child of [0, 3) at depth 0.
+        self.assertEqual(left[lookup[(0, 1, 1, 3)]], lookup[(0, 0, 0, 3)])
+        self.assertEqual(right[lookup[(0, 1, 1, 3)]], -1)
+        # [0, 2) at depth 1 is the left child of [0, 3) at depth 0.
+        self.assertEqual(right[lookup[(0, 1, 0, 2)]], lookup[(0, 0, 0, 3)])
+        self.assertEqual(left[lookup[(0, 1, 0, 2)]], -1)
+        # An interior singleton is bounded by two generated tokens.
+        self.assertEqual(left[lookup[(0, 2, 1, 2)]], lookup[(0, 1, 0, 2)])
+        self.assertEqual(right[lookup[(0, 2, 1, 2)]], lookup[(0, 1, 1, 3)])
+
+    def test_self_token_topology_loss_trains_the_topology_head(self):
+        vocab, model, examples = self.build_model()
+        exact, _, internals = depth_batch_log_likelihoods(
+            model, examples, vocab, torch.device("cpu"), 2, 0.0,
+            return_internals=True,
+        )
+        marginals = pivot_posterior_marginals(exact, internals["flat_scores"])
+        loss = self_token_topology_loss(model, internals, marginals, 2, 0.0)
+        self.assertTrue(torch.isfinite(loss))
+        self.assertGreater(float(loss), 0.0)
+        loss.backward()
+        self.assertIsNotNone(model.topology_head.weight.grad)
+        self.assertGreater(float(model.topology_head.weight.grad.abs().sum()), 0.0)
+
+    def test_self_boundary_loss_only_perturbs_generated_boundaries(self):
+        vocab, model, examples = self.build_model()
+        exact, _, internals = depth_batch_log_likelihoods(
+            model, examples, vocab, torch.device("cpu"), 2, 0.0,
+            return_internals=True,
+        )
+        marginals = pivot_posterior_marginals(exact, internals["flat_scores"])
+        loss = self_boundary_token_loss(model, internals, marginals, 1.0)
+        self.assertIsNotNone(loss)
+        self.assertTrue(torch.isfinite(loss))
+        loss.backward()
+        self.assertIsNotNone(model.interval_projection.weight.grad)
+        # With probability zero nothing is replaced, so the term vanishes.
+        self.assertIsNone(
+            self_boundary_token_loss(model, internals, marginals, 0.0)
+        )
+
+    def test_shape_prior_is_normalised_and_differentiable(self):
+        """The prior measures shape only, and cannot be gamed by span length.
+
+        Total posterior mass equals the span length for any model, since every
+        tree emits every token exactly once, so the normaliser is a constant.
+        A chain over n tokens has mean token depth (n-1)/2 and a balanced tree
+        about log2(n), so the quantity separates the two shapes.
+        """
+        vocab, model, examples = self.build_model()
+        exact, _, internals = depth_batch_log_likelihoods(
+            model, examples, vocab, torch.device("cpu"), 2, 0.0,
+            return_internals=True,
+        )
+        marginals = pivot_posterior_marginals(exact, internals["flat_scores"])
+        span_tokens = sum(len(example.spans[0]) for example in examples)
+        self.assertAlmostEqual(float(marginals.sum()), span_tokens, places=4)
+
+        depth = posterior_mean_token_depth(exact, internals)
+        self.assertTrue(torch.isfinite(depth))
+        self.assertGreaterEqual(float(depth), 0.0)
+        longest = max(len(example.spans[0]) for example in examples)
+        self.assertLess(float(depth), longest)
+        depth.backward()
+        self.assertIsNotNone(model.topology_head.weight.grad)
+        self.assertGreater(
+            float(model.topology_head.weight.grad.abs().sum()), 0.0
+        )
+
+    def test_self_boundary_control_ignores_the_sampled_tokens(self):
+        """The matched control must depend only on the record draw.
+
+        At probability 1.0 every perturbable side is drawn, so the record
+        selection is deterministic and the seed changes only which tokens are
+        sampled. The treatment must move with those tokens and the control must
+        not, which is exactly the substitution the control removes.
+        """
+        vocab, model, examples = self.build_model()
+        exact, _, internals = depth_batch_log_likelihoods(
+            model, examples, vocab, torch.device("cpu"), 2, 0.0,
+            return_internals=True,
+        )
+        marginals = pivot_posterior_marginals(exact, internals["flat_scores"])
+        control = []
+        treatment = []
+        for seed in (11, 29):
+            torch.manual_seed(seed)
+            control.append(float(self_boundary_token_loss(
+                model, internals, marginals, 1.0, substitute=False
+            )))
+            torch.manual_seed(seed)
+            treatment.append(float(self_boundary_token_loss(
+                model, internals, marginals, 1.0, substitute=True
+            )))
+        self.assertAlmostEqual(control[0], control[1], places=6)
+        self.assertNotAlmostEqual(treatment[0], treatment[1], places=6)
+        self.assertNotAlmostEqual(treatment[0], control[0], places=6)
+
+    def test_exposure_auxiliaries_never_read_the_target_length(self):
+        """Identical prompts with different hidden lengths share every input.
+
+        The auxiliaries may only consume the chart records, the model's own
+        token distribution and the gold span the primary objective already
+        scores. This checks the substituted boundaries come from sampled
+        tokens rather than from anything the target length determines.
+        """
+        vocab, model, _ = self.build_model()
+        short = TextInfillingExample(((10, 11), (13,)), ((12,),))
+        long = TextInfillingExample(((10, 11), (13,)), ((12, 20, 21),))
+        self.assertEqual(short.prompt(vocab), long.prompt(vocab))
+        for example in (short, long):
+            _, _, internals = depth_batch_log_likelihoods(
+                model, [example], vocab, torch.device("cpu"), 2, 0.0,
+                return_internals=True,
+            )
+            length = len(example.spans[0])
+            left, right = self_boundary_sources(internals["records"], {0: length})
+            for index, (_, depth, lo, hi) in enumerate(internals["records"]):
+                if depth == 0:
+                    self.assertEqual((left[index], right[index]), (-1, -1))
+                if lo == 0:
+                    self.assertEqual(left[index], -1)
+                if hi == length:
+                    self.assertEqual(right[index], -1)
+
 
 if __name__ == "__main__":
     unittest.main()

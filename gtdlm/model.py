@@ -5,6 +5,7 @@ from typing import Optional, Sequence
 
 import torch
 from torch import nn
+from torch.nn import functional as F
 
 
 def immediate_gap_boundaries(
@@ -1015,6 +1016,942 @@ class PretrainedIntervalInsideModel(nn.Module):
         return self.topology_head(torch.cat((interval_hidden, token), dim=-1))
 
 
+class PretrainedGapFrontierModel(nn.Module):
+    """Re-encode the current partial canvas and score every open gap in parallel.
+
+    Unlike :class:`PretrainedIntervalInsideModel`, this model has no persistent
+    mask bank and no target-length-indexed chart. A gap is represented by the
+    native masked-LM state at its current position in the partial sequence.
+    After a frontier is expanded, generated tokens and newly-created gaps are
+    fed through the backbone again on the next round.
+
+    Lexical and structural learning are intentionally separated. The native MLM
+    head and backbone receive token-loss gradients, while root/degree/direction
+    heads read a detached backbone state through their own adapter.
+    """
+
+    def __init__(
+        self,
+        vocab_size: int,
+        gap_id: int,
+        pad_id: int,
+        model_name: str = "distilroberta-base",
+        cache_dir: str = ".hf_cache/hub",
+        max_steps: int = 32,
+        dropout: float = 0.1,
+        freeze_backbone: bool = False,
+        gradient_checkpointing: bool = False,
+        local_files_only: bool = False,
+        random_init_backbone: bool = False,
+        backbone=None,
+        pretrained_tokenizer=None,
+        pretrained_lm_head=None,
+        detach_structure_encoder: bool = True,
+    ) -> None:
+        super().__init__()
+        if backbone is None or pretrained_lm_head is None:
+            from transformers import (
+                AutoConfig,
+                AutoModelForMaskedLM,
+                AutoTokenizer,
+            )
+
+            if pretrained_tokenizer is None:
+                pretrained_tokenizer = AutoTokenizer.from_pretrained(
+                    model_name,
+                    cache_dir=cache_dir,
+                    use_fast=True,
+                    local_files_only=local_files_only,
+                )
+            if random_init_backbone:
+                config = AutoConfig.from_pretrained(
+                    model_name,
+                    cache_dir=cache_dir,
+                    local_files_only=local_files_only,
+                )
+                masked_lm = AutoModelForMaskedLM.from_config(config)
+            else:
+                masked_lm = AutoModelForMaskedLM.from_pretrained(
+                    model_name,
+                    cache_dir=cache_dir,
+                    local_files_only=local_files_only,
+                )
+            backbone = masked_lm.base_model
+            pretrained_lm_head = getattr(masked_lm, "lm_head", None)
+        if pretrained_tokenizer is None or pretrained_lm_head is None:
+            raise ValueError(
+                "pretrained frontier model needs a tokenizer and native MLM head"
+            )
+        if pretrained_tokenizer.mask_token_id is None:
+            raise ValueError("pretrained tokenizer must define a mask token")
+        if int(pretrained_tokenizer.mask_token_id) != int(gap_id):
+            raise ValueError("GAP must be the pretrained tokenizer's mask token")
+        if int(backbone.get_input_embeddings().num_embeddings) != int(vocab_size):
+            raise ValueError("native vocabulary size does not match the backbone")
+
+        self.backbone = backbone
+        self.pretrained_tokenizer = pretrained_tokenizer
+        self.token_embedding = backbone.get_input_embeddings()
+        self.token_head = pretrained_lm_head
+        self.gap_id = int(gap_id)
+        self.pad_id = int(pad_id)
+        self.detach_structure_encoder = bool(detach_structure_encoder)
+        d_model = int(backbone.config.hidden_size)
+        self.step_embedding = nn.Embedding(max_steps, d_model)
+        self.gap_type_embedding = nn.Embedding(2, d_model)
+        self.structure_adapter = nn.Sequential(
+            nn.LayerNorm(d_model),
+            nn.Linear(d_model, d_model),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.LayerNorm(d_model),
+        )
+        # Termination, branching degree, and unary direction are separate so
+        # chain collapse can be measured and calibrated directly.
+        self.root_stop_head = nn.Linear(d_model, 1)
+        self.degree_head = nn.Linear(d_model, 3)
+        self.direction_head = nn.Linear(d_model, 2)
+
+        if gradient_checkpointing:
+            self.backbone.gradient_checkpointing_enable()
+        if freeze_backbone:
+            for parameter in self.backbone.parameters():
+                parameter.requires_grad_(False)
+
+    @property
+    def d_model(self) -> int:
+        return int(self.backbone.config.hidden_size)
+
+    def forward(
+        self,
+        tokens: torch.Tensor,
+        padding_mask: Optional[torch.Tensor] = None,
+        steps: Optional[torch.Tensor] = None,
+    ):
+        if padding_mask is None:
+            padding_mask = tokens.eq(self.pad_id)
+        if steps is None:
+            steps = torch.zeros(
+                tokens.size(0), dtype=torch.long, device=tokens.device
+            )
+        steps = steps.clamp(0, self.step_embedding.num_embeddings - 1)
+        hidden = self.backbone(
+            input_ids=tokens.masked_fill(padding_mask, self.pad_id),
+            attention_mask=(~padding_mask).to(torch.long),
+        ).last_hidden_state
+        token_logits = self.token_head(hidden)
+
+        structure_input = hidden.detach() if self.detach_structure_encoder else hidden
+        root_types = steps.eq(0).to(torch.long)
+        structure_input = (
+            structure_input
+            + self.step_embedding(steps).unsqueeze(1)
+            + self.gap_type_embedding(root_types).unsqueeze(1)
+        )
+        structure = self.structure_adapter(structure_input)
+        return (
+            token_logits,
+            self.root_stop_head(structure).squeeze(-1),
+            self.degree_head(structure),
+            self.direction_head(structure),
+            hidden,
+        )
+
+
+class PretrainedScaffoldTopologyModel(nn.Module):
+    """Shape-only frontier policy with a shared latent regime per round.
+
+    The frozen pretrained encoder supplies optional prompt evidence.  Shape is
+    governed primarily by explicit depth-indexed priors.  A small, zero-gated
+    residual can use context, while a round-level categorical regime couples
+    sibling decisions without sharing any lexical latent or mask bank.
+    """
+
+    def __init__(
+        self,
+        vocab_size: int,
+        gap_id: int,
+        pad_id: int,
+        model_name: str = "distilroberta-base",
+        cache_dir: str = ".hf_cache/hub",
+        max_steps: int = 16,
+        regimes: int = 4,
+        residual_dim: int = 128,
+        state_feedback: bool = False,
+        prompt_conditioned: bool = False,
+        state_bins: int = 17,
+        semantic_codes: int = 0,
+        continuous_semantic: bool = False,
+        semantic_seed: int = 29,
+        semantic_injection_scale: float = 0.25,
+        dropout: float = 0.1,
+        local_files_only: bool = False,
+        backbone=None,
+        pretrained_tokenizer=None,
+    ) -> None:
+        super().__init__()
+        if regimes < 1:
+            raise ValueError("regimes must be positive")
+        if state_bins < 2:
+            raise ValueError("state_bins must be at least two")
+        if semantic_codes < 0:
+            raise ValueError("semantic_codes cannot be negative")
+        if semantic_codes and continuous_semantic:
+            raise ValueError(
+                "discrete and continuous semantic states are exclusive"
+            )
+        if backbone is None:
+            from transformers import AutoModel, AutoTokenizer
+
+            if pretrained_tokenizer is None:
+                pretrained_tokenizer = AutoTokenizer.from_pretrained(
+                    model_name,
+                    cache_dir=cache_dir,
+                    use_fast=True,
+                    local_files_only=local_files_only,
+                )
+            backbone = AutoModel.from_pretrained(
+                model_name,
+                cache_dir=cache_dir,
+                local_files_only=local_files_only,
+            )
+        if pretrained_tokenizer is None:
+            raise ValueError("a pretrained tokenizer is required")
+        if int(pretrained_tokenizer.mask_token_id) != int(gap_id):
+            raise ValueError("GAP must be the pretrained mask token")
+        if int(backbone.get_input_embeddings().num_embeddings) != int(vocab_size):
+            raise ValueError("native vocabulary size does not match the backbone")
+
+        self.backbone = backbone
+        self.gap_id = int(gap_id)
+        self.pad_id = int(pad_id)
+        self.regimes = int(regimes)
+        self.max_steps = int(max_steps)
+        self.state_feedback = bool(state_feedback)
+        # A prompt-conditioned policy reads one context vector fixed at round
+        # zero instead of the evolving scaffold, which keeps the branching
+        # process context-free *given the prompt* and therefore keeps the
+        # total-progeny chart exact per prompt.
+        self.prompt_conditioned = bool(prompt_conditioned)
+        self.state_bins = int(state_bins)
+        self.semantic_codes = int(semantic_codes)
+        self.continuous_semantic = bool(continuous_semantic)
+        self.semantic_injection_scale = float(semantic_injection_scale)
+        for parameter in self.backbone.parameters():
+            parameter.requires_grad_(False)
+
+        d_model = int(backbone.config.hidden_size)
+        if self.continuous_semantic:
+            with torch.no_grad():
+                token_vectors = (
+                    backbone.get_input_embeddings().weight.detach().float()
+                )
+                semantic_mean = token_vectors.mean(dim=0)
+                centered = token_vectors - semantic_mean
+                semantic_scale = centered.norm(dim=-1).mean()
+            self.register_buffer(
+                "semantic_embedding_mean",
+                semantic_mean.to(backbone.get_input_embeddings().weight.dtype),
+                persistent=False,
+            )
+            self.register_buffer(
+                "semantic_embedding_scale",
+                semantic_scale.to(backbone.get_input_embeddings().weight.dtype),
+                persistent=False,
+            )
+        if self.semantic_codes:
+            with torch.no_grad():
+                token_vectors = (
+                    backbone.get_input_embeddings().weight.detach().float()
+                )
+                generator = torch.Generator(device=token_vectors.device)
+                generator.manual_seed(int(semantic_seed))
+                projection = torch.randn(
+                    d_model,
+                    self.semantic_codes,
+                    generator=generator,
+                    device=token_vectors.device,
+                )
+                normalized_tokens = F.normalize(token_vectors, dim=-1)
+                normalized_projection = F.normalize(projection, dim=0)
+                token_codes = (
+                    normalized_tokens @ normalized_projection
+                ).argmax(dim=-1)
+                code_vectors = token_vectors.new_zeros(
+                    self.semantic_codes, d_model
+                )
+                code_vectors.index_add_(0, token_codes, token_vectors)
+                code_counts = torch.bincount(
+                    token_codes, minlength=self.semantic_codes
+                ).clamp_min(1).unsqueeze(-1)
+                code_vectors = code_vectors / code_counts
+                code_vectors = code_vectors - token_vectors.mean(
+                    dim=0, keepdim=True
+                )
+                code_vectors = F.normalize(code_vectors, dim=-1)
+                code_vectors = code_vectors * token_vectors.norm(
+                    dim=-1
+                ).mean()
+            self.register_buffer(
+                "semantic_token_codes", token_codes, persistent=False
+            )
+            self.register_buffer(
+                "semantic_code_vectors",
+                code_vectors.to(backbone.get_input_embeddings().weight.dtype),
+                persistent=False,
+            )
+        self.residual_dim = residual_dim
+        self.local_adapter = nn.Sequential(
+            nn.LayerNorm(d_model),
+            nn.Linear(d_model, residual_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.LayerNorm(residual_dim),
+        )
+        self.global_adapter = nn.Sequential(
+            nn.LayerNorm(d_model),
+            nn.Linear(d_model, residual_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.LayerNorm(residual_dim),
+        )
+
+        self.root_stop_prior = nn.Parameter(torch.zeros(()))
+        self.regime_prior = nn.Embedding(max_steps, regimes)
+        self.regime_transition = nn.Parameter(
+            torch.zeros(max_steps, regimes, regimes)
+        )
+        self.degree_prior = nn.Parameter(torch.zeros(max_steps, regimes, 3))
+        self.direction_prior = nn.Parameter(torch.zeros(max_steps, regimes, 2))
+        nn.init.normal_(self.degree_prior, std=0.01)
+        nn.init.normal_(self.direction_prior, std=0.01)
+        if self.state_feedback:
+            self.open_regime_prior = nn.Embedding(state_bins, regimes)
+            self.completed_regime_prior = nn.Embedding(state_bins, regimes)
+            self.open_degree_prior = nn.Embedding(
+                state_bins, regimes * 3
+            )
+            self.completed_degree_prior = nn.Embedding(
+                state_bins, regimes * 3
+            )
+            nn.init.zeros_(self.open_regime_prior.weight)
+            nn.init.zeros_(self.completed_regime_prior.weight)
+            nn.init.zeros_(self.open_degree_prior.weight)
+            nn.init.zeros_(self.completed_degree_prior.weight)
+        self.root_residual = nn.Linear(residual_dim, 1)
+        self.regime_residual = nn.Linear(residual_dim, regimes)
+        self.degree_residual = nn.Linear(residual_dim, regimes * 3)
+        self.direction_residual = nn.Linear(residual_dim, regimes * 2)
+        self.semantic_head = (
+            nn.Linear(residual_dim, self.semantic_codes)
+            if self.semantic_codes
+            else None
+        )
+        self.semantic_vector_head = (
+            nn.Linear(residual_dim, d_model)
+            if self.continuous_semantic
+            else None
+        )
+
+        # Zero gates make the initial policy an explicit global shape prior.
+        # Context can enter only when held-out likelihood supports it.
+        self.root_gate = nn.Parameter(torch.zeros(()))
+        self.regime_gate = nn.Parameter(torch.zeros(max_steps))
+        self.degree_gate = nn.Parameter(torch.zeros(max_steps))
+        self.direction_gate = nn.Parameter(torch.zeros(max_steps))
+        # Held-out calibration is disabled during ordinary training.  Keeping
+        # these explicit makes post-hoc shape calibration reproducible without
+        # touching the frozen encoder or learned residual policy.
+        self.calibration_root_bias = nn.Parameter(
+            torch.zeros(()), requires_grad=False
+        )
+        self.calibration_regime_bias = nn.Parameter(
+            torch.zeros(max_steps, regimes), requires_grad=False
+        )
+        self.calibration_degree_bias = nn.Parameter(
+            torch.zeros(max_steps, 3), requires_grad=False
+        )
+        self.calibration_direction_bias = nn.Parameter(
+            torch.zeros(max_steps, 2), requires_grad=False
+        )
+
+    @property
+    def d_model(self) -> int:
+        return int(self.backbone.config.hidden_size)
+
+    def topology_state_dict(self):
+        """Return the small trainable state without duplicating the backbone."""
+        return {
+            name: value
+            for name, value in self.state_dict().items()
+            if not name.startswith("backbone.")
+        }
+
+    def token_semantic_states(self, token_ids: torch.Tensor) -> torch.Tensor:
+        if not self.continuous_semantic:
+            raise ValueError("continuous semantic states are disabled")
+        embeddings = self.backbone.get_input_embeddings().weight[token_ids]
+        centered = embeddings - self.semantic_embedding_mean
+        return F.normalize(centered, dim=-1) * self.semantic_embedding_scale
+
+    def load_topology_state_dict(self, state_dict) -> None:
+        missing, unexpected = self.load_state_dict(state_dict, strict=False)
+        non_backbone_missing = [
+            name
+            for name in missing
+            if not name.startswith("backbone.")
+            and not name.startswith("calibration_")
+            and name != "regime_transition"
+        ]
+        if non_backbone_missing or unexpected:
+            raise RuntimeError(
+                "invalid topology state: missing={} unexpected={}".format(
+                    non_backbone_missing, unexpected
+                )
+            )
+
+    def prompt_shape_context(
+        self,
+        tokens: torch.Tensor,
+        padding_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Encode the round-zero canvas once into a fixed per-prompt context.
+
+        Every later round reuses this vector, so the shape policy depends on
+        the prompt but not on the partially grown scaffold.  That is what makes
+        `conditional_scaffold_length_distribution` exact rather than an
+        approximation of an evolving process.
+        """
+        if padding_mask is None:
+            padding_mask = tokens.eq(self.pad_id)
+        input_ids = tokens.masked_fill(padding_mask, self.pad_id)
+        with torch.no_grad():
+            hidden = self.backbone(
+                input_ids=input_ids,
+                attention_mask=(~padding_mask).to(torch.long),
+            ).last_hidden_state
+        observed = (~padding_mask).to(hidden.dtype).unsqueeze(-1)
+        pooled = (hidden * observed).sum(1) / observed.sum(1).clamp_min(1.0)
+        return self.global_adapter(pooled)
+
+    def conditional_shape_logits(
+        self,
+        context: torch.Tensor,
+        step: int,
+        open_count: int,
+        completed_count: int,
+    ):
+        """Shape logits for one chart state, from the prompt context alone.
+
+        `structure_logits` reads the current canvas, so its degree logits
+        differ per node and per round.  Here every open node in a round shares
+        one distribution determined by the prompt, the round, and the realized
+        counts, which is exactly the exchangeability the chart assumes.
+        """
+        step = min(max(int(step), 0), self.max_steps - 1)
+        batch = context.size(0)
+        root = (
+            self.root_stop_prior
+            + self.calibration_root_bias
+            + torch.tanh(self.root_gate) * self.root_residual(context).squeeze(-1)
+        )
+        regime = (
+            self.regime_prior.weight[step]
+            + self.calibration_regime_bias[step]
+            + torch.tanh(self.regime_gate[step]) * self.regime_residual(context)
+        )
+        degree = (
+            self.degree_prior[step]
+            + self.calibration_degree_bias[step].unsqueeze(0)
+            + torch.tanh(self.degree_gate[step])
+            * self.degree_residual(context).view(batch, self.regimes, 3)
+        )
+        direction = (
+            self.direction_prior[step]
+            + self.calibration_direction_bias[step].unsqueeze(0)
+            + torch.tanh(self.direction_gate[step])
+            * self.direction_residual(context).view(batch, self.regimes, 2)
+        )
+        if self.state_feedback:
+            open_index = min(max(int(open_count), 0), self.state_bins - 1)
+            completed_index = min(
+                max(int(completed_count), 0), self.state_bins - 1
+            )
+            regime = (
+                regime
+                + self.open_regime_prior.weight[open_index]
+                + self.completed_regime_prior.weight[completed_index]
+            )
+            degree = degree + (
+                self.open_degree_prior.weight[open_index]
+                + self.completed_degree_prior.weight[completed_index]
+            ).view(self.regimes, 3).unsqueeze(0)
+        return root, regime, degree, direction
+
+    def structure_logits(
+        self,
+        tokens: torch.Tensor,
+        padding_mask: Optional[torch.Tensor] = None,
+        steps: Optional[torch.Tensor] = None,
+        open_mask: Optional[torch.Tensor] = None,
+        slot_codes: Optional[torch.Tensor] = None,
+        slot_semantics: Optional[torch.Tensor] = None,
+        semantic_scale: Optional[torch.Tensor] = None,
+        semantic_requires_grad: bool = False,
+        return_semantic: bool = False,
+        return_continuous_semantic: bool = False,
+    ):
+        if padding_mask is None:
+            padding_mask = tokens.eq(self.pad_id)
+        if steps is None:
+            steps = torch.zeros(
+                tokens.size(0), dtype=torch.long, device=tokens.device
+            )
+        steps = steps.clamp(0, self.max_steps - 1)
+        if open_mask is None:
+            open_mask = tokens.eq(self.gap_id) & ~padding_mask
+        input_ids = tokens.masked_fill(padding_mask, self.pad_id)
+        def encode_scaffold():
+            if self.continuous_semantic and slot_semantics is not None:
+                valid_semantics = slot_semantics.abs().sum(dim=-1).gt(0)
+                inputs_embeds = self.backbone.get_input_embeddings()(input_ids)
+                scale = (
+                    self.semantic_injection_scale
+                    if semantic_scale is None
+                    else semantic_scale
+                )
+                if torch.is_tensor(scale):
+                    while scale.dim() < inputs_embeds.dim():
+                        scale = scale.unsqueeze(-1)
+                inputs_embeds = inputs_embeds + (
+                    scale
+                    * slot_semantics.to(inputs_embeds.dtype)
+                    * valid_semantics.unsqueeze(-1).to(inputs_embeds.dtype)
+                )
+                return self.backbone(
+                    inputs_embeds=inputs_embeds,
+                    attention_mask=(~padding_mask).to(torch.long),
+                ).last_hidden_state
+            elif self.semantic_codes and slot_codes is not None:
+                valid_codes = slot_codes.ge(0) & ~padding_mask
+                inputs_embeds = self.backbone.get_input_embeddings()(input_ids)
+                code_indices = slot_codes.clamp(0, self.semantic_codes - 1)
+                code_residual = self.semantic_code_vectors[code_indices]
+                inputs_embeds = inputs_embeds + (
+                    self.semantic_injection_scale
+                    * code_residual
+                    * valid_codes.unsqueeze(-1).to(code_residual.dtype)
+                )
+                return self.backbone(
+                    inputs_embeds=inputs_embeds,
+                    attention_mask=(~padding_mask).to(torch.long),
+                ).last_hidden_state
+            return self.backbone(
+                input_ids=input_ids,
+                attention_mask=(~padding_mask).to(torch.long),
+            ).last_hidden_state
+
+        if semantic_requires_grad:
+            hidden = encode_scaffold()
+        else:
+            with torch.no_grad():
+                hidden = encode_scaffold()
+
+        shape_hidden = hidden if semantic_requires_grad else hidden.detach()
+        local = self.local_adapter(shape_hidden)
+        observed = (~padding_mask).to(hidden.dtype).unsqueeze(-1)
+        pooled = (shape_hidden * observed).sum(1) / observed.sum(1).clamp_min(1.0)
+        global_hidden = self.global_adapter(pooled)
+        batch, width = tokens.shape
+
+        root = self.root_stop_prior + self.calibration_root_bias + torch.tanh(self.root_gate) * (
+            self.root_residual(local).squeeze(-1)
+        )
+        regime = self.regime_prior(steps) + torch.tanh(
+            self.regime_gate[steps]
+        ).unsqueeze(-1) * self.regime_residual(global_hidden) + self.calibration_regime_bias[steps]
+        degree = self.degree_prior[steps].unsqueeze(1).expand(
+            batch, width, self.regimes, 3
+        ) + torch.tanh(self.degree_gate[steps]).view(batch, 1, 1, 1) * (
+            self.degree_residual(local).view(batch, width, self.regimes, 3)
+        ) + self.calibration_degree_bias[steps].view(batch, 1, 1, 3)
+        direction = self.direction_prior[steps].unsqueeze(1).expand(
+            batch, width, self.regimes, 2
+        ) + torch.tanh(self.direction_gate[steps]).view(batch, 1, 1, 1) * (
+            self.direction_residual(local).view(batch, width, self.regimes, 2)
+        ) + self.calibration_direction_bias[steps].view(batch, 1, 1, 2)
+        if self.state_feedback:
+            open_count = open_mask.sum(dim=1).clamp(
+                0, self.state_bins - 1
+            )
+            mask_count = (
+                tokens.eq(self.gap_id) & ~padding_mask
+            ).sum(dim=1)
+            completed_count = (mask_count - open_count).clamp(
+                0, self.state_bins - 1
+            )
+            regime = (
+                regime
+                + self.open_regime_prior(open_count)
+                + self.completed_regime_prior(completed_count)
+            )
+            state_degree = (
+                self.open_degree_prior(open_count)
+                + self.completed_degree_prior(completed_count)
+            ).view(batch, self.regimes, 3)
+            degree = degree + state_degree.unsqueeze(1)
+        if return_semantic:
+            if self.semantic_head is None:
+                raise ValueError("semantic codes are disabled")
+            return (
+                root,
+                regime,
+                degree,
+                direction,
+                hidden,
+                self.semantic_head(local),
+            )
+        if return_continuous_semantic:
+            if self.semantic_vector_head is None:
+                raise ValueError("continuous semantic states are disabled")
+            semantic_state = F.normalize(
+                self.semantic_vector_head(local), dim=-1
+            ) * self.semantic_embedding_scale
+            return (
+                root,
+                regime,
+                degree,
+                direction,
+                hidden,
+                semantic_state,
+            )
+        return root, regime, degree, direction, hidden
+
+    @torch.inference_mode()
+    def sample_regime_transition(
+        self,
+        previous_regimes: torch.Tensor,
+        steps: torch.Tensor,
+        generator: Optional[torch.Generator] = None,
+    ) -> torch.Tensor:
+        steps = steps.clamp(0, self.max_steps - 1)
+        logits = self.regime_transition[steps, previous_regimes]
+        return torch.multinomial(
+            logits.softmax(dim=-1), 1, generator=generator
+        ).squeeze(-1)
+
+    @torch.inference_mode()
+    def sample_structure(
+        self,
+        tokens: torch.Tensor,
+        padding_mask: torch.Tensor,
+        steps: torch.Tensor,
+        open_mask: torch.Tensor,
+        generator: Optional[torch.Generator] = None,
+        forced_regimes: Optional[torch.Tensor] = None,
+        slot_codes: Optional[torch.Tensor] = None,
+        slot_semantics: Optional[torch.Tensor] = None,
+        return_semantic_codes: bool = False,
+        return_continuous_semantic: bool = False,
+    ):
+        if return_semantic_codes and return_continuous_semantic:
+            raise ValueError("only one semantic representation can be returned")
+        outputs = self.structure_logits(
+            tokens,
+            padding_mask,
+            steps,
+            open_mask,
+            slot_codes=slot_codes,
+            slot_semantics=slot_semantics,
+            return_semantic=return_semantic_codes,
+            return_continuous_semantic=return_continuous_semantic,
+        )
+        root, regime_logits, degree_logits, direction_logits = outputs[:4]
+        stops = torch.rand(
+            root.shape, device=root.device, generator=generator
+        ) < root.sigmoid()
+        regime_probabilities = regime_logits.softmax(dim=-1)
+        sampled_regimes = torch.multinomial(
+            regime_probabilities, 1, generator=generator
+        ).squeeze(-1)
+        if forced_regimes is None:
+            regimes = sampled_regimes
+        else:
+            forced_regimes = forced_regimes.to(
+                device=tokens.device, dtype=torch.long
+            )
+            regimes = torch.where(
+                forced_regimes.ge(0), forced_regimes, sampled_regimes
+            )
+        rows = torch.arange(tokens.size(0), device=tokens.device)
+        selected_degree = degree_logits[rows, :, regimes, :]
+        selected_direction = direction_logits[rows, :, regimes, :]
+        degrees = torch.multinomial(
+            selected_degree.softmax(dim=-1).reshape(-1, 3),
+            1,
+            generator=generator,
+        ).reshape(tokens.shape)
+        directions = torch.multinomial(
+            selected_direction.softmax(dim=-1).reshape(-1, 2),
+            1,
+            generator=generator,
+        ).reshape(tokens.shape)
+        if return_semantic_codes:
+            semantic_logits = outputs[5]
+            semantic = torch.multinomial(
+                semantic_logits.softmax(dim=-1).reshape(
+                    -1, self.semantic_codes
+                ),
+                1,
+                generator=generator,
+            ).reshape(tokens.shape)
+            return stops, degrees, directions, regimes, semantic
+        if return_continuous_semantic:
+            return stops, degrees, directions, regimes, outputs[5]
+        return stops, degrees, directions, regimes
+
+
+class PretrainedUnifiedScaffoldModel(PretrainedScaffoldTopologyModel):
+    """One masked LM jointly grows a scaffold and maintains token beliefs.
+
+    Every round uses one shared backbone pass.  Its native MLM head supplies a
+    token posterior for each open node while topology heads decide how that
+    node branches.  The posterior embedding is stored on the completed node
+    and is re-encoded on later rounds.  A zero-initialized gate makes the token
+    path exactly the supplied masked-LM baseline before joint training.
+    """
+
+    def __init__(
+        self,
+        vocab_size: int,
+        gap_id: int,
+        pad_id: int,
+        pretrained_lm_head,
+        generated_token_ids: Sequence[int],
+        posterior_topk: int = 32,
+        freeze_lexical_model: bool = True,
+        **kwargs,
+    ) -> None:
+        if pretrained_lm_head is None:
+            raise ValueError("a pretrained MLM head is required")
+        if not generated_token_ids:
+            raise ValueError("generated token ids cannot be empty")
+        kwargs.pop("continuous_semantic", None)
+        kwargs.pop("semantic_codes", None)
+        kwargs.pop("semantic_injection_scale", None)
+        super().__init__(
+            vocab_size,
+            gap_id,
+            pad_id,
+            continuous_semantic=True,
+            semantic_codes=0,
+            semantic_injection_scale=1.0,
+            **kwargs,
+        )
+        # Unified states come from the native token posterior, so the former
+        # auxiliary vector-prediction head would be redundant and is removed.
+        self.semantic_vector_head = None
+        self.lm_head = pretrained_lm_head
+        self.posterior_topk = max(1, int(posterior_topk))
+        self.register_buffer(
+            "generated_token_ids",
+            torch.tensor(list(generated_token_ids), dtype=torch.long),
+            persistent=True,
+        )
+        # Node-local token beliefs affect topology through their own attention
+        # path.  They never perturb the MLM hidden states or token head, so
+        # lexical baseline equivalence is exact even after this gate is learned.
+        residual_dim = self.residual_dim
+        self.posterior_query = nn.Linear(self.d_model, residual_dim, bias=False)
+        self.posterior_key = nn.Linear(self.d_model, residual_dim, bias=False)
+        self.posterior_value = nn.Linear(self.d_model, residual_dim, bias=False)
+        self.posterior_norm = nn.LayerNorm(residual_dim)
+        self.posterior_regime_head = nn.Linear(residual_dim, self.regimes)
+        self.posterior_degree_head = nn.Linear(
+            residual_dim, self.regimes * 3
+        )
+        self.posterior_direction_head = nn.Linear(
+            residual_dim, self.regimes * 2
+        )
+        self.posterior_gate = nn.Parameter(torch.zeros(self.max_steps))
+        self.freeze_lexical_model = bool(freeze_lexical_model)
+        if freeze_lexical_model:
+            for parameter in self.lm_head.parameters():
+                parameter.requires_grad_(False)
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        # Frozen pretrained components must not acquire stochastic dropout
+        # drift while the small joint controller is trained.
+        self.backbone.eval()
+        if self.freeze_lexical_model:
+            self.lm_head.eval()
+        return self
+
+    def topology_state_dict(self):
+        """Save joint control parameters without duplicating the lexical LM."""
+        return {
+            name: value
+            for name, value in self.state_dict().items()
+            if not name.startswith("backbone.")
+            and not name.startswith("lm_head.")
+        }
+
+    def load_topology_state_dict(self, state_dict) -> None:
+        missing, unexpected = self.load_state_dict(state_dict, strict=False)
+        allowed_missing = ("backbone.", "lm_head.", "calibration_")
+        non_lexical_missing = [
+            name
+            for name in missing
+            if not name.startswith(allowed_missing)
+            and name != "regime_transition"
+            and name != "generated_token_ids"
+            and not name.startswith("posterior_")
+        ]
+        if non_lexical_missing or unexpected:
+            raise RuntimeError(
+                "invalid unified topology state: missing={} unexpected={}".format(
+                    non_lexical_missing, unexpected
+                )
+            )
+
+    def posterior_states(self, token_logits: torch.Tensor) -> torch.Tensor:
+        """Convert native MLM probabilities to node-local soft embeddings."""
+        generated = self.generated_token_ids.to(token_logits.device)
+        allowed = token_logits.index_select(-1, generated)
+        topk = min(self.posterior_topk, allowed.size(-1))
+        values, indices = allowed.topk(topk, dim=-1)
+        probabilities = values.softmax(dim=-1)
+        token_ids = generated[indices]
+        states = self.token_semantic_states(token_ids)
+        return (probabilities.unsqueeze(-1) * states).sum(dim=-2)
+
+    def unified_logits(
+        self,
+        tokens: torch.Tensor,
+        padding_mask: Optional[torch.Tensor] = None,
+        steps: Optional[torch.Tensor] = None,
+        open_mask: Optional[torch.Tensor] = None,
+        slot_semantics: Optional[torch.Tensor] = None,
+        semantic_requires_grad: bool = False,
+    ):
+        if steps is None:
+            steps = torch.zeros(
+                tokens.size(0), dtype=torch.long, device=tokens.device
+            )
+        clipped_steps = steps.clamp(0, self.max_steps - 1)
+        root, regime, degree, direction, hidden = self.structure_logits(
+            tokens,
+            padding_mask,
+            clipped_steps,
+            open_mask,
+        )
+        if slot_semantics is not None:
+            if padding_mask is None:
+                padding_mask = tokens.eq(self.pad_id)
+            valid = slot_semantics.abs().sum(dim=-1).gt(0) & ~padding_mask
+            query = self.posterior_query(hidden.detach())
+            key = self.posterior_key(slot_semantics.to(query.dtype))
+            value = self.posterior_value(slot_semantics.to(query.dtype))
+            scores = torch.matmul(query, key.transpose(1, 2)) / math.sqrt(
+                query.size(-1)
+            )
+            scores = scores.masked_fill(~valid.unsqueeze(1), -1e4)
+            attention = scores.softmax(dim=-1)
+            attention = attention * valid.unsqueeze(1).to(attention.dtype)
+            attention = attention / attention.sum(
+                dim=-1, keepdim=True
+            ).clamp_min(1e-6)
+            local_posterior = self.posterior_norm(
+                torch.matmul(attention, value)
+            )
+            valid_float = valid.to(value.dtype).unsqueeze(-1)
+            global_posterior = self.posterior_norm(
+                (value * valid_float).sum(dim=1)
+                / valid_float.sum(dim=1).clamp_min(1.0)
+            )
+            has_posterior = valid.any(dim=1).to(value.dtype)
+            local_posterior = (
+                local_posterior * has_posterior.view(-1, 1, 1)
+            )
+            global_posterior = (
+                global_posterior * has_posterior.unsqueeze(-1)
+            )
+            gate = torch.tanh(self.posterior_gate[clipped_steps])
+            regime = regime + gate.unsqueeze(-1) * (
+                self.posterior_regime_head(global_posterior)
+            )
+            degree = degree + gate.view(-1, 1, 1, 1) * (
+                self.posterior_degree_head(local_posterior).view(
+                    tokens.size(0), tokens.size(1), self.regimes, 3
+                )
+            )
+            direction = direction + gate.view(-1, 1, 1, 1) * (
+                self.posterior_direction_head(local_posterior).view(
+                    tokens.size(0), tokens.size(1), self.regimes, 2
+                )
+            )
+        return self.lm_head(hidden), root, regime, degree, direction, hidden
+
+    @torch.inference_mode()
+    def sample_unified_structure(
+        self,
+        tokens: torch.Tensor,
+        padding_mask: torch.Tensor,
+        steps: torch.Tensor,
+        open_mask: torch.Tensor,
+        slot_semantics: Optional[torch.Tensor] = None,
+        generator: Optional[torch.Generator] = None,
+        forced_regimes: Optional[torch.Tensor] = None,
+    ):
+        outputs = self.unified_logits(
+            tokens,
+            padding_mask,
+            steps,
+            open_mask,
+            slot_semantics=slot_semantics,
+        )
+        token_logits, root, regime_logits, degree_logits, direction_logits = (
+            outputs[:5]
+        )
+        stops = torch.rand(
+            root.shape, device=root.device, generator=generator
+        ) < root.sigmoid()
+        sampled_regimes = torch.multinomial(
+            regime_logits.softmax(dim=-1), 1, generator=generator
+        ).squeeze(-1)
+        if forced_regimes is None:
+            regimes = sampled_regimes
+        else:
+            forced_regimes = forced_regimes.to(
+                device=tokens.device, dtype=torch.long
+            )
+            regimes = torch.where(
+                forced_regimes.ge(0), forced_regimes, sampled_regimes
+            )
+        rows = torch.arange(tokens.size(0), device=tokens.device)
+        selected_degree = degree_logits[rows, :, regimes, :]
+        selected_direction = direction_logits[rows, :, regimes, :]
+        degrees = torch.multinomial(
+            selected_degree.softmax(dim=-1).reshape(-1, 3),
+            1,
+            generator=generator,
+        ).reshape(tokens.shape)
+        directions = torch.multinomial(
+            selected_direction.softmax(dim=-1).reshape(-1, 2),
+            1,
+            generator=generator,
+        ).reshape(tokens.shape)
+        return (
+            stops,
+            degrees,
+            directions,
+            regimes,
+            self.posterior_states(token_logits),
+            token_logits,
+        )
+
+
 class GapTreeSharedRegimeBoundaryModel(nn.Module):
     """Joint topology conditioned on one root-sampled shared branching regime."""
 
@@ -1197,6 +2134,8 @@ class PretrainedLengthMaskedModel(nn.Module):
         tokens: torch.Tensor,
         padding_mask: Optional[torch.Tensor],
         mask_counts: Optional[Sequence[int]],
+        mask_residuals: Optional[Sequence[torch.Tensor]] = None,
+        residual_scale: float = 0.0,
     ):
         """Encode each prompt with ``mask_counts[i]`` mask tokens in its gap.
 
@@ -1230,10 +2169,35 @@ class PretrainedLengthMaskedModel(nn.Module):
             model_inputs = {
                 key: value.to(tokens.device) for key, value in encoded.items()
             }
-        hidden = encoder.backbone(**model_inputs).last_hidden_state
-        matches = model_inputs["input_ids"].eq(
+        input_ids = model_inputs["input_ids"]
+        matches = input_ids.eq(
             int(encoder.pretrained_tokenizer.mask_token_id)
         )
+        if residual_scale and mask_residuals is not None:
+            inputs_embeds = encoder.backbone.get_input_embeddings()(input_ids)
+            inputs_embeds = inputs_embeds.clone()
+            for row, residuals in enumerate(mask_residuals):
+                positions = matches[row].nonzero().flatten()
+                count = min(int(positions.numel()), int(residuals.size(0)))
+                if count:
+                    inputs_embeds[row, positions[:count]] = (
+                        inputs_embeds[row, positions[:count]]
+                        + float(residual_scale)
+                        * residuals[:count].to(
+                            device=inputs_embeds.device,
+                            dtype=inputs_embeds.dtype,
+                        )
+                    )
+            backbone_inputs = {
+                key: value
+                for key, value in model_inputs.items()
+                if key != "input_ids"
+            }
+            hidden = encoder.backbone(
+                inputs_embeds=inputs_embeds, **backbone_inputs
+            ).last_hidden_state
+        else:
+            hidden = encoder.backbone(**model_inputs).last_hidden_state
         width = int(matches.sum(dim=1).max().clamp_min(1))
         states = hidden.new_zeros((hidden.size(0), width, hidden.size(-1)))
         valid = torch.zeros(
@@ -1262,6 +2226,8 @@ class PretrainedLengthMaskedModel(nn.Module):
         tokens: torch.Tensor,
         padding_mask: Optional[torch.Tensor] = None,
         mask_counts: Optional[Sequence[int]] = None,
+        mask_residuals: Optional[Sequence[torch.Tensor]] = None,
+        residual_scale: float = 0.0,
     ):
         if self.bottleneck_context:
             # One mask, one summary vector, every span token predicted from it.
@@ -1276,7 +2242,13 @@ class PretrainedLengthMaskedModel(nn.Module):
             for row, count in enumerate(mask_counts or [width] * states.size(0)):
                 valid[row, :min(int(count), width)] = True
             return self.token_head(states), valid
-        states, valid = self._encode_with_masks(tokens, padding_mask, mask_counts)
+        states, valid = self._encode_with_masks(
+            tokens,
+            padding_mask,
+            mask_counts,
+            mask_residuals=mask_residuals,
+            residual_scale=residual_scale,
+        )
         return self.token_head(states), valid
 
 

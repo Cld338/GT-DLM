@@ -71,8 +71,17 @@ def frequency_floor(corpus, vocab, examples):
 
 
 @torch.inference_mode()
-def decode_greedy_top_down(model, examples, vocab, device, batch_size):
-    """Generate tokens and topology jointly, without gold length or tree."""
+def decode_greedy_top_down(
+    model, examples, vocab, device, batch_size, return_rounds=False
+):
+    """Generate tokens and topology jointly, without gold length or tree.
+
+    With ``return_rounds`` the number of expansion rounds each example actually
+    consumed is returned alongside the predictions. That is the quantity the
+    parallel claim is about — an n-token span is supposed to cost about log2(n)
+    rounds rather than n — and `research/GENERATION_THEORY.md` needs it to place
+    a model against the length/parallelism trade-off.
+    """
     contexts, roots_left, roots_right, bank_chunks = [], [], [], []
     for start in range(0, len(examples), batch_size):
         batch = examples[start:start + batch_size]
@@ -93,6 +102,7 @@ def decode_greedy_top_down(model, examples, vocab, device, batch_size):
     generated = torch.tensor(vocab.generated_token_ids, device=device)
     canvases = [[None] for _ in examples]
     unfinished = [False] * len(examples)
+    rounds = [0] * len(examples)
     for depth in range(8):
         locations = []
         for owner, canvas in enumerate(canvases):
@@ -112,6 +122,8 @@ def decode_greedy_top_down(model, examples, vocab, device, batch_size):
                 locations.append((owner, position, left, right))
         if not locations:
             break
+        for owner in {item[0] for item in locations}:
+            rounds[owner] += 1
         owners = torch.tensor(
             [item[0] for item in locations], dtype=torch.long, device=device
         )
@@ -164,6 +176,8 @@ def decode_greedy_top_down(model, examples, vocab, device, batch_size):
     predictions = [
         [int(item) for item in canvas if item is not None] for canvas in canvases
     ]
+    if return_rounds:
+        return predictions, unfinished, rounds
     return predictions, unfinished
 
 

@@ -57,9 +57,60 @@ MLM-compatible states to each queried node. Test exact NLL improves
 length TV improves `0.157 -> 0.126`. The gain survives answer-independent tree
 selection and is not posterior exploitation. Generation moves much less:
 oracle-midpoint accuracy is `9.80%`, and sampled top-down rollout reaches
-`12.24%` on length-matched pairs against the masked baseline's `20.04%`. The
-remaining blocker is gold-token/boundary exposure during topology training. See
+`12.24%` on length-matched pairs against the masked baseline's `20.04%`. See
 `research/FIXED_MASK_BANK.md`.
+
+That document named gold-token/boundary exposure as the remaining blocker.
+It is not. Measured on the same checkpoint, dropping the gold pivot token from
+the topology head costs `0.005` nats, and although self-generated boundaries do
+cost `0.487` nats of token NLL, training against them loses `0.454` nats of test
+exact NLL while its entire length gain is reproduced by a matched control that
+keeps the gold boundaries. ROADMAP item 18 is closed negative on both branches.
+See `research/EXPOSURE_GAP.md`.
+
+**The parallel-expansion claim does not hold on natural text.** Counting the
+expansion rounds of the greedy rollout gives `5.758` rounds for `5.758` emitted
+tokens, exactly equal on all 128 test prompts. Since a depth holding `k` open
+nodes emits `k` tokens while costing one round, equality forces one open node
+per depth: the model never selects the two-child topology, and generation is a
+pure chain at the same sequential cost as an autoregressive filler.
+
+The cause is the fixed mask bank, isolated by a controlled comparison. The
+pooled native model shares corpus, seed, epochs and every optimization setting
+and differs only in whether a node reads eight native mask states or one pooled
+vector; it branches, at `61.83%` two-child posterior at the root and `1.261`
+tokens per round, against the bank model's `0.06%` and `1.000`. The bank buys
+`4.5` nats of exact NLL and spends the whole parallel saving.
+
+An earlier reading here blamed the objective's indifference to tree shape. That
+is necessary but not sufficient: the pooled model trains against the same
+indifferent objective and branches anyway. Indifference lets the model
+concentrate on whichever shape it can score best, and the encoder decides which
+shape that is. See `research/CHAIN_COLLAPSE.md`.
+
+**Parallel expansion has since been recovered, by removing the bank.** The
+re-encoded frontier model keeps one native mask token per open gap in the
+partial sequence, scores every open gap in one backbone pass, and re-encodes
+after each round. Factorizing generation into
+`p(shape scaffold | prompt) * p(tokens | completed scaffold, prompt)` — the
+first emitting mask slots in parallel, the second filling them in one native
+MLM pass — reaches `21.32%` matched token accuracy against the oracle-length
+native masked baseline's `20.04%`, in `2.18` shape rounds plus one lexical
+pass, with target length never supplied. Shape then became the isolated
+bottleneck at TV `0.201`. Giving shape its own small model (depth-indexed
+priors, zero-gated prompt residuals, per-round shared regime, `204,107`
+trainable parameters over a frozen encoder) reaches `0.155`, and exposing the
+realized process state `(completed slots, open gaps, depth)` while training
+against an exact total-progeny likelihood reaches `0.0718` empirical TV at
+`2.84` rounds with `0.024%` overflow. That is the first configuration in the
+project to hold length calibration and genuine parallelism at the same time.
+Two attempts to feed lexical information back into shape — a node-local 16-way
+discrete code and a node-local continuous embedding — both had their coupling
+set to zero by validation, and a third that pushes a native token posterior
+into the topology heads instead improves local frontier NLL while doubling
+length TV to `0.148`. A better local topology likelihood is not a better length
+law, which is now shown three independent ways. See
+`research/FRONTIER_REENCODE.md`.
 
 ## What is established
 
@@ -220,6 +271,8 @@ matched intervention isolating the surviving twin. See
 | Baseline on the same pretrained backbone | `LIKELIHOOD_DECOMPOSITION.md` | **Done:** matched on backbone, stream, split and budget, the masked baseline reaches `12.56%` oracle-structure accuracy to the tree model's `5.66%` in 3/3 non-overlapping seeds; `84%` of that gap is encoder access, not the objective |
 | Native pretrained vocabulary and MLM head | `NATIVE_VOCABULARY.md` | **Done at seed 17:** the full native path is implemented for corpus, chart, baseline and evaluation. It raises the lexical floor but leaves the native masked baseline well ahead (`20.04%` vs `8.71%` token accuracy; `0.410` vs `0.281` decoded character similarity) |
 | Fixed length-blind native mask bank | `FIXED_MASK_BANK.md` | **Done at seed 17:** exact and topology-prior NLL improve by `4.526` and `5.317` nats, with TV `0.126`; generation improves only modestly and remains below the native masked baseline |
+| Matched control for the exposure-gap auxiliary | `EXPOSURE_GAP.md` | **Done at seed 17:** the control keeps the auxiliary and its record draw but restores gold boundaries, and reproduces the entire length-TV gain, so the substitution contributes nothing but `+0.433` nats of cost |
+| Expected rollout rounds, the parallel claim itself | `GENERATION_THEORY.md` | **Done:** `5.758` rounds for `5.758` tokens on 128 prompts. No parallel saving; the greedy rollout is a chain |
 
 ### 3. Generation quality (deficit attributed to the encoder, not the objective)
 
@@ -334,10 +387,31 @@ topology-prior NLL improves by `5.317` nats with TV `0.126`. It still reaches
 only `12.24%` on length-matched sampled rollout pairs, so the gate remains held
 for generation rather than likelihood.
 
-The hold is not a verdict on the objective. It now blocks scaling a training
-path that uses gold pivot tokens and boundaries but rolls out with self-generated
-ones. Recommended order item 18 is the intervention to test before the gate is
-re-run.
+The hold is not a verdict on the objective. It was previously stated as blocking
+a training path that uses gold pivot tokens and boundaries but rolls out with
+self-generated ones; that reason is withdrawn, since the exposure gap has now
+been measured at `0.005` nats structurally and training against its lexical half
+made things worse (`research/EXPOSURE_GAP.md`).
+
+The hold now rests on something more basic. The gate asks for a length or
+composition advantage at comparable compute, and the compute side has never
+been measured at decode time. It now has been: the greedy rollout spends
+`5.758` rounds to emit `5.758` tokens, so on natural text the model buys no
+parallel saving over a sequential filler at all. Until that is understood there
+is no efficiency case to scale, independent of the quality clause the gate also
+fails.
+
+That reason is now partly discharged. The scaffold architecture emits `3.61`
+tokens in `2.84` shape rounds plus one lexical pass, so the parallel saving is
+real there, and its matched token accuracy (`19.07%`--`21.32%` across rollout
+estimates) sits at the oracle-length native masked baseline's `20.04%` rather
+than at half of it. Two clauses of the gate therefore look different under this
+architecture than under the fixed mask bank, but neither is yet claimed as
+passed: the lexical comparison is a matched-subset estimate on 300--327 pairs
+with visible sampling variance, the length-extrapolation and composition slices
+have not been re-run on the scaffold at all, and the compute comparison is
+rounds-versus-tokens rather than wall clock. The hold stands, and what it now
+waits on is a scaffold evaluation at those slices, not a diagnosis.
 
 ## Recommended order
 
@@ -417,10 +491,48 @@ re-run.
    `16.95%` token accuracy on only 11 length-matched spans; 16 stochastic samples
    per prompt yield `12.24%` over 156 matched pairs. This improves on the
    off-distribution midpoint readout but remains below the masked baseline.
-18. **Next:** train against the gold-token/boundary exposure gap revealed by the
-   rollout, while keeping the fixed bank length-blind. Do not use the midpoint
-   auxiliary unchanged; midpoint NLL is `35.754` and is off-distribution here.
-19. Re-evaluate the scale-up gate only after that intervention.
+18. **Completed, negative.** The exposure gap was measured before being trained
+   against. The topology half is `0.005` nats and was not worth an arm; the
+   boundary half is `0.487` nats but training against it costs `+0.454` test
+   exact NLL and `+0.188` oracle token NLL, and a matched control that keeps
+   the gold boundaries reproduces the whole `-0.028` length-TV gain. The
+   transferable lesson is that a measured train/test discrepancy is not by
+   itself a reason to train against it (`research/EXPOSURE_GAP.md`).
+19. **Completed as analysis plus measurement.** The rollout is a branching
+   process, which bounds what length laws it can express. A depth-homogeneous
+   process cannot represent the corpus law at all — its TV floor is `0.2234`,
+   and the depth-free model sat at `0.234`, so it failed the `TV < 0.20` gate
+   for a representational reason rather than a training one. Depth-indexing
+   reaches TV `0` exactly, via a chain costing `4.5` rounds
+   (`research/GENERATION_THEORY.md`).
+20. **Completed, negative.** Decoding by the trained objective — sampling a
+   candidate pool and reranking it by the exact marginal, plus an MBR arm —
+   does not beat greedy on decoded character similarity (`0.214` and `0.288`
+   against `0.308`). Unrestricted MAP reranking collapses to the empty string.
+   The test is not clean: the candidate pool itself scores below greedy, and
+   matched-pair counts are `10`-`17` (`research/GENERATION_THEORY.md` section 6).
+21. **Completed, and it is the mask bank.** The collapse is not a decoding
+   artifact — the two-child class holds `1.07%` of the model's own posterior and
+   sampling does not branch either. It is also not the objective alone: the
+   pooled native model, matched on corpus, seed, epochs and optimization and
+   differing only in the bank, branches at `61.83%` two-child root posterior and
+   `1.261` tokens per round. The fixed mask bank buys `4.5` nats of exact NLL
+   and spends the entire parallel saving (`research/CHAIN_COLLAPSE.md`).
+22. **Started and stopped.** A shape prior that penalises posterior mean token
+   depth outside the likelihood is implemented (`shape_prior.py`,
+   `--shape-prior-weight`, unit-tested so that the normaliser equals the span
+   length and cannot be gamed by span shortening). A `lambda = 2.0` run reached
+   two epochs, paying likelihood (validation `24.908`, `23.734` against the
+   baseline's `23.301`, `22.132`) with the depth effect unmeasured. It was
+   stopped once the controlled comparison showed the bank is the cause, since
+   the question changed from "can indifference be broken" to "can the bank's
+   gain be kept while restoring shape". **Untested.**
+23. **Next:** find the mechanism by which the bank forces left-to-right. The
+   positional hypothesis is dead — correlation between node depth and selected
+   bank slot is `-0.104`, so the bank is not a position index. Until the
+   mechanism is known, neither redesigning the bank nor tuning a shape prior
+   against it is well aimed.
+24. Re-evaluate the scale-up gate only after that.
 
 ## Currently claimable
 
@@ -468,6 +580,21 @@ encoder integration rather than the objective: bottlenecking the baseline's
 encoder to the tree model's single pooled vector, objective untouched, removes
 `84%` of the gap.
 
+**Parallel expansion is claimable only away from the fixed mask bank.** The
+synthetic result keeps its `2.95` NFE. On natural text the pooled native model
+reaches `1.261` tokens per round, so the mechanism does work there, but the
+selected fixed-mask-bank model spends one round per emitted token — `5.758` for
+`5.758`, exactly equal across all 128 test prompts. Any statement of the form
+"logarithmically many model evaluations" must name which checkpoint it means,
+and it is false for the current best-likelihood one.
+
+Two negative results are also claimable, and both were controls this project
+designed against itself. Training against a measured exposure gap does not help:
+the matched control reproduces the whole gain. And decoding by the trained
+objective does not help either: exact-marginal reranking and MBR both fail to
+beat greedy on decoded character similarity, though that test's candidate pool
+was itself weaker than greedy and its sample sizes were small.
+
 Pretraining is the one intervention that moves top-1 accuracy: `+1.7` points
 against its capacity-matched control (`3.95% -> 5.66%`), so the from-scratch
 deficit is not intrinsic to the objective.
@@ -489,3 +616,71 @@ it from `12.56%` to `6.74%` — `84%` of the gap, in 3/3 seeds. At comparable
 encoder access the tree objective is ahead on token NLL (`6.161` against
 `6.814`). The `1.09` point residual is the honest upper bound on what the
 objective itself costs here.
+
+The scaffold line adds two claimable natural-text results and one negative pair.
+Parallel expansion on natural text is claimable for the scaffold architecture,
+not only for the pooled model: `3.61` emitted tokens in `2.84` shape rounds plus
+one lexical pass, with no target length supplied and no unfinished rollouts
+beyond `0.024%`. Length calibration is claimable at TV `0.0718` to the finite
+test histogram, obtained by exactly marginalizing the state-feedback branching
+process and fitting `657` parameters to the training length histogram — a
+better figure than any earlier configuration, and reached without a categorical
+length head. The lexical side is claimable only as parity: matched token
+accuracy lands at the oracle-length native masked baseline's level rather than
+above it, and the matched-subset estimates (`19.07%`, `21.32%`, `21.30%`,
+`23.01%`) vary by more than the differences being discussed, so no lexical
+ranking within the scaffold family is claimable from them.
+
+The negative pair is that lexical information does not help shape here. A
+node-local discrete code and a node-local continuous embedding were each
+trained, each learnable on their own terms, and each had their coupling to the
+final MLM set to zero by validation-only selection. This is a result about
+post-hoc coupling interfaces, not about node-local state, and it is what
+motivates training the state-to-MLM interface jointly with lexical likelihood
+if the direction is pursued again.
+
+The third coupling sharpens that negative into a methodological one. Pushing a
+native token posterior into the topology heads, with the lexical path exactly
+nested at zero gate, improves validation frontier topology NLL by `0.48` nats
+and degrades total-progeny TV from `0.074` to `0.148`. The local score and the
+length law are not merely uncorrelated here; they are traded against each
+other, and `experiment_unified_scaffold.py` selects its checkpoint on the local
+one. Anything trained on top of a calibrated shape model must therefore be
+re-calibrated against the exact total-progeny objective before it is compared.
+`calibrate_scaffold_length_distribution.py` now constructs the unified model,
+so that comparison has been made, and it closes the item negatively: exact
+re-calibration reaches a better chart (`0.00030` training TV) and a worse
+rollout (`0.148 -> 0.187`), because the chart marginalizes a context-free
+process while the coupling is not context-free.
+
+The constructive half of that result is the one to carry forward. **The single
+model is not the problem and is not rejected.** One frozen backbone, one native
+MLM head, shape heads on top, one backbone pass per growth round, and the same
+head filling the completed scaffold reaches `0.074` sampled TV at `21.04%`
+matched token accuracy with the token-to-shape gate at zero — matching the
+two-checkpoint split (`0.0718`, `19.07%`) within sampling noise as one set of
+weights. Only the token-to-shape coupling is rejected, and the reason is
+specific: a lexically conditioned shape policy has no exact length objective in
+this project, since total progeny is exact only for a context-free branching
+process. Reviving the direction requires per-prompt exact marginalization or
+Monte-Carlo calibration against the sampled histogram, neither of which the
+current evidence justifies building.
+
+Conditional length has since been opened and closed at the current encoder
+access. The restriction that makes it exact is implemented and tested: shape
+logits read a prompt encoding fixed at round zero plus the realized state, so
+the branching process is context-free given the prompt and the total-progeny
+chart runs per prompt, differentiably, with no length head. Training against
+`-log p(length | prompt)` reaches held-out identifiable nats of `+0.00074` and
+`+0.00001` under two nestings whose validation gains do not transfer, and an
+unconstrained categorical probe on the same input is at zero too. The
+information is not in the frozen mean-pooled representation the shape path
+reads. `research/PRETRAINED_IDENTIFIABILITY.md`'s `+0.235` was measured with a
+fine-tuned backbone reading every position, so the two figures differ by
+encoder access rather than by objective — the same attribution that
+`research/LIKELIHOOD_DECOMPOSITION.md` reached for generation.
+
+The practical consequence for the gate: the architecture's length law is
+prompt-independent, that is now a measured statement rather than an assumption,
+and the exact per-prompt chart is built and validated for the moment the shape
+path is given the access the probe had.

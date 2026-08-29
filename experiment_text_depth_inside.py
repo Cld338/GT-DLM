@@ -61,6 +61,7 @@ def depth_batch_log_likelihoods(
     penalty_start_depth: int,
     late_depth_child_penalty: float,
     return_charts: bool = False,
+    return_internals: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     tokens, padding, positions, roots_left, roots_right = collate_prompt_contexts(
         examples, vocab, device
@@ -182,19 +183,34 @@ def depth_batch_log_likelihoods(
             for index, chart in weights_by_example.items()
         }
         cursor = 0
+        token_chunks: List[torch.Tensor] = []
+        topology_chunks: List[torch.Tensor] = []
         for record_index, (example_index, depth, lo, hi) in enumerate(records):
             width = hi - lo
             pivots = torch.arange(cursor, cursor + width, device=device)
             span_tensor = span_tensors[example_index]
-            token_scores = token_logp[
-                record_index, token_index[span_tensor[lo:hi]]
-            ]
-            topology_scores = topology_logp[pivots, targets[pivots]]
-            scores = token_scores + topology_scores
-            weights_by_example[example_index][depth, lo, hi, lo:hi] = scores
-            token_by_example[example_index][depth, lo, hi, lo:hi] = token_scores
+            token_chunks.append(
+                token_logp[record_index, token_index[span_tensor[lo:hi]]]
+            )
+            topology_chunks.append(topology_logp[pivots, targets[pivots]])
+            cursor += width
+        # One flat [pivot-cell] tensor feeds every chart, so a single
+        # autograd.grad against it yields the exact posterior marginal of each
+        # (node, pivot) pair without an explicit outside pass.
+        flat_token_scores = torch.cat(token_chunks)
+        flat_topology_scores = torch.cat(topology_chunks)
+        flat_scores = flat_token_scores + flat_topology_scores
+        cursor = 0
+        for record_index, (example_index, depth, lo, hi) in enumerate(records):
+            width = hi - lo
+            weights_by_example[example_index][depth, lo, hi, lo:hi] = (
+                flat_scores[cursor:cursor + width]
+            )
+            token_by_example[example_index][depth, lo, hi, lo:hi] = (
+                flat_token_scores[cursor:cursor + width]
+            )
             topology_by_example[example_index][depth, lo, hi, lo:hi] = (
-                topology_scores
+                flat_topology_scores[cursor:cursor + width]
             )
             cursor += width
         for length in range(1, 9):
@@ -216,6 +232,25 @@ def depth_batch_log_likelihoods(
                 exact[example_index] = group_exact[offset]
                 midpoint[example_index] = group_midpoint[offset]
     exact_tensor, midpoint_tensor = torch.stack(exact), torch.stack(midpoint)
+    if return_internals:
+        internals = {
+            "records": records,
+            "flat_scores": flat_scores if records else None,
+            "hidden": hidden if records else None,
+            "token_logp": token_logp if records else None,
+            "contexts": contexts,
+            "context_indices": context_indices if records else None,
+            "left": left if records else None,
+            "right": right if records else None,
+            "depths": depths if records else None,
+            "targets": targets if records else None,
+            "pivot_record_indices": pivot_record_indices if records else None,
+            "chosen": chosen if records else None,
+            "generated_ids": generated_ids if records else None,
+            "token_index": token_index if records else None,
+            "span_tensors": span_tensors,
+        }
+        return exact_tensor, midpoint_tensor, internals
     if not return_charts:
         return exact_tensor, midpoint_tensor
     return exact_tensor, midpoint_tensor, {
