@@ -1173,3 +1173,74 @@ be quoted. And this result does **not** transfer to compute: the baseline spends
 one backbone pass on `predict_length` and another on `predict_tokens`, so it is
 also a two-pass system. The two-pass finding above is an advantage over a
 sequential filler at one pass per token, not over this baseline.
+
+## Length extrapolation: the marginal transfers, the conditional does not
+
+The strongest synthetic result in this project is that recursive local stopping
+generalizes to interval lengths absent from training, `0.792` against `0.003`
+for learned per-gap length. On natural text that claim had never been run. It is
+also the last place the two architectures differ structurally: the masked
+baseline's length head is `nn.Linear(d_model, max_span + 1)`, nine classes `0`
+through `8`, so a length of nine is unrepresentable rather than merely unlikely,
+while the scaffold's length is total progeny and has no ceiling.
+
+Both models were trained on spans of `1`--`8` and evaluated on spans of `9`--`16`
+with no retraining. The scaffold gets one intervention: `113` additive logit
+biases (`calibration_root_bias`, and per-depth regime and degree biases) fitted
+on `128` long-span *validation* prompts against `-log p(gold length | prompt)`
+from the exact chart. Every one of its `102,450` learned parameters and the whole
+backbone stay frozen, so no local branching decision is retrained -- only the
+length regime moves.
+
+| Arm | Reaches length 9+ | Length match | Expected edit | Matched token accuracy | Mean length |
+|---|---:|---:|---:|---:|---:|
+| Scaffold, as trained | `0.15%` | `0.05%` | `0.1178` | `16.67%` (2 pairs) | `4.90` |
+| Scaffold, recalibrated | **`93.55%`** | `12.16%` | `0.1247` | `11.41%` (498 pairs) | `12.12` |
+| Baseline, self length | **`0.00%`** | `0.00%` | `0.1204` | — (0 pairs) | `5.54` |
+| Baseline, oracle length | `100%` | `100%` | `0.1361` | `12.76%` | `12.43` |
+
+The exact chart moves with it: mass on lengths `9`--`16` goes `0.0011 -> 0.9352`
+and length NLL `11.478 -> 2.226`.
+
+**The mechanism transfers, and decisively.** Moving `113` bias parameters takes
+the policy from placing a tenth of a percent of its mass in the unseen range to
+placing `93.5%` of it there, and the rollout follows exactly -- `93.55%` of
+samples reach nine tokens or more, at a mean length of `12.12` against the
+target's `12.43`, in `7.41` shape rounds instead of `3.55`. Nothing was
+retrained. The recursion composes: the same local decisions, applied more times,
+cover a length range they were never trained on. The baseline has no counterpart
+move at any number of examples, because nine classes cannot be recalibrated into
+sixteen.
+
+**The prompt-conditional length signal does not transfer at all.** The long-span
+slice is nearly uniform over its eight lengths, so the best prompt-blind constant
+guess scores `14.06%`. The recalibrated chart's argmax scores `10.16%` and the
+rollout matches length on `12.16%` of samples: both *below* the prompt-blind
+rate. In range the same controller carries `+0.3137` identifiable nats and
+`30.47%` argmax accuracy; out of range it carries nothing. The backbone was
+fine-tuned on short spans, and the GAP state that supplies the conditional signal
+is as out of distribution as everything else.
+
+**And it is not a quality win.** Recalibrated, the scaffold reaches `0.1247`
+expected edit similarity against the fairly-evaluated baseline's `0.1204` -- a
+`0.004` margin, which is a tie at the resolution this project can measure -- and
+both sit well below the oracle-length baseline's `0.1361`. Matched token accuracy
+actually favours the baseline here (`12.76%` against `11.41%`), reversing the
+in-range ordering. The synthetic separation of `0.792` against `0.003` does not
+reproduce on text as a quality result.
+
+So the claim that survives the move to natural text is narrower than the
+synthetic one and should be stated as such: *the branching process can be
+retargeted to an unseen length regime by recalibration alone, where a
+fixed-class length head cannot be retargeted at all* -- a statement about
+representational reach, not about output quality. What does not survive is any
+suggestion that this buys better text, or that the conditional length model
+generalizes past its training range.
+
+Three limits. The calibration sees `128` validation examples drawn from the new
+regime, so this is low-shot regime adaptation rather than zero-shot
+generalization; the honest contrast is that the baseline cannot make the move at
+any sample size without new parameters and retraining. This is one seed on one
+backbone, unlike the three-seed results elsewhere in this document. And the
+`16.67%` token accuracy for the untouched scaffold rests on two matched pairs and
+means nothing.
