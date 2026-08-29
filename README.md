@@ -122,6 +122,8 @@ python evaluate_continuous_scaffold.py --device cuda
 python experiment_unified_scaffold.py --device cuda --local-files-only --state-feedback --shape-checkpoint artifacts/text_scaffold_topology_feedback_exact/topology.pt --posterior-only --artifact-dir artifacts/text_scaffold_unified_exact_posterior
 python experiment_conditional_length.py --device cuda --epochs 8 --max-train-examples 2048 --artifact-dir artifacts/text_conditional_length_output_zero
 python probe_conditional_length_context.py --device cuda --train-examples 4096
+python experiment_conditional_length.py --device cuda --context-source gap --unified-lexical-artifact-dir artifacts/text_pretrained_masked_roberta_base --artifact-dir artifacts/text_conditional_length_gap_local_unified_roberta_base_seed23 --seed 23
+python evaluate_conditional_scaffold.py --device cuda --unified --chunk-size 16 --conditional-artifact-dir artifacts/text_conditional_length_gap_local_unified_roberta_base_seed23 --lexical-artifact-dir artifacts/text_pretrained_masked_roberta_base
 ```
 
 The experiment writes its metrics and checkpoints to `artifacts/`.
@@ -768,4 +770,40 @@ the branching parameterization is not what fails. This also corrects the
 comparison to the `+0.235` identifiable nats in
 `research/PRETRAINED_IDENTIFIABILITY.md`: that probe fine-tuned the backbone and
 read every position. The gap is encoder access, not the objective. See
+`research/FRONTIER_REENCODE.md`.
+
+Acting on that diagnosis turns the result positive. Two oracle probes were run
+first, and they redirected the work: the gold pivot token carries no held-out
+information about a node's marker in 3/3 probe seeds, which retires the
+token-to-shape coupling family as a property of the task rather than of any
+particular parameterization; and the length information absent from the
+mean-pooled state is present at the native `<mask>` GAP hidden state
+(`+0.0918` identifiable nats). Encoding the prompt once, reading the hidden
+state at that single GAP token, and holding it fixed through tree growth keeps
+the process context-free *given the prompt*, so the exact total-progeny chart
+still applies per prompt. There is still no length head, no target-length input
+and no preallocated canvas: length remains the number of emitted tree nodes.
+Trained this way, 102,450 shape parameters over a frozen backbone take
+per-prompt length matching from `11.30%` — at, in fact just below, the `11.94%`
+a prompt-blind sampler gets — to `23.02%`, inside one unified MLM that both
+grows the scaffold and fills it.
+
+Three controller seeds on each of two backbones then replicate it and separate
+the two effects that matter. Held-out identifiable nats are `0.2512+/-0.0079`
+on distilroberta and `0.3137+/-0.0062` on roberta-base, positive in 6/6 runs
+with non-overlapping families, while four times the training data changes
+nothing (`0.2499`) — the shortage is encoder access, not examples. Matched
+token accuracy is `20.34%+/-0.63` against that backbone's oracle-length masked
+baseline at `20.04%`, and `29.39%+/-0.96` against `27.45%` at roberta-base,
+where all three seeds are above the baseline. A model never told the target
+length now matches, then beats, one that is handed it, in `2.82`--`2.97` shape
+rounds plus one lexical pass.
+
+Two limits keep that from being a generation claim. The comparison is on the
+length-matched subset (`416`--`421` of `4096` samples) while the baseline is
+scored on all 128 oracle-length prompts; over every sample the scaffold's
+expected edit similarity is `0.2074` against `0.3280`, because only about a
+quarter of its samples hit the target length. And each family's baseline is a
+single checkpoint. Raising that match rate is the one quantity separating a
+matched-subset lead from an unconditional one. See
 `research/FRONTIER_REENCODE.md`.

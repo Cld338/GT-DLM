@@ -12,8 +12,16 @@ own document and update the status here.
 
 The mechanism is established, a coherent exact objective is in hand, and a
 pretrained context encoder now supplies the largest single-gap likelihood gain
-so far. The natural-text claims remain likelihood-and-calibration claims, not
-generation claims, and the preregistered scale-up gate has not been passed.
+so far. The preregistered scale-up gate has not been passed.
+
+The natural-text claims were for a long time likelihood-and-calibration claims
+rather than generation claims. That is no longer the whole picture: the scaffold
+architecture generates its own length and now matches, then beats, an
+oracle-length masked baseline on length-matched spans, replicated across three
+controller seeds on two backbones. It is still behind that baseline once length
+misses are counted, so what the gate now waits on is a slice evaluation, not a
+diagnosis. The paragraphs below are the record of how this was reached, in
+order; the last two are the current state.
 
 The two-gap likelihood advantage has since been decomposed. It is lexical, it
 survives scoring under the model's own tree head at about 70% strength
@@ -110,6 +118,33 @@ set to zero by validation, and a third that pushes a native token posterior
 into the topology heads instead improves local frontier NLL while doubling
 length TV to `0.148`. A better local topology likelihood is not a better length
 law, which is now shown three independent ways. See
+`research/FRONTIER_REENCODE.md`.
+
+**Length is now conditioned on the prompt, and the scaffold reaches the
+oracle-length baseline.** Every configuration above generates length from a
+prompt-independent calibrated prior: the kept model's rollout matched the
+target on `11.30%` of samples against a prompt-blind sampler's `11.94%`. Making
+the shape logits read the prompt only through a round-zero encoding keeps the
+process context-free *given the prompt*, so the exact total-progeny chart still
+applies per prompt and `p(length | prompt)` stays exactly differentiable with no
+length head. The first attempt was flat at zero held-out nats, and an
+unconstrained probe found why: the mean-pooled state the shape policy read
+carries no length information. Reading the hidden state at the native GAP token
+instead carries `+0.0918` nats, and the resulting controller — 102,450 shape
+parameters over a frozen backbone, inside one unified MLM — more than doubles
+per-prompt length matching to `23.02%`.
+
+Three controller seeds on each of two backbones then replicate it and separate
+the two effects. Held-out identifiable nats are `0.2512+/-0.0079` on
+distilroberta and `0.3137+/-0.0062` on roberta-base, positive in 6/6 runs with
+non-overlapping families, while four times the training data changes nothing
+(`0.2499`) — the shortage is encoder access, not examples. Matched token
+accuracy is `20.34%+/-0.63` against that backbone's oracle-length masked
+baseline's `20.04%`, and `29.39%+/-0.96` against `27.45%` at roberta-base, where
+all three seeds are above the baseline. A model never told the target length
+now matches, then beats, one that is handed it — but only on the length-matched
+subset: counting every sample, expected edit similarity is `0.2074` against
+`0.3280`, because only about a quarter of samples hit the target length. See
 `research/FRONTIER_REENCODE.md`.
 
 ## What is established
@@ -272,7 +307,10 @@ matched intervention isolating the surviving twin. See
 | Native pretrained vocabulary and MLM head | `NATIVE_VOCABULARY.md` | **Done at seed 17:** the full native path is implemented for corpus, chart, baseline and evaluation. It raises the lexical floor but leaves the native masked baseline well ahead (`20.04%` vs `8.71%` token accuracy; `0.410` vs `0.281` decoded character similarity) |
 | Fixed length-blind native mask bank | `FIXED_MASK_BANK.md` | **Done at seed 17:** exact and topology-prior NLL improve by `4.526` and `5.317` nats, with TV `0.126`; generation improves only modestly and remains below the native masked baseline |
 | Matched control for the exposure-gap auxiliary | `EXPOSURE_GAP.md` | **Done at seed 17:** the control keeps the auxiliary and its record draw but restores gold boundaries, and reproduces the entire length-TV gain, so the substitution contributes nothing but `+0.433` nats of cost |
-| Expected rollout rounds, the parallel claim itself | `GENERATION_THEORY.md` | **Done:** `5.758` rounds for `5.758` tokens on 128 prompts. No parallel saving; the greedy rollout is a chain |
+| Expected rollout rounds, the parallel claim itself | `GENERATION_THEORY.md` | **Done, then superseded:** `5.758` rounds for `5.758` tokens on the fixed-mask-bank model, a pure chain. The scaffold that replaced it emits `3.5`--`3.8` tokens in `2.82`--`2.97` rounds in 6/6 replicated runs, so the parallel saving is real for the selected architecture |
+| Seed replication of the conditional-length scaffold | `FRONTIER_REENCODE.md` | **Done:** three controller seeds on each of two backbones, `0.2512+/-0.0079` and `0.3137+/-0.0062` identifiable nats, positive in 6/6 with non-overlapping families. Only the controller seed varies; each family's lexical backbone is a single seed-17 checkpoint |
+| Backbone scale for the scaffold | `FRONTIER_REENCODE.md` | **Done:** roberta-base moves matched token accuracy `20.34% -> 29.39%` and conditional length `+0.063` nats, against a `0.96` point and `0.008` nat seed spread. Four times the training data moves neither |
+| Unconditional generation comparison against the masked baseline | `FRONTIER_REENCODE.md` | **Open:** the `29.39%` lead is on the length-matched subset (`416`--`421` of `4096`). Over all samples expected edit similarity is `0.2074` against `0.3280`. Closing this is a `length_match_probability` problem, currently `24.83%` |
 
 ### 3. Generation quality (deficit attributed to the encoder, not the objective)
 
@@ -413,6 +451,32 @@ have not been re-run on the scaffold at all, and the compute comparison is
 rounds-versus-tokens rather than wall clock. The hold stands, and what it now
 waits on is a scaffold evaluation at those slices, not a diagnosis.
 
+The sampling-variance objection is now removed, and one gate clause moves.
+Three controller seeds on each of two backbones give matched token accuracy
+`20.34%+/-0.63` against distilroberta's oracle-length masked baseline at
+`20.04%`, and `29.39%+/-0.96` against roberta-base's at `27.45%`, with all
+three roberta-base seeds above the baseline. The single-seed `19.07%--21.32%`
+spread was seed noise around a tie; at the larger backbone it is a `1.94` point
+lead. The gate's "without material IID edit-similarity loss" clause was
+previously failed by a factor of two, and on this metric it is no longer failed
+at all.
+
+It is not yet passed either, for a reason that is now precise rather than
+diagnostic. Matched accuracy is scored on the `416`--`421` of `4096` samples
+whose length hit the target, while the baseline is scored on all `128` prompts
+with the length handed to it. The unbiased comparison is expected edit
+similarity over every sample, and there the scaffold is `0.2074` against
+`0.3280` — it loses on the roughly three quarters of samples that miss the
+length. Each family's baseline is also one checkpoint, so this is three
+scaffold seeds against one baseline point estimate.
+
+That fixes what the remaining work is. The quality clause turns entirely on
+`length_match_probability`, which is `24.83%` at roberta-base and is the single
+number standing between the matched-subset lead and an unconditional one. The
+length-extrapolation and gap-composition slices still have not been run on the
+scaffold, and the compute comparison is still rounds-versus-tokens rather than
+wall clock. The hold stands on those three.
+
 ## Recommended order
 
 1. **Completed:** integrate the pretrained context encoder with
@@ -527,12 +591,63 @@ waits on is a scaffold evaluation at those slices, not a diagnosis.
    stopped once the controlled comparison showed the bank is the cause, since
    the question changed from "can indifference be broken" to "can the bank's
    gain be kept while restoring shape". **Untested.**
-23. **Next:** find the mechanism by which the bank forces left-to-right. The
-   positional hypothesis is dead — correlation between node depth and selected
-   bank slot is `-0.104`, so the bank is not a position index. Until the
-   mechanism is known, neither redesigning the bank nor tuning a shape prior
-   against it is well aimed.
-24. Re-evaluate the scale-up gate only after that.
+23. **Overtaken, not answered.** This item asked for the mechanism by which the
+   bank forces left-to-right, having killed the positional hypothesis
+   (depth-to-slot correlation `-0.104`). The question was dropped rather than
+   settled: removing the bank recovered parallelism outright, so why it
+   collapsed is no longer load-bearing. Recorded here so the gap is not mistaken
+   for a result (`research/CHAIN_COLLAPSE.md`).
+24. **Completed, and the architecture the project now runs on.** The re-encoded
+   frontier keeps one native mask token per open gap and scores every open gap
+   in one backbone pass. Factorizing into `p(scaffold | prompt)` then
+   `p(tokens | scaffold, prompt)` restores parallel growth and puts matched
+   token accuracy at the oracle-length baseline (`research/FRONTIER_REENCODE.md`).
+25. **Completed:** shape given its own small model over a frozen encoder, trained
+   against an exact total-progeny likelihood with the realized process state
+   exposed. Empirical TV `0.0718` at `2.84` rounds with `0.024%` overflow — the
+   first configuration holding length calibration and genuine parallelism at
+   once (`research/FRONTIER_REENCODE.md`).
+26. **Completed, negative, five independent ways.** Letting lexical content steer
+   shape fails as a node-local discrete code, as a node-local continuous
+   embedding, as a token posterior pushed into the topology heads, as a
+   token-conditioned topology head, and as a Sinkhorn-projected joint over
+   `(token, marker)` that provably preserves both marginals. Validation sets the
+   coupling to zero in the first two; the third improves local frontier NLL
+   while doubling length TV; the last two cost about eight points of matched
+   accuracy against the split. Monte-Carlo calibration of the joint family, the
+   only way to fit a length law with no exact chart, reaches `0.201` against the
+   scaffold's `0.0718` and pays `2.6`--`4.7` accuracy points for it, so the
+   split's advantage is not an artifact of the joint arms being uncalibrated.
+   **A better local topology likelihood is not a better length law**
+   (`research/FRONTIER_REENCODE.md`).
+27. **Completed, and it redirected the work.** Two oracle probes separated a
+   missing signal from a weak controller. The gold pivot token carries no
+   held-out marker information at all (negative in 3/3 probe seeds), which
+   explains item 26 as a property of the task rather than of the parameterizations.
+   And length information absent from the mean-pooled state (`-0.0145` to
+   `+0.0051` nats) is present at the native GAP hidden state (`+0.0918`), which
+   named the fix (`research/FRONTIER_REENCODE.md`).
+28. **Completed, positive.** Conditional length made exactly trainable: shape
+   logits reading the prompt only through a round-zero GAP encoding keep the
+   process context-free *given the prompt*, so the total-progeny chart runs per
+   prompt and `p(length | prompt)` is exactly differentiable with no length
+   head. Inside one unified MLM, 102,450 shape parameters over a frozen
+   backbone take per-prompt length matching from `11.30%` — at, in fact just
+   below, the `11.94%` prompt-blind rate — to `23.02%`
+   (`research/FRONTIER_REENCODE.md`).
+29. **Completed:** three controller seeds on each of two backbones.
+   Identifiable nats are `0.2512+/-0.0079` and `0.3137+/-0.0062`, positive in
+   6/6 with non-overlapping families; four times the data changes nothing.
+   Matched token accuracy is `20.34%+/-0.63` against `20.04%` and
+   `29.39%+/-0.96` against `27.45%`, the latter above baseline in 3/3. Backbone
+   scale moves the metric `9.05` points where seed moves it `0.96`
+   (`research/FRONTIER_REENCODE.md`).
+30. **Next:** raise `length_match_probability` above its current `24.83%`. It is
+   the single quantity separating a matched-subset lead from an unconditional
+   one, since expected edit similarity over all samples is still `0.2074`
+   against the baseline's `0.3280`. Then run the length-extrapolation and
+   gap-composition slices on the scaffold, and replace rounds-versus-tokens with
+   a wall-clock comparison. Those three are what the scale-up gate now waits on.
 
 ## Currently claimable
 
@@ -586,7 +701,14 @@ reaches `1.261` tokens per round, so the mechanism does work there, but the
 selected fixed-mask-bank model spends one round per emitted token — `5.758` for
 `5.758`, exactly equal across all 128 test prompts. Any statement of the form
 "logarithmically many model evaluations" must name which checkpoint it means,
-and it is false for the current best-likelihood one.
+and it was false for the checkpoint that then had the best likelihood.
+
+That qualification no longer applies to the selected model. The scaffold emits
+`3.5`--`3.8` tokens in `2.82`--`2.97` shape rounds plus one lexical pass, in 6/6
+replicated runs with no unfinished samples, so parallel expansion is claimable
+for the architecture the project now runs on. The saving is measured in rounds,
+not wall clock, and it is sublinear rather than logarithmic at these span
+lengths.
 
 Two negative results are also claimable, and both were controls this project
 designed against itself. Training against a measured exposure gap does not help:
@@ -684,3 +806,23 @@ The practical consequence for the gate: the architecture's length law is
 prompt-independent, that is now a measured statement rather than an assumption,
 and the exact per-prompt chart is built and validated for the moment the shape
 path is given the access the probe had.
+
+Two further claims come from the scaffold line, and both are seed-replicated.
+The first is that a latent branching process can carry prompt-conditional length
+exactly, with no length head, no target-length input, and no preallocated
+canvas: held-out identifiable nats are `0.2512+/-0.0079` on distilroberta and
+`0.3137+/-0.0062` on roberta-base, positive in 6/6 runs, and per-prompt length
+matching roughly doubles over the prompt-blind prior. The second is narrower
+than it looks: on length-matched spans the scaffold reaches `29.39%+/-0.96`
+token accuracy against an oracle-length masked baseline's `27.45%` at
+roberta-base, above it in 3/3 seeds. State that one with its subset, or not at
+all — over all samples the scaffold is at `0.2074` expected edit similarity
+against `0.3280`, because only about a quarter of its samples hit the target
+length, and the baseline is a single checkpoint.
+
+What is not claimable from this line is that the encoder question is closed. The
+conditional-length gain is `+0.063` nats larger at roberta-base than at
+distilroberta while four times the training data buys nothing, and the pooled
+state carries no length signal where the GAP state carries `+0.0918` nats.
+Encoder access has been the binding constraint at every point it has been
+measured, and it still is.
