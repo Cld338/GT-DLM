@@ -127,6 +127,7 @@ python evaluate_conditional_scaffold.py --device cuda --unified --chunk-size 16 
 python evaluate_length_guided_rollout.py --device cuda --unified --chunk-size 16 --conditional-artifact-dir artifacts/text_conditional_length_gap_local_unified_roberta_base --lexical-artifact-dir artifacts/text_pretrained_masked_roberta_base
 python probe_conditional_length_context.py --device cuda --lexical-artifact-dir artifacts/text_pretrained_masked_roberta_base --artifact-dir artifacts/text_length_probe_finetuned_roberta_base
 python ablate_round_encoding.py --device cuda --unified --chunk-size 16 --conditional-artifact-dir artifacts/text_conditional_length_gap_local_unified_roberta_base --lexical-artifact-dir artifacts/text_pretrained_masked_roberta_base
+python evaluate_self_length_baseline.py --device cuda --unified --conditional-artifact-dir artifacts/text_conditional_length_gap_local_unified_roberta_base --lexical-artifact-dir artifacts/text_pretrained_masked_roberta_base
 ```
 
 The experiment writes its metrics and checkpoints to `artifacts/`.
@@ -866,5 +867,25 @@ property comes from the wiring rather than from a gate setting. This is not
 evidence that node-local token beliefs fail to help the fill: they were never
 connected to it, so that remains untested and is now cheap to try against a
 two-pass baseline. Nor is it a throughput claim — measured wall clock spans
-`1.61x`--`4.93x` across seeds, which is contention on a shared GPU. See
-`research/FRONTIER_REENCODE.md`.
+`1.61x`--`4.93x` across seeds, which is contention on a shared GPU. The baseline
+is also a two-pass system (`predict_length`, then `predict_tokens`), so this is
+an advantage over a sequential filler at one pass per token, not over it.
+
+The comparison that the quality half of the scale-up gate rested on then turned
+out to be unfair, in the scaffold's favour. `PretrainedLengthMaskedModel` has
+had a trained length head all along -- a linear layer on the GAP mask's hidden
+state, optimized jointly with the token loss -- and no evaluation ever called
+it: the baseline was decoded at *oracle* length while the scaffold inferred its
+own. The two length models are otherwise closely matched, reading the same
+backbone at the same position, and they score the same to within noise
+(`+0.3696` against `+0.3622` identifiable nats).
+
+Made to use its own head, at matched decoding rule and matched sample size, the
+baseline reaches `0.1966` expected edit similarity against the scaffold's
+`0.2069` at roberta-base, with matched token accuracy `26.88%` against `30.24%`;
+at distilroberta the two tie (`0.1512` against `0.1497`). **The
+`0.2074`-against-`0.3280` deficit carried through this record is an artifact of
+the evaluation protocol.** One methodological note belongs with that: a single
+draw per prompt put the baseline at `0.2102` and read as a baseline win, while
+`32` draws give `0.1966` — the small-sample estimate was noise at the scale of
+the effect. See `research/FRONTIER_REENCODE.md`.

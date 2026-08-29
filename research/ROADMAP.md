@@ -311,7 +311,8 @@ matched intervention isolating the surviving twin. See
 | Expected rollout rounds, the parallel claim itself | `GENERATION_THEORY.md` | **Done, then superseded:** `5.758` rounds for `5.758` tokens on the fixed-mask-bank model, a pure chain. The scaffold that replaced it emits `3.5`--`3.8` tokens in `2.82`--`2.97` rounds in 6/6 replicated runs, so the parallel saving is real for the selected architecture |
 | Seed replication of the conditional-length scaffold | `FRONTIER_REENCODE.md` | **Done:** three controller seeds on each of two backbones, `0.2512+/-0.0079` and `0.3137+/-0.0062` identifiable nats, positive in 6/6 with non-overlapping families. Only the controller seed varies; each family's lexical backbone is a single seed-17 checkpoint |
 | Backbone scale for the scaffold | `FRONTIER_REENCODE.md` | **Done:** roberta-base moves matched token accuracy `20.34% -> 29.39%` and conditional length `+0.063` nats, against a `0.96` point and `0.008` nat seed spread. Four times the training data moves neither |
-| Unconditional generation comparison against the masked baseline | `FRONTIER_REENCODE.md` | **Open, and now localized:** the `29.39%` lead is on the length-matched subset (`416`--`421` of `4096`); over all samples expected edit similarity is `0.2074` against `0.3280`. An oracle-length arm reaches `0.3324`, so length selection accounts for the entire gap |
+| Unconditional generation comparison against the masked baseline | `FRONTIER_REENCODE.md` | **Done, and it reverses:** the `0.3280` figure was the baseline decoding at *oracle* length while the scaffold inferred its own, and its trained length head had never been called. Made to use it, at matched decoding rule and matched sample size, it reaches `0.1966` against the scaffold's `0.2069`, and `21.39%` against `19.61%` at distilroberta. At equal length information roberta-base favours the scaffold and distilroberta ties |
+| Matched sample size for the baseline's sampled-length arm | `FRONTIER_REENCODE.md` | **Done, and it mattered:** one draw per prompt gave `0.2102` and read as a baseline win; `32` draws give `0.1966`. The `128`-sample estimate was noise at the scale of the effect |
 | Decoding at the exact chart's mode | `FRONTIER_REENCODE.md` | **Done, positive on its own metric and negative downstream:** length match `22.72% -> 27.89%` and `24.83% -> 32.55%` in 6/6 runs, matching the chart's argmax accuracy within noise, but expected edit similarity moves only `-0.004` and `+0.012` because conditioning on the mode costs `0.5`--`1.4` points of token accuracy |
 
 ### 3. Generation quality (deficit attributed to the encoder, not the objective)
@@ -419,6 +420,14 @@ baseline's oracle-structure token accuracy (`5.66%` against `12.56%`), so the
 clause is failed by a clear margin. Scaling the current configuration is not
 warranted.
 
+That reading has since been withdrawn for the scaffold, and the reason is a
+protocol error rather than a new result. Every comparison behind it decoded the
+masked baseline at *oracle* length while the scaffold inferred its own, and the
+baseline's trained length head was never called. Made to use it at matched
+decoding rule and matched sample size, the baseline reaches `0.1966` expected
+edit similarity against the scaffold's `0.2069` at roberta-base, and ties at
+distilroberta. The edit-similarity clause is not failed by the scaffold.
+
 The vocabulary handicap has now been removed in both arms. The native masked
 baseline improves to `20.04%` oracle token accuracy while the pooled tree reaches
 `8.71%`, confirming that the output side mattered but did not explain the
@@ -500,10 +509,18 @@ now holds and does not decay with span length. What is not established is a
 wall-clock ratio: measured speedups range `1.61x`--`4.93x` on a shared desktop
 GPU, which is contention, not measurement.
 
-The hold therefore stands on two things: a backbone carrying more length
-information at the GAP, and the length-extrapolation and gap-composition slices
-— neither of which is a mechanical re-run, since the first needs a new slice
-designed and the second needs the scaffold extended past one gap.
+The quality clause has since resolved as well, and by correcting a protocol
+error rather than by improving the model. The comparison that failed it decoded
+the baseline at oracle length while the scaffold inferred its own; the
+baseline's own trained length head, never called until now, puts it at `0.1966`
+against the scaffold's `0.2069` at roberta-base with a tie at distilroberta.
+
+The hold therefore stands on one thing: the length-extrapolation and
+gap-composition slices, neither of which is a mechanical re-run, since the first
+needs a new slice designed and the second needs the scaffold extended past one
+gap. A backbone carrying more length information at the GAP (item 32) is now an
+improvement rather than a blocker, since both systems read the same
+representation and neither is ahead because of it.
 
 ## Recommended order
 

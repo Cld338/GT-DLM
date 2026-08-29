@@ -1103,3 +1103,73 @@ desktop GPU rather than by anything in the model, so only the pass count should
 be quoted. And the two passes are per sample; every sample of one prompt encodes
 the same round-zero context independently, so caching it per prompt would take
 the amortized cost to about `1.03` passes, which has not been implemented.
+
+## The masked baseline has a length head, and it was never used
+
+Every generation comparison in this document scores the masked baseline with
+`decode_oracle_length`, which hands it the gold number of masks. That baseline
+has had a trained length head the whole time --
+`PretrainedLengthMaskedModel.predict_length`, a linear layer on the hidden state
+at the GAP mask, optimized jointly with the token loss in
+`experiment_pretrained_masked_baseline.py` -- and no evaluation has ever called
+it. The scaffold, which must infer its own length, has been measured against a
+model given the answer.
+
+The two length models are unusually well matched, which is what makes the fair
+comparison worth running rather than merely fair. The baseline's head reads the
+GAP hidden state of a fine-tuned backbone; the scaffold's controller reads the
+same backbone's state at the same position. They differ in what they do with it
+-- a categorical head against the total progeny of a branching process -- and in
+essentially nothing else.
+
+Scored on the same 128 prompts:
+
+| Length model | Identifiable nats | Argmax accuracy | Induced marginal TV |
+|---|---:|---:|---:|
+| Baseline categorical head | `+0.3696` | `35.16%` | `0.2656` argmax / `0.0776` sampled |
+| Scaffold total progeny | `+0.3622` | `30.47%` | `0.0859` |
+
+As length models they are the same to within noise: `0.007` nats apart, with the
+categorical head slightly better at argmax. What differs is the distribution
+each *decoding rule* induces. Taking the head's argmax is a point estimate, so
+its marginal collapses -- `28.9%` empty against a true `21.1%`, with mass piled
+on lengths `0`, `1` and `8`, TV `0.2656`. Sampling from the same head restores
+calibration to `0.0776`.
+
+Three decoders were therefore run for the baseline, and the middle one is a
+methodological warning. A single draw per prompt gave `0.2102` expected edit
+similarity, which read as a baseline win; at `32` draws, matching the scaffold's
+sample count, the same arm gives `0.1966`. The `128`-sample estimate was noise
+at the scale of the effect being measured.
+
+At matched decoding rule and matched sample size (`4096` draws each):
+
+| Backbone | System | Length match | Expected edit | Matched token accuracy |
+|---|---|---:|---:|---:|
+| roberta-base | Baseline, oracle length | `100%` | `0.3280` | `27.45%` |
+| roberta-base | Baseline, sampled length | `24.02%` | `0.1966` | `26.88%` |
+| roberta-base | Scaffold, ancestral | `24.88%` | **`0.2069`** | **`30.24%`** |
+| roberta-base | Scaffold, modal-guided | `29.69%` | **`0.2121`** | `29.29%` |
+| distilroberta | Baseline, oracle length | `100%` | `0.2480` | `20.04%` |
+| distilroberta | Baseline, sampled length | `22.63%` | `0.1512` | `21.39%` |
+| distilroberta | Scaffold, ancestral | `23.02%` | `0.1497` | `19.61%` |
+
+**The `0.2074`-against-`0.3280` deficit this document has carried is an artifact
+of the evaluation protocol, not a property of the models.** At equal length
+information the roberta-base scaffold is ahead: `+0.0103` expected edit
+similarity against the sampled-length baseline using the same ancestral rule,
+`+0.023` under mode-versus-mode, and `+3.4` points of matched token accuracy.
+Against the three-seed scaffold mean (`0.2074+/-0.0030`) the margin is the same.
+At distilroberta the two tie (`0.1497` against `0.1512`), which is the pattern
+every other result in this session shows: the scaffold's advantage appears at
+the larger backbone and not below it.
+
+Four limits belong with this. Each family's baseline is a single checkpoint
+against three scaffold seeds, so the margin is three seeds against one point
+estimate. The comparison is expected quality of one draw, which is the right
+quantity but says nothing about best-of-`n`. The distilroberta modal-guided arm
+is unstable across seeds (`19.84%+/-8.05` matched token accuracy) and should not
+be quoted. And this result does **not** transfer to compute: the baseline spends
+one backbone pass on `predict_length` and another on `predict_tokens`, so it is
+also a two-pass system. The two-pass finding above is an advantage over a
+sequential filler at one pass per token, not over this baseline.
