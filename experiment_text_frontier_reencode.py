@@ -2,6 +2,7 @@
 
 import argparse
 import contextlib
+import gc
 import json
 import math
 import os
@@ -16,9 +17,12 @@ from evaluate_text_sampling import distribution_metrics
 from experiment import choose_device, parameter_count, seed_everything
 from frontier_reencode import (
     RandomFrontierDataset,
+    collate_frontiers_with_history,
     decode_frontier_model,
     frontier_losses,
     greedy_length_probabilities,
+    replace_with_generated_history,
+    sampled_trajectory_length_policy_loss,
 )
 from gtdlm.data import collate_compact_frontiers
 from gtdlm.model import PretrainedGapFrontierModel
@@ -33,17 +37,22 @@ from gtdlm.text_tokenizer import vocabulary_from_pretrained_tokenizer
 
 def combined_loss(losses, args):
     if args.marginal_preserving_joint:
-        return (
+        base = (
             losses["token"]
             + args.root_weight * losses["root"]
             + args.degree_weight * losses["joint"]
         )
-    return (
-        losses["token"]
-        + args.root_weight * losses["root"]
-        + args.degree_weight * losses["degree"]
-        + args.direction_weight * losses["direction"]
-    )
+    elif getattr(args, "direct_joint_actions", False):
+        # Direct joint NLL already contains both the emitted token and marker.
+        base = args.root_weight * losses["root"] + losses["joint"]
+    else:
+        base = (
+            losses["token"]
+            + args.root_weight * losses["root"]
+            + args.degree_weight * losses["degree"]
+            + args.direction_weight * losses["direction"]
+        )
+    return base + args.rollout_length_weight * losses["rollout_length"]
 
 
 @torch.inference_mode()
@@ -57,13 +66,25 @@ def evaluate_frontiers(model, dataset, vocab, device, batch_size, args):
     totals = {
         name: 0.0
         for name in (
-            "token", "root", "degree", "direction", "marker", "joint"
+            "token", "root", "degree", "direction", "marker", "joint",
+            "rollout_length",
         )
     }
     counts = {name: 0 for name in totals}
     model.eval()
     for batch in loader:
-        losses = frontier_losses(model, batch, vocab, device)
+        losses = frontier_losses(
+            model,
+            batch,
+            vocab,
+            device,
+            rollout_length_cap=(
+                args.rollout_length_cap if args.rollout_length_weight > 0 else 0
+            ),
+            rollout_length_horizon=args.rollout_length_horizon,
+            rollout_length_detach_backbone=args.rollout_length_detach_backbone,
+            rollout_length_root_only=args.rollout_length_root_only,
+        )
         for name in totals:
             count = int(losses[name + "_count"])
             totals[name] += float(losses[name]) * count
@@ -81,6 +102,15 @@ def evaluate_frontiers(model, dataset, vocab, device, batch_size, args):
         result["coupling_gain_nats"] = (
             result["marker_nll"] - result["joint_nll"]
         )
+    elif getattr(args, "direct_joint_actions", False):
+        result["objective"] = (
+            args.root_weight * result["root_nll"] + result["joint_nll"]
+        )
+        result["coupling_gain_nats"] = (
+            result["token_nll"]
+            + result["marker_nll"]
+            - result["joint_nll"]
+        )
     else:
         result["objective"] = (
             result["token_nll"]
@@ -88,6 +118,9 @@ def evaluate_frontiers(model, dataset, vocab, device, batch_size, args):
             + args.degree_weight * result["degree_nll"]
             + args.direction_weight * result["direction_nll"]
         )
+    result["objective"] += (
+        args.rollout_length_weight * result["rollout_length_nll"]
+    )
     result["counts"] = counts
     return result
 
@@ -132,11 +165,23 @@ def train(model, source, validation, vocab, device, args):
 
     for epoch in range(args.epochs):
         source.set_epoch(epoch)
+        history_probability = args.generated_history_probability * min(
+            1.0,
+            (epoch + 1) / max(1, args.generated_history_warmup_epochs),
+        )
         loader = DataLoader(
             source,
             batch_size=args.batch_size,
             shuffle=True,
-            collate_fn=partial(collate_compact_frontiers, pad_id=vocab.PAD),
+            collate_fn=partial(
+                collate_frontiers_with_history
+                if (
+                    history_probability > 0.0
+                    or args.trajectory_length_weight > 0.0
+                )
+                else collate_compact_frontiers,
+                pad_id=vocab.PAD,
+            ),
         )
         model.train()
         if args.joint_only:
@@ -145,7 +190,11 @@ def train(model, source, validation, vocab, device, args):
             model.structure_adapter.eval()
         running = 0.0
         seen = 0
-        for batch in loader:
+        generated_history_examples = 0
+        generated_history_tokens = 0
+        trajectory_energy_total = 0.0
+        trajectory_batches = 0
+        for batch_index, batch in enumerate(loader):
             optimizer.zero_grad(set_to_none=True)
             autocast = (
                 torch.autocast(device_type="cuda", dtype=torch.float16)
@@ -153,8 +202,60 @@ def train(model, source, validation, vocab, device, args):
                 else contextlib.nullcontext()
             )
             with autocast:
-                losses = frontier_losses(model, batch, vocab, device)
+                if history_probability > 0.0:
+                    selected, replacements = replace_with_generated_history(
+                        model,
+                        batch,
+                        vocab,
+                        device,
+                        history_probability,
+                    )
+                    generated_history_examples += selected
+                    generated_history_tokens += replacements
+                losses = frontier_losses(
+                    model,
+                    batch,
+                    vocab,
+                    device,
+                    rollout_length_cap=(
+                        args.rollout_length_cap
+                        if args.rollout_length_weight > 0 else 0
+                    ),
+                    rollout_length_horizon=args.rollout_length_horizon,
+                    rollout_length_detach_backbone=(
+                        args.rollout_length_detach_backbone
+                    ),
+                    rollout_length_root_only=args.rollout_length_root_only,
+                )
                 loss = combined_loss(losses, args)
+                if (
+                    args.trajectory_length_weight > 0.0
+                    and batch_index % args.trajectory_length_every == 0
+                ):
+                    policy_loss, trajectory_energy, _ = (
+                        sampled_trajectory_length_policy_loss(
+                            model,
+                            batch["source_examples"],
+                            vocab,
+                            device,
+                            samples_per_prompt=args.trajectory_length_samples,
+                            max_rounds=args.max_rounds,
+                            max_decode_span=args.max_decode_span,
+                            seed=(
+                                args.trajectory_length_seed
+                                + epoch * 1_000_003
+                                + batch_index * 9_176
+                            ),
+                            target_length_bank=(
+                                [0, 0] + list(range(1, args.max_span + 1))
+                                if args.trajectory_length_balanced_prior
+                                else None
+                            ),
+                        )
+                    )
+                    loss = loss + args.trajectory_length_weight * policy_loss
+                    trajectory_energy_total += float(trajectory_energy)
+                    trajectory_batches += 1
             batch_size = int(batch["tokens"].size(0))
             running += float(loss.detach()) * batch_size
             seen += batch_size
@@ -180,6 +281,13 @@ def train(model, source, validation, vocab, device, args):
         row = {
             "epoch": epoch + 1,
             "training_objective": running / max(1, seen),
+            "generated_history_probability": history_probability,
+            "generated_history_examples": generated_history_examples,
+            "generated_history_tokens": generated_history_tokens,
+            "trajectory_length_energy": (
+                trajectory_energy_total / max(1, trajectory_batches)
+            ),
+            "trajectory_length_batches": trajectory_batches,
             **{"validation_" + key: value for key, value in validation_metrics.items()},
         }
         history.append(row)
@@ -190,7 +298,7 @@ def train(model, source, validation, vocab, device, args):
             marker = " <- best"
         print(
             "epoch {}/{} train={:.4f} valid={:.4f} token={:.4f} "
-            "root={:.4f} degree={:.4f} direction={:.4f}{}".format(
+            "root={:.4f} degree={:.4f} direction={:.4f} length={:.4f}{}".format(
                 epoch + 1,
                 args.epochs,
                 row["training_objective"],
@@ -199,6 +307,7 @@ def train(model, source, validation, vocab, device, args):
                 validation_metrics["root_nll"],
                 validation_metrics["degree_nll"],
                 validation_metrics["direction_nll"],
+                validation_metrics["rollout_length_nll"],
                 marker,
             ),
             flush=True,
@@ -263,6 +372,37 @@ def main():
     parser.add_argument("--root-weight", type=float, default=1.0)
     parser.add_argument("--degree-weight", type=float, default=1.0)
     parser.add_argument("--direction-weight", type=float, default=0.25)
+    parser.add_argument("--rollout-length-weight", type=float, default=0.0)
+    parser.add_argument("--rollout-length-cap", type=int, default=16)
+    parser.add_argument("--rollout-length-horizon", type=int, default=8)
+    parser.add_argument(
+        "--rollout-length-detach-backbone",
+        action="store_true",
+        help=(
+            "route projected terminal-length gradients only through the "
+            "structure adapter and heads"
+        ),
+    )
+    parser.add_argument(
+        "--rollout-length-root-only",
+        action="store_true",
+        help=(
+            "apply projected terminal-length NLL only at the unknown root "
+            "frontier, avoiding target leakage from later gold states"
+        ),
+    )
+    parser.add_argument("--trajectory-length-weight", type=float, default=0.0)
+    parser.add_argument("--trajectory-length-samples", type=int, default=2)
+    parser.add_argument("--trajectory-length-every", type=int, default=8)
+    parser.add_argument("--trajectory-length-seed", type=int, default=2909)
+    parser.add_argument(
+        "--trajectory-length-balanced-prior",
+        action="store_true",
+        help=(
+            "score trajectories against the known training corruption prior "
+            "[0,0,1,...,max_span] instead of a four-example minibatch"
+        ),
+    )
     parser.add_argument(
         "--tree-strategy", choices=("midpoint", "mixed"), default="mixed"
     )
@@ -270,6 +410,7 @@ def main():
     parser.add_argument("--max-span", type=int, default=8)
     parser.add_argument("--max-decode-span", type=int, default=16)
     parser.add_argument("--max-rounds", type=int, default=16)
+    parser.add_argument("--decode-batch-size", type=int, default=32)
     parser.add_argument("--examples", type=int, default=128)
     parser.add_argument("--max-train-examples", type=int, default=0)
     parser.add_argument("--max-validation-examples", type=int, default=128)
@@ -285,10 +426,44 @@ def main():
     )
     parser.add_argument("--token-conditioned-topology", action="store_true")
     parser.add_argument("--marginal-preserving-joint", action="store_true")
+    parser.add_argument(
+        "--direct-joint-actions",
+        action="store_true",
+        help=(
+            "train and decode one unconstrained joint distribution over each "
+            "emitted token and its leaf/left/right/both branch marker"
+        ),
+    )
     parser.add_argument("--joint-rank", type=int, default=32)
     parser.add_argument("--joint-sinkhorn-iterations", type=int, default=12)
+    parser.add_argument(
+        "--zero-joint-interaction",
+        action="store_true",
+        help=(
+            "hold the token/marker interaction at its zero init, so the joint "
+            "table is exactly the independent product in training and rollout; "
+            "the prescribed dependence ablation for semantic branching"
+        ),
+    )
     parser.add_argument("--initial-checkpoint", default="")
+    parser.add_argument(
+        "--evaluation-only",
+        action="store_true",
+        help="load --initial-checkpoint and write validation/rollout artifacts",
+    )
     parser.add_argument("--joint-only", action="store_true")
+    parser.add_argument(
+        "--generated-history-probability",
+        type=float,
+        default=0.0,
+        help=(
+            "maximum fraction of examples whose previous-round lexical tokens "
+            "are sampled from the model under the gold topology"
+        ),
+    )
+    parser.add_argument(
+        "--generated-history-warmup-epochs", type=int, default=1
+    )
     parser.add_argument(
         "--no-mixed-precision",
         action="store_false",
@@ -296,15 +471,49 @@ def main():
     )
     parser.set_defaults(mixed_precision=True, detach_structure_encoder=True)
     args = parser.parse_args()
-    if args.token_conditioned_topology and args.marginal_preserving_joint:
+    if sum((
+        bool(args.token_conditioned_topology),
+        bool(args.marginal_preserving_joint),
+        bool(args.direct_joint_actions),
+    )) > 1:
         parser.error(
-            "--token-conditioned-topology and --marginal-preserving-joint "
-            "are mutually exclusive"
+            "--token-conditioned-topology, --marginal-preserving-joint, and "
+            "--direct-joint-actions are mutually exclusive"
         )
     if args.joint_only and not args.marginal_preserving_joint:
         parser.error("--joint-only requires --marginal-preserving-joint")
+    if args.zero_joint_interaction and not (
+        args.direct_joint_actions or args.marginal_preserving_joint
+    ):
+        parser.error(
+            "--zero-joint-interaction requires a joint action mode"
+        )
     if not 0.0 <= args.midpoint_probability <= 1.0:
         parser.error("--midpoint-probability must be in [0,1]")
+    if not 0.0 <= args.generated_history_probability <= 1.0:
+        parser.error("--generated-history-probability must be in [0,1]")
+    if args.generated_history_warmup_epochs < 1:
+        parser.error("--generated-history-warmup-epochs must be positive")
+    if args.rollout_length_weight < 0.0:
+        parser.error("--rollout-length-weight cannot be negative")
+    if args.rollout_length_cap < 1:
+        parser.error("--rollout-length-cap must be positive")
+    if args.rollout_length_horizon < 1:
+        parser.error("--rollout-length-horizon must be positive")
+    if args.trajectory_length_weight < 0.0:
+        parser.error("--trajectory-length-weight cannot be negative")
+    if args.trajectory_length_samples < 1:
+        parser.error("--trajectory-length-samples must be positive")
+    if args.trajectory_length_every < 1:
+        parser.error("--trajectory-length-every must be positive")
+    if args.decode_batch_size < 1:
+        parser.error("--decode-batch-size must be positive")
+    if args.generated_history_probability and not args.direct_joint_actions:
+        parser.error("--generated-history-probability requires --direct-joint-actions")
+    if args.trajectory_length_weight and not args.direct_joint_actions:
+        parser.error("--trajectory-length-weight requires --direct-joint-actions")
+    if args.evaluation_only and not args.initial_checkpoint:
+        parser.error("--evaluation-only requires --initial-checkpoint")
 
     with open(
         os.path.join(args.base_artifact_dir, "results.json"), encoding="utf-8"
@@ -382,8 +591,10 @@ def main():
         detach_structure_encoder=args.detach_structure_encoder,
         token_conditioned_topology=args.token_conditioned_topology,
         marginal_preserving_joint=args.marginal_preserving_joint,
+        direct_joint_actions=args.direct_joint_actions,
         joint_rank=args.joint_rank,
         joint_sinkhorn_iterations=args.joint_sinkhorn_iterations,
+        zero_joint_interaction=args.zero_joint_interaction,
     ).to(device)
     if args.initial_checkpoint:
         state = torch.load(
@@ -415,12 +626,28 @@ def main():
         ),
         flush=True,
     )
-    history, best, checkpoint = train(
-        model, source, validation_states, vocab, device, args
-    )
+    if args.evaluation_only:
+        validation_metrics = evaluate_frontiers(
+            model, validation_states, vocab, device, args.eval_batch_size, args
+        )
+        history = [{
+            "epoch": 0,
+            **{"validation_" + key: value for key, value in validation_metrics.items()},
+        }]
+        best = (0, validation_metrics["objective"])
+        checkpoint = args.initial_checkpoint
+    else:
+        history, best, checkpoint = train(
+            model, source, validation_states, vocab, device, args
+        )
     model.load_state_dict(
         torch.load(checkpoint, map_location=device, weights_only=True)
     )
+    # AdamW and AMP can leave several GiB cached after training. The genuine
+    # rollout materializes full-vocabulary logits, so release that cache first.
+    gc.collect()
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
     predictions, rounds, unfinished = decode_frontier_model(
         model,
         test,
@@ -428,6 +655,7 @@ def main():
         device,
         max_rounds=args.max_rounds,
         max_decode_span=args.max_decode_span,
+        chunk_size=args.decode_batch_size,
     )
     lexical = lexical_sampling_metrics(
         test,
@@ -447,10 +675,26 @@ def main():
             "random_window_min": window_min,
             "random_window_max": window_max,
             "objective": (
-                "marginal_preserving_dynamic_frontier_joint"
-                if args.marginal_preserving_joint
-                else "balanced_dynamic_frontier_joint"
+                "direct_semantic_branching_joint_plus_trajectory_length_policy"
+                if args.direct_joint_actions and args.trajectory_length_weight > 0
+                else "direct_semantic_branching_joint_plus_projected_rollout_length"
+                if args.direct_joint_actions and args.rollout_length_weight > 0
+                else "direct_semantic_branching_joint"
+                if args.direct_joint_actions
+                else (
+                    "marginal_preserving_dynamic_frontier_joint"
+                    if args.marginal_preserving_joint
+                    else "balanced_dynamic_frontier_joint"
+                )
             ),
+            "emits_token_with_branch": True,
+            "reencodes_emitted_tokens_each_round": True,
+            "history_training": (
+                "gold_topology_generated_lexical"
+                if args.generated_history_probability > 0.0
+                else "teacher_forced_lexical"
+            ),
+            "final_mask_fill": False,
             "target_length_input": False,
             "preallocated_canvas": False,
         },

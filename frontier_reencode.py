@@ -35,6 +35,219 @@ def topology_targets(
     return degree, direction
 
 
+def truncated_length_convolution(
+    left: torch.Tensor,
+    right: torch.Tensor,
+    cap: int,
+) -> torch.Tensor:
+    """Convolve length laws with a final overflow category.
+
+    Inputs and output use categories ``0..cap, >cap``. Keeping overflow mass
+    explicit makes the projected rollout objective penalize runaway branching
+    without allocating a canvas for every possible descendant.
+    """
+    if cap < 1:
+        raise ValueError("length cap must be positive")
+    if left.shape != (cap + 2,) or right.shape != (cap + 2,):
+        raise ValueError("length distributions must have cap + 2 entries")
+    finite_size = cap + 1
+    outer = left[:finite_size].unsqueeze(1) * right[:finite_size].unsqueeze(0)
+    indices = (
+        torch.arange(finite_size, device=left.device).unsqueeze(1)
+        + torch.arange(finite_size, device=left.device).unsqueeze(0)
+    ).flatten()
+    full = left.new_zeros(2 * cap + 1).scatter_add(
+        0, indices, outer.flatten()
+    )
+    finite_tensor = full[:finite_size]
+    total_mass = left.sum() * right.sum()
+    overflow = (total_mass - finite_tensor.sum()).clamp_min(0.0)
+    return torch.cat((finite_tensor, overflow.unsqueeze(0)))
+
+
+def truncated_length_convolution_batch(
+    distributions: torch.Tensor,
+    cap: int,
+) -> torch.Tensor:
+    """Self-convolve a batch of capped length distributions."""
+    if distributions.dim() != 2 or distributions.size(1) != cap + 2:
+        raise ValueError("batched length laws must have shape [batch, cap + 2]")
+    finite_size = cap + 1
+    finite = distributions[:, :finite_size]
+    outer = finite.unsqueeze(2) * finite.unsqueeze(1)
+    base = torch.arange(finite_size, device=distributions.device)
+    indices = (base.unsqueeze(1) + base.unsqueeze(0)).flatten()
+    full = distributions.new_zeros(
+        distributions.size(0), 2 * cap + 1
+    ).scatter_add(
+        1,
+        indices.unsqueeze(0).expand(distributions.size(0), -1),
+        outer.flatten(start_dim=1),
+    )
+    finite_result = full[:, :finite_size]
+    total_mass = distributions.sum(dim=1).square()
+    overflow = (total_mass - finite_result.sum(dim=1)).clamp_min(0.0)
+    return torch.cat((finite_result, overflow.unsqueeze(1)), dim=1)
+
+
+def shift_length_distribution(
+    distribution: torch.Tensor,
+    amount: int,
+    cap: int,
+) -> torch.Tensor:
+    """Add a fixed number of emitted tokens to a capped length law."""
+    if amount < 0:
+        raise ValueError("length shift cannot be negative")
+    if distribution.shape != (cap + 2,):
+        raise ValueError("length distribution must have cap + 2 entries")
+    if amount > cap:
+        return torch.cat((
+            distribution.new_zeros(cap + 1), distribution.sum().unsqueeze(0)
+        ))
+    retained = distribution[: cap + 1 - amount]
+    finite = torch.cat((distribution.new_zeros(amount), retained))
+    overflow = (
+        distribution[-1] + distribution[cap + 1 - amount : cap + 1].sum()
+    )
+    return torch.cat((finite, overflow.unsqueeze(0)))
+
+
+def projected_total_progeny_distribution(
+    degree_probabilities: torch.Tensor,
+    cap: int,
+    horizon: int,
+    completed: int = 0,
+    root_stop_probabilities: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Project local degree laws to a differentiable terminal length law.
+
+    Each active frontier node recursively reuses its current ``0/1/2`` child
+    law for descendants up to ``horizon`` levels. This homogeneous projection
+    is deliberately a cheap training surrogate, not a claim that future neural
+    states are context-free. It supplies a proper terminal-length NLL while the
+    ordinary joint action loss still trains every observed frontier state.
+    """
+    if degree_probabilities.dim() != 2 or degree_probabilities.size(-1) != 3:
+        raise ValueError("degree probabilities must have shape [nodes, 3]")
+    if horizon < 1:
+        raise ValueError("rollout horizon must be positive")
+    if root_stop_probabilities is not None and root_stop_probabilities.shape != (
+        degree_probabilities.size(0),
+    ):
+        raise ValueError("root stop probabilities must align with active nodes")
+    delta_zero = degree_probabilities.new_zeros(cap + 2)
+    delta_zero[0] = 1.0
+    node_count = degree_probabilities.size(0)
+    total = delta_zero
+    node = shift_length_distribution(delta_zero, 1, cap).unsqueeze(0).expand(
+        node_count, -1
+    )
+    for _ in range(1, horizon):
+        two_children = truncated_length_convolution_batch(node, cap)
+        children = (
+            degree_probabilities[:, 0:1] * delta_zero.unsqueeze(0)
+            + degree_probabilities[:, 1:2] * node
+            + degree_probabilities[:, 2:3] * two_children
+        )
+        node = torch.cat((
+            children.new_zeros(node_count, 1),
+            children[:, :cap],
+            (children[:, -1] + children[:, cap]).unsqueeze(1),
+        ), dim=1)
+    if root_stop_probabilities is not None:
+        stop = root_stop_probabilities.unsqueeze(1)
+        node = stop * delta_zero.unsqueeze(0) + (1.0 - stop) * node
+    for node_distribution in node:
+        total = truncated_length_convolution(total, node_distribution, cap)
+    return shift_length_distribution(total, completed, cap)
+
+
+def projected_rollout_length_loss(
+    model,
+    batch: Dict[str, torch.Tensor],
+    vocab: TextVocabulary,
+    outputs: Tuple[torch.Tensor, ...],
+    cap: int,
+    horizon: int,
+    detach_backbone: bool = False,
+    root_only: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Proper length NLL from a projected frontier branching process."""
+    token_logits, root_stop, degree_logits, _, hidden = outputs
+    targets = batch.get("target_lengths")
+    if targets is None:
+        return token_logits.sum() * 0.0, torch.zeros(
+            (), dtype=torch.long, device=token_logits.device
+        )
+    tokens = batch["tokens"].to(token_logits.device)
+    padding = batch["padding"].to(token_logits.device)
+    steps = batch["steps"].to(token_logits.device)
+    node_ids = batch["node_ids"].to(token_logits.device)
+    targets = targets.to(token_logits.device)
+    valid = targets.ge(0)
+    if root_only:
+        valid = valid & steps.eq(0)
+    if not bool(valid.any()):
+        return token_logits.sum() * 0.0, valid.sum()
+    if detach_backbone:
+        root_stop, degree_logits, _ = model.structure_logits_from_hidden(
+            hidden.detach(), steps
+        )
+    sample_weights = batch.get("sample_weights")
+    if sample_weights is None:
+        sample_weights = torch.ones(tokens.size(0), device=token_logits.device)
+    else:
+        sample_weights = sample_weights.to(token_logits.device)
+    losses = []
+    weights = []
+    for row in valid.nonzero(as_tuple=False).flatten().tolist():
+        gaps = tokens[row].eq(vocab.GAP) & ~padding[row]
+        probabilities = degree_logits[row, gaps].float().softmax(dim=-1)
+        completed = int((node_ids[row].ge(0) & ~tokens[row].eq(vocab.GAP)).sum())
+        remaining_horizon = max(1, horizon - int(steps[row]))
+        root_probabilities = (
+            root_stop[row, gaps].float().sigmoid()
+            if int(steps[row]) == 0
+            else None
+        )
+        distribution = projected_total_progeny_distribution(
+            probabilities,
+            cap=cap,
+            horizon=remaining_horizon,
+            completed=completed,
+            root_stop_probabilities=root_probabilities,
+        )
+        target = int(targets[row])
+        category = target if target <= cap else cap + 1
+        losses.append(-distribution[category].clamp_min(1e-8).log())
+        weights.append(sample_weights[row])
+    stacked_weights = torch.stack(weights)
+    loss = (torch.stack(losses) * stacked_weights).sum() / stacked_weights.sum()
+    return loss, valid.sum()
+
+
+def apply_frontier_calibration_biases(model, values: Sequence[float]) -> None:
+    """Apply root/base/slope biases used by Monte Carlo length calibration."""
+    if len(values) != 7:
+        raise ValueError("frontier calibration requires seven bias values")
+    root, base, slope = values[0], values[1:4], values[4:7]
+    steps = torch.arange(
+        model.calibration_degree_bias.size(0),
+        device=model.calibration_degree_bias.device,
+    ).unsqueeze(-1).to(model.calibration_degree_bias.dtype)
+    base_tensor = torch.tensor(
+        base, device=model.calibration_degree_bias.device
+    ).to(model.calibration_degree_bias.dtype)
+    slope_tensor = torch.tensor(
+        slope, device=model.calibration_degree_bias.device
+    ).to(model.calibration_degree_bias.dtype)
+    with torch.no_grad():
+        model.calibration_root_bias.fill_(float(root))
+        model.calibration_degree_bias.copy_(
+            base_tensor.unsqueeze(0) + steps * slope_tensor.unsqueeze(0)
+        )
+
+
 class RandomFrontierDataset(Dataset):
     """Draw one balanced or near-balanced frontier per document and epoch."""
 
@@ -73,7 +286,132 @@ class RandomFrontierDataset(Dataset):
         # The input contains only the observed context, already emitted tokens,
         # and current gaps. Hidden span length is never included.
         state["sample_weight"] = float(len(states))
+        # Prefix states let training reconstruct the exact gold-topology
+        # derivation while replacing lexical ancestors with model samples.
+        state["history_states"] = [
+            dict(states[level]) for level in range(choice)
+        ]
+        state["source_example"] = example
         return state
+
+
+def collate_frontiers_with_history(
+    examples: Sequence[Dict[str, object]], pad_id: int
+) -> Dict[str, object]:
+    """Collate current frontiers while retaining raw derivation prefixes."""
+    batch: Dict[str, object] = dict(collate_compact_frontiers(examples, pad_id))
+    batch["history_states"] = [
+        example.get("history_states", []) for example in examples
+    ]
+    batch["source_examples"] = [
+        example.get("source_example") for example in examples
+    ]
+    return batch
+
+
+@torch.no_grad()
+def replace_with_generated_history(
+    model,
+    batch: Dict[str, object],
+    vocab: TextVocabulary,
+    device: torch.device,
+    probability: float,
+) -> Tuple[int, int]:
+    """Roll out lexical ancestors under gold topology and insert them.
+
+    The topology and current targets remain teacher-forced. Only tokens emitted
+    in earlier parallel rounds are sampled from the model, so the current
+    frontier is trained on histories it can actually produce at inference.
+    Returns the number of selected examples and replaced ancestor tokens.
+    """
+    if probability <= 0.0:
+        return 0, 0
+    histories = batch.get("history_states")
+    if not isinstance(histories, list):
+        raise ValueError("generated-history batches must retain history_states")
+    selected = torch.rand(len(histories), device=device).lt(probability).tolist()
+    generated = [dict() for _ in histories]
+    maximum_depth = max((len(states) for states in histories), default=0)
+    generated_ids = torch.tensor(
+        vocab.generated_token_ids, dtype=torch.long, device=device
+    )
+    was_training = model.training
+    model.eval()
+    try:
+        for depth in range(maximum_depth):
+            owners = [
+                row for row, states in enumerate(histories)
+                if selected[row] and depth < len(states)
+            ]
+            if not owners:
+                continue
+            states = []
+            for owner in owners:
+                state = dict(histories[owner][depth])
+                tokens = list(state["tokens"])
+                targets = list(state["targets"])
+                node_ids = list(state.get("node_ids", []))
+                for position, node_id in enumerate(node_ids):
+                    if targets[position] < 0 and node_id in generated[owner]:
+                        tokens[position] = generated[owner][node_id]
+                state["tokens"] = tokens
+                states.append(state)
+            prefix = collate_compact_frontiers(states, vocab.PAD)
+            tokens = prefix["tokens"].to(device)
+            padding = prefix["padding"].to(device)
+            steps = prefix["steps"].to(device)
+            targets = prefix["targets"].to(device)
+            node_ids = prefix["node_ids"].to(device)
+            token_logits, _, degree_logits, direction_logits, hidden = model(
+                tokens, padding, steps
+            )
+            active = targets.ge(0) & targets.lt(vocab.vocab_size)
+            if not bool(active.any()):
+                continue
+            if getattr(model, "direct_joint_actions", False):
+                active_steps = steps.unsqueeze(1).expand_as(tokens)[active]
+                joint_logp = model.joint_action_log_probs(
+                    token_logits[active],
+                    degree_logits[active],
+                    direction_logits[active],
+                    hidden[active],
+                    active_steps,
+                    generated_ids,
+                )
+                token_probabilities = torch.logsumexp(
+                    joint_logp, dim=-1
+                ).exp()
+            else:
+                token_probabilities = token_logits[active].index_select(
+                    -1, generated_ids
+                ).softmax(dim=-1)
+            sampled = generated_ids[torch.multinomial(
+                token_probabilities, 1
+            ).squeeze(-1)]
+            active_locations = active.nonzero(as_tuple=False)
+            for index, (prefix_row, position) in enumerate(active_locations.tolist()):
+                owner = owners[prefix_row]
+                node_id = int(node_ids[prefix_row, position])
+                if node_id < 0:
+                    raise ValueError("active frontier node is missing its node id")
+                generated[owner][node_id] = int(sampled[index])
+    finally:
+        model.train(was_training)
+
+    tokens = batch["tokens"]
+    targets = batch["targets"]
+    node_ids = batch["node_ids"]
+    if not all(isinstance(value, torch.Tensor) for value in (tokens, targets, node_ids)):
+        raise TypeError("collated frontier tensors are required")
+    replacements = 0
+    for row, use_generated in enumerate(selected):
+        if not use_generated:
+            continue
+        for position, node_id in enumerate(node_ids[row].tolist()):
+            if targets[row, position] < 0 and node_id in generated[row]:
+                tokens[row, position] = generated[row][node_id]
+                replacements += 1
+    return sum(selected), replacements
 
 
 class ScaffoldProposalDataset(Dataset):
@@ -797,6 +1135,10 @@ def frontier_losses(
     batch: Dict[str, torch.Tensor],
     vocab: TextVocabulary,
     device: torch.device,
+    rollout_length_cap: int = 0,
+    rollout_length_horizon: int = 8,
+    rollout_length_detach_backbone: bool = False,
+    rollout_length_root_only: bool = False,
 ) -> Dict[str, torch.Tensor]:
     """Compute separated lexical, root-stop, degree, and direction losses."""
     tokens = batch["tokens"].to(device)
@@ -918,9 +1260,11 @@ def frontier_losses(
     else:
         marker_loss = zero
         marker_count = torch.zeros((), dtype=torch.long, device=device)
-    if getattr(model, "marginal_preserving_joint", False) and bool(
-        degree_valid.any()
-    ):
+    marginal_joint = bool(
+        getattr(model, "marginal_preserving_joint", False)
+    )
+    direct_joint = bool(getattr(model, "direct_joint_actions", False))
+    if (marginal_joint or direct_joint) and bool(degree_valid.any()):
         generated_ids = torch.tensor(
             vocab.generated_token_ids, dtype=torch.long, device=device
         )
@@ -931,10 +1275,14 @@ def frontier_losses(
             generated_ids.numel(), device=device
         )
         node_steps = steps.unsqueeze(1).expand_as(tokens)[degree_valid]
+        joint_token_logits = token_logits[degree_valid]
+        if marginal_joint:
+            # In the copula experiment, the separate token loss is the only
+            # lexical gradient path. Direct semantic branching instead learns
+            # token and marker from the full joint likelihood.
+            joint_token_logits = joint_token_logits.detach()
         joint_logp = model.joint_action_log_probs(
-            # The separate token loss is the only lexical gradient path. The
-            # copula learns association without pulling the MLM marginal.
-            token_logits[degree_valid].detach(),
+            joint_token_logits,
             degree_logits[degree_valid],
             direction_logits[degree_valid],
             outputs[-1][degree_valid],
@@ -952,7 +1300,13 @@ def frontier_losses(
             -1, generated_ids
         ).log_softmax(dim=-1)
         gold_token = allowed_logp[rows, token_indices]
-        joint_terms = -(gold_joint - gold_token)
+        # Marginal-preserving coupling trains only p(marker | token), leaving
+        # the separate token loss as the lexical term. Direct semantic
+        # branching trains the full p(token, marker) table because rollout
+        # samples that same joint action without teacher forcing.
+        joint_terms = (
+            -(gold_joint - gold_token) if marginal_joint else -gold_joint
+        )
         joint_weights = position_weights[degree_valid]
         joint_loss = (
             joint_terms * joint_weights
@@ -961,6 +1315,20 @@ def frontier_losses(
     else:
         joint_loss = zero
         joint_count = torch.zeros((), dtype=torch.long, device=device)
+    if rollout_length_cap > 0:
+        rollout_length_loss, rollout_length_count = projected_rollout_length_loss(
+            model,
+            batch,
+            vocab,
+            outputs,
+            cap=rollout_length_cap,
+            horizon=rollout_length_horizon,
+            detach_backbone=rollout_length_detach_backbone,
+            root_only=rollout_length_root_only,
+        )
+    else:
+        rollout_length_loss = zero
+        rollout_length_count = torch.zeros((), dtype=torch.long, device=device)
     return {
         "token": token_loss,
         "root": root_loss,
@@ -968,12 +1336,14 @@ def frontier_losses(
         "direction": direction_loss,
         "marker": marker_loss,
         "joint": joint_loss,
+        "rollout_length": rollout_length_loss,
         "token_count": token_valid.sum(),
         "root_count": root_valid.sum(),
         "degree_count": degree_valid.sum(),
         "direction_count": direction_valid.sum(),
         "marker_count": marker_count,
         "joint_count": joint_count,
+        "rollout_length_count": rollout_length_count,
     }
 
 
@@ -990,6 +1360,243 @@ def initial_region_canvas(
     return canvas
 
 
+def trajectory_energy_coefficients(
+    generated_lengths: torch.Tensor,
+    target_lengths: torch.Tensor,
+    scale: float,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Score-function coefficients for the sample energy distance.
+
+    The energy distance is ``2 E|X-Y| - E|X-X'| - E|Y-Y'|``. Its derivative
+    with respect to the generated law assigns each sampled ``X`` the detached
+    coefficient returned here. Unlike per-example squared length error, this
+    distributional objective does not ask an unidentifiable prompt to predict
+    one randomly corrupted length.
+    """
+    if generated_lengths.dim() != 1 or target_lengths.dim() != 1:
+        raise ValueError("trajectory lengths must be one-dimensional")
+    if generated_lengths.numel() < 2 or target_lengths.numel() < 1:
+        raise ValueError("energy distance needs two generated and one target sample")
+    generated = generated_lengths.float()
+    targets = target_lengths.float()
+    attraction = 2.0 * (generated[:, None] - targets[None, :]).abs().mean(dim=1)
+    pairwise_generated = (generated[:, None] - generated[None, :]).abs()
+    repulsion = 2.0 * pairwise_generated.sum(dim=1) / (
+        generated.numel() - 1
+    )
+    coefficients = (attraction - repulsion) / max(float(scale), 1.0)
+    generated_term = pairwise_generated.sum() / (
+        generated.numel() * (generated.numel() - 1)
+    )
+    target_pairwise = (targets[:, None] - targets[None, :]).abs()
+    target_term = target_pairwise.mean()
+    energy = (
+        2.0 * (generated[:, None] - targets[None, :]).abs().mean()
+        - generated_term
+        - target_term
+    ) / max(float(scale), 1.0)
+    return coefficients, energy
+
+
+def sampled_trajectory_length_policy_loss(
+    model,
+    examples: Sequence[TextInfillingExample],
+    vocab: TextVocabulary,
+    device: torch.device,
+    samples_per_prompt: int = 2,
+    max_rounds: int = 8,
+    max_decode_span: int = 16,
+    seed: int = 1901,
+    target_length_bank: Optional[Sequence[int]] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Sample re-encoded trajectories and return a structural policy loss.
+
+    Sampling uses the model's exact current direct-joint action table. For the
+    auxiliary score-function gradient, the sampled joint marker marginal is
+    treated as a frozen offset around the live base marker logits. Consequently
+    the length signal updates the structure adapter and root/degree/direction
+    heads, but not the native token head, backbone, or learned token-marker
+    interaction. Supervised joint NLL continues to train the full model.
+    """
+    if samples_per_prompt < 1:
+        raise ValueError("trajectory samples per prompt must be positive")
+    if len(examples) * samples_per_prompt < 2:
+        raise ValueError("trajectory policy loss needs at least two rollouts")
+    if any(example is None for example in examples):
+        raise ValueError("trajectory batches must retain source examples")
+    replicas = [
+        (owner, example)
+        for owner, example in enumerate(examples)
+        for _ in range(samples_per_prompt)
+    ]
+    canvases = [initial_region_canvas(example, vocab) for _, example in replicas]
+    rounds = [0] * len(replicas)
+    unfinished = [False] * len(replicas)
+    logp_rounds: List[torch.Tensor] = []
+    generated_ids = torch.tensor(
+        vocab.generated_token_ids, dtype=torch.long, device=device
+    )
+    generator = torch.Generator(device=device)
+    generator.manual_seed(seed)
+    was_training = model.training
+    model.eval()
+    try:
+        for _ in range(max_rounds):
+            active = [
+                index for index, canvas in enumerate(canvases)
+                if any(token == vocab.GAP for token, _ in canvas)
+                and not unfinished[index]
+            ]
+            if not active:
+                break
+            width = max(len(canvases[index]) for index in active)
+            tokens = torch.full(
+                (len(active), width), vocab.PAD, dtype=torch.long, device=device
+            )
+            padding = torch.ones_like(tokens, dtype=torch.bool)
+            steps = torch.tensor(
+                [rounds[index] for index in active], dtype=torch.long, device=device
+            )
+            for row, index in enumerate(active):
+                values = [token for token, _ in canvases[index]]
+                tokens[row, : len(values)] = torch.tensor(values, device=device)
+                padding[row, : len(values)] = False
+            with torch.no_grad():
+                hidden = model.backbone(
+                    input_ids=tokens.masked_fill(padding, vocab.PAD),
+                    attention_mask=(~padding).to(torch.long),
+                ).last_hidden_state
+                token_logits = model.token_head(hidden)
+            root_stop, degree_logits, direction_logits = (
+                model.structure_logits_from_hidden(hidden.detach(), steps)
+            )
+            gaps = tokens.eq(vocab.GAP) & ~padding
+            gap_steps = steps.unsqueeze(1).expand_as(tokens)[gaps]
+            with torch.no_grad():
+                frozen_joint = model.joint_action_log_probs(
+                    token_logits[gaps].detach(),
+                    degree_logits[gaps].detach(),
+                    direction_logits[gaps].detach(),
+                    hidden[gaps].detach(),
+                    gap_steps,
+                    generated_ids,
+                )
+                sampled = torch.multinomial(
+                    frozen_joint.exp().reshape(int(gaps.sum()), -1),
+                    1,
+                    generator=generator,
+                ).squeeze(-1)
+                token_indices = torch.div(sampled, 4, rounding_mode="floor")
+                marker_values = sampled.remainder(4)
+                stop_values = (
+                    torch.rand(
+                        root_stop.shape, device=device, generator=generator
+                    ) < root_stop.detach().sigmoid()
+                )
+            base_marker = model.marker_log_probs(
+                degree_logits[gaps], direction_logits[gaps]
+            )
+            frozen_marker = torch.logsumexp(frozen_joint, dim=-2)
+            auxiliary_marker = (
+                frozen_marker
+                + base_marker
+                - base_marker.detach()
+            ).log_softmax(dim=-1)
+            selected_marker_logp = auxiliary_marker.gather(
+                1, marker_values.unsqueeze(1)
+            ).squeeze(1)
+            gap_rows = gaps.nonzero(as_tuple=False)[:, 0]
+            row_contribution = root_stop.new_zeros(len(active)).scatter_add(
+                0, gap_rows, selected_marker_logp
+            )
+            initial_rows = steps.eq(0)
+            if bool(initial_rows.any()):
+                root_locations = gaps & initial_rows.unsqueeze(1)
+                root_logp = -F.binary_cross_entropy_with_logits(
+                    root_stop[root_locations],
+                    stop_values[root_locations].to(root_stop.dtype),
+                    reduction="none",
+                )
+                root_rows = root_locations.nonzero(as_tuple=False)[:, 0]
+                row_contribution = row_contribution.scatter_add(
+                    0, root_rows, root_logp
+                )
+                # A stopped root emits no joint action.
+                stopped_gap = stop_values[gaps] & initial_rows[gap_rows]
+                row_contribution = row_contribution.scatter_add(
+                    0, gap_rows[stopped_gap],
+                    -selected_marker_logp[stopped_gap],
+                )
+            replica_contribution = root_stop.new_zeros(len(replicas))
+            active_tensor = torch.tensor(active, device=device, dtype=torch.long)
+            replica_contribution = replica_contribution.scatter_add(
+                0, active_tensor, row_contribution
+            )
+            logp_rounds.append(replica_contribution)
+
+            chosen_tokens = generated_ids[token_indices].cpu()
+            chosen_markers = marker_values.cpu()
+            stop_cpu = stop_values.cpu()
+            gap_cursor = 0
+            for row, replica_index in enumerate(active):
+                expanded: List[Tuple[int, int]] = []
+                initial = rounds[replica_index] == 0
+                for position, (token, region) in enumerate(canvases[replica_index]):
+                    if token != vocab.GAP:
+                        expanded.append((token, region))
+                        continue
+                    stopped = initial and bool(stop_cpu[row, position])
+                    pivot = int(chosen_tokens[gap_cursor])
+                    marker = int(chosen_markers[gap_cursor])
+                    gap_cursor += 1
+                    if stopped:
+                        continue
+                    if marker in (1, 3):
+                        expanded.append((vocab.GAP, region))
+                    expanded.append((pivot, region))
+                    if marker in (2, 3):
+                        expanded.append((vocab.GAP, region))
+                rounds[replica_index] += 1
+                generated = sum(
+                    token != vocab.GAP and region >= 0 for token, region in expanded
+                )
+                if generated > max_decode_span:
+                    unfinished[replica_index] = True
+                    expanded = [item for item in expanded if item[0] != vocab.GAP]
+                canvases[replica_index] = expanded
+    finally:
+        model.train(was_training)
+    if logp_rounds:
+        trajectory_logp = torch.stack(logp_rounds).sum(dim=0)
+    else:
+        trajectory_logp = next(model.parameters()).sum() * 0.0 + torch.zeros(
+            len(replicas), device=device
+        )
+    lengths = []
+    for index, canvas in enumerate(canvases):
+        failed = unfinished[index] or any(token == vocab.GAP for token, _ in canvas)
+        lengths.append(
+            max_decode_span + 1 if failed else sum(
+                token != vocab.GAP and region >= 0 for token, region in canvas
+            )
+        )
+    generated_lengths = torch.tensor(lengths, device=device)
+    target_lengths = torch.tensor(
+        list(target_length_bank)
+        if target_length_bank is not None
+        else [sum(len(span) for span in example.spans) for example in examples],
+        device=device,
+    )
+    if target_lengths.numel() < 1:
+        raise ValueError("trajectory target length bank cannot be empty")
+    coefficients, energy = trajectory_energy_coefficients(
+        generated_lengths, target_lengths, max_decode_span + 1
+    )
+    scale = coefficients.detach().abs().mean().clamp_min(1.0)
+    policy_loss = (coefficients.detach() / scale * trajectory_logp).mean()
+    return policy_loss, energy.detach(), generated_lengths.detach()
+
+
 @torch.inference_mode()
 def decode_frontier_model(
     model,
@@ -1001,6 +1608,7 @@ def decode_frontier_model(
     stochastic: bool = False,
     generator: Optional[torch.Generator] = None,
     sample_tokens: Optional[bool] = None,
+    chunk_size: Optional[int] = None,
 ) -> Tuple[List[List[List[int]]], List[int], List[bool]]:
     """Expand every open gap in one backbone pass per round.
 
@@ -1009,6 +1617,29 @@ def decode_frontier_model(
     when corruption length is independent of the visible prompt and therefore
     cannot be recovered as a deterministic per-prompt label.
     """
+    if chunk_size is not None and chunk_size < 1:
+        raise ValueError("decode chunk size must be positive")
+    if chunk_size is not None and len(examples) > chunk_size:
+        predictions: List[List[List[int]]] = []
+        rounds: List[int] = []
+        unfinished: List[bool] = []
+        for start in range(0, len(examples), chunk_size):
+            chunk_predictions, chunk_rounds, chunk_unfinished = decode_frontier_model(
+                model,
+                examples[start : start + chunk_size],
+                vocab,
+                device,
+                max_rounds=max_rounds,
+                max_decode_span=max_decode_span,
+                stochastic=stochastic,
+                generator=generator,
+                sample_tokens=sample_tokens,
+                chunk_size=None,
+            )
+            predictions.extend(chunk_predictions)
+            rounds.extend(chunk_rounds)
+            unfinished.extend(chunk_unfinished)
+        return predictions, rounds, unfinished
     model.eval()
     if sample_tokens is None:
         sample_tokens = stochastic
@@ -1045,7 +1676,10 @@ def decode_frontier_model(
         )
         allowed = token_logits.index_select(-1, generated_ids)
         joint_markers = None
-        if getattr(model, "marginal_preserving_joint", False):
+        if (
+            getattr(model, "marginal_preserving_joint", False)
+            or getattr(model, "direct_joint_actions", False)
+        ):
             gap_mask = tokens.eq(vocab.GAP) & ~padding
             gap_steps = steps.unsqueeze(1).expand_as(tokens)[gap_mask]
             joint_logp = model.joint_action_log_probs(

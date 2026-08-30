@@ -175,9 +175,15 @@ def decompose_exact_batch(
         group_lexical = (marginals * token_part).sum(dim=dims)
         group_topology = (marginals * topology_part).sum(dim=dims)
         # H(q') = log Z - E_q'[sum of the weights that defined q'].
-        group_entropy = log_partition.detach() - (
-            marginals * stacked.detach().nan_to_num(neginf=0.0)
-        ).sum(dim=dims)
+        if tree == "midpoint":
+            # A deterministic proposal has one admissible tree, hence exactly
+            # zero entropy. Computing this as log Z - E[weight] only introduces
+            # avoidable floating-point cancellation for large random logits.
+            group_entropy = torch.zeros_like(log_partition)
+        else:
+            group_entropy = log_partition.detach() - (
+                marginals * stacked.detach().nan_to_num(neginf=0.0)
+            ).sum(dim=dims)
         # Collapse every axis except batch and depth.
         interval_dims = tuple(range(2, stacked.ndim))
         by_depth_lexical = (marginals * token_part).sum(dim=interval_dims)

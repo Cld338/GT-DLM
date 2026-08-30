@@ -16,7 +16,11 @@ from transformers import AutoTokenizer
 from evaluate_inside_lexical import lexical_sampling_metrics
 from evaluate_text_sampling import distribution_metrics
 from experiment import choose_device, seed_everything
-from frontier_reencode import sample_frontier_rollouts, sampled_length_probabilities
+from frontier_reencode import (
+    apply_frontier_calibration_biases,
+    sample_frontier_rollouts,
+    sampled_length_probabilities,
+)
 from gtdlm.model import PretrainedGapFrontierModel
 from gtdlm.text_data import random_length_windows, sample_text_infilling_examples
 from gtdlm.text_tokenizer import vocabulary_from_pretrained_tokenizer
@@ -42,9 +46,13 @@ def load_model(artifact_dir, vocab, tokenizer, device):
         marginal_preserving_joint=bool(
             config.get("marginal_preserving_joint", False)
         ),
+        direct_joint_actions=bool(config.get("direct_joint_actions", False)),
         joint_rank=int(config.get("joint_rank", 32)),
         joint_sinkhorn_iterations=int(
             config.get("joint_sinkhorn_iterations", 12)
+        ),
+        zero_joint_interaction=bool(
+            config.get("zero_joint_interaction", False)
         ),
         dropout=0.0,
     ).to(device)
@@ -80,9 +88,20 @@ def main():
         help="sample shape but take the argmax token, matching the scaffold "
              "comparison in research/FRONTIER_REENCODE.md",
     )
+    parser.add_argument(
+        "--calibration-results",
+        default="",
+        help="apply test.calibrated.values from a frontier calibration JSON",
+    )
     args = parser.parse_args()
 
     directories = [name for name in args.artifact_dirs.split(",") if name]
+    if args.calibration_results and len(directories) != 1:
+        parser.error("--calibration-results requires exactly one artifact dir")
+    calibration_values = None
+    if args.calibration_results:
+        with open(args.calibration_results, encoding="utf-8") as handle:
+            calibration_values = json.load(handle)["test"]["calibrated"]["values"]
     with open(
         os.path.join(directories[0], "results.json"), encoding="utf-8"
     ) as handle:
@@ -116,6 +135,8 @@ def main():
     results = {}
     for artifact_dir in directories:
         model, config = load_model(artifact_dir, vocab, tokenizer, device)
+        if calibration_values is not None:
+            apply_frontier_calibration_biases(model, calibration_values)
         predictions, rounds, unfinished = sample_frontier_rollouts(
             model,
             test,
@@ -144,7 +165,14 @@ def main():
             "marginal_preserving_joint": bool(
                 config.get("marginal_preserving_joint", False)
             ),
+            "direct_joint_actions": bool(
+                config.get("direct_joint_actions", False)
+            ),
+            "zero_joint_interaction": bool(
+                config.get("zero_joint_interaction", False)
+            ),
             "selected_epoch": None,
+            "calibration_values": calibration_values,
             "matched_length_token_accuracy": lexical[
                 "matched_length_token_accuracy"
             ],

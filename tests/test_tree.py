@@ -9,6 +9,15 @@ import torch.nn.functional as F
 from analyze_topology_exposure import tuple_dependence
 from adapt_multigap_proper_mle import masked_batch_logp, sequential_batch_logp
 from analyze_shared_regime import conditional_metrics
+from calibrate_frontier_length import (
+    balanced_length_target,
+    cramer_cdf_distance,
+    histogram_objective,
+    parse_calibration_values,
+    parse_search_indices,
+    parse_seed_list,
+    robust_seed_score,
+)
 from evaluate_text_sampling import (
     calibrated_topology_logits,
     distribution_metrics,
@@ -41,6 +50,8 @@ from exposure_gap import (
     self_token_topology_loss,
 )
 from frontier_reencode import (
+    apply_frontier_calibration_biases,
+    collate_frontiers_with_history,
     decode_frontier_model,
     FixedScaffoldDerivationDataset,
     frontier_losses,
@@ -53,6 +64,10 @@ from frontier_reencode import (
     scaffold_topology_losses,
     ScaffoldProposalDataset,
     sampled_length_probabilities,
+    replace_with_generated_history,
+    projected_total_progeny_distribution,
+    sampled_trajectory_length_policy_loss,
+    trajectory_energy_coefficients,
     topology_targets,
     unified_scaffold_losses,
 )
@@ -2881,6 +2896,492 @@ class ReencodedFrontierTests(unittest.TestCase):
         self.assertEqual(unfinished, [False])
         self.assertEqual(backbone.calls - before, 1)
         self.assertIn(predictions[0][0][0], vocab.generated_token_ids)
+
+    def test_direct_joint_actions_nest_the_independent_product(self):
+        tokenizer, backbone, head, _ = self.build_native_model()
+        vocab = TextVocabulary(
+            len(tokenizer), PAD=1, GAP=9, MASK=9, LEFT=0, RIGHT=2,
+            EXTRA_STRUCTURAL=(3,),
+        )
+        model = PretrainedGapFrontierModel(
+            vocab.vocab_size,
+            vocab.GAP,
+            vocab.PAD,
+            backbone=backbone,
+            pretrained_tokenizer=tokenizer,
+            pretrained_lm_head=head,
+            direct_joint_actions=True,
+            joint_rank=4,
+            dropout=0.0,
+        )
+        model.eval()
+        tokens = torch.tensor([[0, 5, 9, 6, 2]])
+        padding = tokens.eq(vocab.PAD)
+        steps = torch.tensor([1])
+        generated = torch.tensor(vocab.generated_token_ids)
+        with torch.no_grad():
+            outputs = model(tokens, padding, steps)
+            node = tokens.eq(vocab.GAP)
+            joint = model.joint_action_log_probs(
+                outputs[0][node], outputs[2][node], outputs[3][node],
+                outputs[4][node], steps.unsqueeze(1).expand_as(tokens)[node],
+                generated,
+            )
+            token_logp = outputs[0][node].index_select(
+                -1, generated
+            ).log_softmax(dim=-1)
+            marker_logp = model.marker_log_probs(
+                outputs[2][node], outputs[3][node]
+            )
+        expected = token_logp.unsqueeze(-1) + marker_logp.unsqueeze(-2)
+        self.assertTrue(torch.allclose(joint, expected, atol=1e-6))
+        self.assertTrue(torch.allclose(
+            torch.logsumexp(joint.flatten(start_dim=-2), dim=-1),
+            torch.zeros(1),
+            atol=1e-6,
+        ))
+
+    def test_zero_joint_interaction_stays_the_independent_product_when_trained(self):
+        """The prescribed dependence ablation must not drift off zero.
+
+        The nesting test above holds at initialization.  This one takes a real
+        gradient step through the joint loss and checks that the table is still
+        exactly the independent token/marker product afterwards, which is what
+        makes the ablation attributable to the interaction alone.
+        """
+        tokenizer, backbone, head, _ = self.build_native_model()
+        vocab = TextVocabulary(
+            len(tokenizer), PAD=1, GAP=9, MASK=9, LEFT=0, RIGHT=2,
+            EXTRA_STRUCTURAL=(3,),
+        )
+        model = PretrainedGapFrontierModel(
+            vocab.vocab_size,
+            vocab.GAP,
+            vocab.PAD,
+            backbone=backbone,
+            pretrained_tokenizer=tokenizer,
+            pretrained_lm_head=head,
+            direct_joint_actions=True,
+            zero_joint_interaction=True,
+            joint_rank=4,
+            dropout=0.0,
+        )
+        # The frozen projections must be invisible to the optimizer, so weight
+        # decay cannot move them.
+        self.assertFalse(model.joint_marker_projection.weight.requires_grad)
+        self.assertFalse(model.joint_token_projection.weight.requires_grad)
+        trainable = [p for p in model.parameters() if p.requires_grad]
+        self.assertNotIn(
+            id(model.joint_marker_projection.weight),
+            {id(p) for p in trainable},
+        )
+
+        example = TextInfillingExample(((5,), (6,)), ((10, 11, 12),))
+        states = TextGapProposalDataset(
+            [example], vocab, strategy="midpoint", seed=17
+        )
+        batch = collate_compact_frontiers(
+            [states[index] for index in range(len(states))], vocab.PAD
+        )
+        optimizer = torch.optim.AdamW(trainable, lr=1e-3, weight_decay=0.01)
+        losses = frontier_losses(model, batch, vocab, torch.device("cpu"))
+        (losses["root"] + losses["joint"]).backward()
+        optimizer.step()
+
+        # The interaction path receives no gradient at all.
+        self.assertIsNone(model.joint_marker_projection.weight.grad)
+        self.assertIsNone(model.joint_token_projection.weight.grad)
+
+        # And the table still factorizes exactly after the step, even though
+        # the token head and branching heads have moved.
+        model.eval()
+        tokens = torch.tensor([[0, 5, 9, 6, 2]])
+        padding = tokens.eq(vocab.PAD)
+        steps = torch.tensor([1])
+        generated = torch.tensor(vocab.generated_token_ids)
+        with torch.no_grad():
+            outputs = model(tokens, padding, steps)
+            node = tokens.eq(vocab.GAP)
+            joint = model.joint_action_log_probs(
+                outputs[0][node], outputs[2][node], outputs[3][node],
+                outputs[4][node], steps.unsqueeze(1).expand_as(tokens)[node],
+                generated,
+            )
+            token_logp = outputs[0][node].index_select(
+                -1, generated
+            ).log_softmax(dim=-1)
+            marker_logp = model.marker_log_probs(
+                outputs[2][node], outputs[3][node]
+            )
+        expected = token_logp.unsqueeze(-1) + marker_logp.unsqueeze(-2)
+        self.assertTrue(torch.allclose(joint, expected, atol=1e-6))
+        self.assertTrue(torch.allclose(
+            torch.logsumexp(joint.flatten(start_dim=-2), dim=-1),
+            torch.zeros(1),
+            atol=1e-6,
+        ))
+
+    def test_zero_joint_interaction_survives_a_trained_checkpoint_load(self):
+        """A checkpoint trained *with* interaction must not reintroduce it.
+
+        `joint_marker_projection` is only zero by initialization, so loading a
+        trained direct checkpoint into the ablation arm would silently restore
+        the coupling if the table read those weights.  It must not.
+        """
+        tokenizer, backbone, head, _ = self.build_native_model()
+        vocab = TextVocabulary(
+            len(tokenizer), PAD=1, GAP=9, MASK=9, LEFT=0, RIGHT=2,
+            EXTRA_STRUCTURAL=(3,),
+        )
+        shared = dict(
+            backbone=backbone,
+            pretrained_tokenizer=tokenizer,
+            pretrained_lm_head=head,
+            direct_joint_actions=True,
+            joint_rank=4,
+            dropout=0.0,
+        )
+        trained = PretrainedGapFrontierModel(
+            vocab.vocab_size, vocab.GAP, vocab.PAD, **shared
+        )
+        with torch.no_grad():
+            trained.joint_marker_projection.weight.normal_(std=0.5)
+            trained.joint_marker_projection.bias.normal_(std=0.5)
+        ablated = PretrainedGapFrontierModel(
+            vocab.vocab_size, vocab.GAP, vocab.PAD,
+            zero_joint_interaction=True, **shared
+        )
+        ablated.load_state_dict(trained.state_dict())
+        self.assertGreater(
+            float(ablated.joint_marker_projection.weight.abs().sum()), 0.0
+        )
+
+        trained.eval()
+        ablated.eval()
+        tokens = torch.tensor([[0, 5, 9, 6, 2]])
+        padding = tokens.eq(vocab.PAD)
+        steps = torch.tensor([1])
+        generated = torch.tensor(vocab.generated_token_ids)
+        node = tokens.eq(vocab.GAP)
+        tables = []
+        for model in (trained, ablated):
+            with torch.no_grad():
+                outputs = model(tokens, padding, steps)
+                tables.append(model.joint_action_log_probs(
+                    outputs[0][node], outputs[2][node], outputs[3][node],
+                    outputs[4][node],
+                    steps.unsqueeze(1).expand_as(tokens)[node], generated,
+                ))
+        # Same weights, same inputs: the arms must differ only by the coupling,
+        # and the ablated arm must be the exact independent product.
+        self.assertFalse(torch.allclose(tables[0], tables[1], atol=1e-5))
+        with torch.no_grad():
+            outputs = ablated(tokens, padding, steps)
+            token_logp = outputs[0][node].index_select(
+                -1, generated
+            ).log_softmax(dim=-1)
+            marker_logp = ablated.marker_log_probs(
+                outputs[2][node], outputs[3][node]
+            )
+        self.assertTrue(torch.allclose(
+            tables[1],
+            token_logp.unsqueeze(-1) + marker_logp.unsqueeze(-2),
+            atol=1e-6,
+        ))
+
+    def test_direct_joint_loss_trains_token_marker_and_interaction_together(self):
+        tokenizer, backbone, head, _ = self.build_native_model()
+        vocab = TextVocabulary(
+            len(tokenizer), PAD=1, GAP=9, MASK=9, LEFT=0, RIGHT=2,
+            EXTRA_STRUCTURAL=(3,),
+        )
+        model = PretrainedGapFrontierModel(
+            vocab.vocab_size,
+            vocab.GAP,
+            vocab.PAD,
+            backbone=backbone,
+            pretrained_tokenizer=tokenizer,
+            pretrained_lm_head=head,
+            direct_joint_actions=True,
+            joint_rank=4,
+            dropout=0.0,
+        )
+        example = TextInfillingExample(((5,), (6,)), ((10, 11, 12),))
+        states = TextGapProposalDataset(
+            [example], vocab, strategy="midpoint", seed=17
+        )
+        batch = collate_compact_frontiers(
+            [states[index] for index in range(len(states))], vocab.PAD
+        )
+        losses = frontier_losses(model, batch, vocab, torch.device("cpu"))
+        self.assertTrue(torch.isfinite(losses["joint"]))
+        self.assertEqual(
+            int(losses["joint_count"]), int(losses["degree_count"])
+        )
+        (losses["root"] + losses["joint"]).backward()
+        self.assertIsNotNone(model.joint_marker_projection.weight.grad)
+        self.assertGreater(
+            float(model.joint_marker_projection.weight.grad.abs().sum()), 0.0
+        )
+        self.assertIsNotNone(model.degree_head.weight.grad)
+        self.assertIsNotNone(head[-1].weight.grad)
+
+    def test_direct_joint_semantic_branching_emits_seven_tokens_in_three_passes(self):
+        tokenizer, backbone, head, _ = self.build_native_model()
+        vocab = TextVocabulary(
+            len(tokenizer), PAD=1, GAP=9, MASK=9, LEFT=0, RIGHT=2,
+            EXTRA_STRUCTURAL=(3,),
+        )
+        model = PretrainedGapFrontierModel(
+            vocab.vocab_size,
+            vocab.GAP,
+            vocab.PAD,
+            backbone=backbone,
+            pretrained_tokenizer=tokenizer,
+            pretrained_lm_head=head,
+            direct_joint_actions=True,
+            joint_rank=4,
+            dropout=0.0,
+        )
+        with torch.no_grad():
+            for parameter in head.parameters():
+                parameter.zero_()
+            head[-1].bias[10] = 20.0
+            model.root_stop_head.weight.zero_()
+            model.root_stop_head.bias.fill_(-20.0)
+            model.degree_head.weight.zero_()
+            model.degree_head.bias.zero_()
+            model.direction_head.weight.zero_()
+            model.direction_head.bias.zero_()
+            model.calibration_degree_bias.fill_(-20.0)
+            model.calibration_degree_bias[0, 2] = 20.0
+            model.calibration_degree_bias[1, 2] = 20.0
+            model.calibration_degree_bias[2:, 0] = 20.0
+        before = backbone.calls
+        predictions, rounds, unfinished = decode_frontier_model(
+            model,
+            [TextInfillingExample(((5,), (6,)), ((10,),))],
+            vocab,
+            torch.device("cpu"),
+            max_rounds=4,
+            max_decode_span=8,
+            stochastic=False,
+        )
+        self.assertEqual(predictions[0][0], [10] * 7)
+        self.assertEqual(rounds, [3])
+        self.assertEqual(unfinished, [False])
+        self.assertEqual(backbone.calls - before, 3)
+
+    def test_generated_history_replaces_exact_lexical_ancestors(self):
+        tokenizer, backbone, head, _ = self.build_native_model()
+        vocab = TextVocabulary(
+            len(tokenizer), PAD=1, GAP=9, MASK=9, LEFT=0, RIGHT=2,
+            EXTRA_STRUCTURAL=(3,),
+        )
+        model = PretrainedGapFrontierModel(
+            vocab.vocab_size,
+            vocab.GAP,
+            vocab.PAD,
+            backbone=backbone,
+            pretrained_tokenizer=tokenizer,
+            pretrained_lm_head=head,
+            direct_joint_actions=True,
+            joint_rank=4,
+            dropout=0.0,
+        )
+        with torch.no_grad():
+            for parameter in head.parameters():
+                parameter.zero_()
+            head[-1].bias[10] = 30.0
+        example = TextInfillingExample(
+            ((5,), (6,)), ((11, 12, 13, 14, 15, 16, 17),)
+        )
+        states = TextGapProposalDataset(
+            [example], vocab, strategy="midpoint", seed=17
+        )
+        current = dict(states[2])
+        current["history_states"] = [dict(states[0]), dict(states[1])]
+        batch = collate_frontiers_with_history([current], vocab.PAD)
+        selected, replacements = replace_with_generated_history(
+            model, batch, vocab, torch.device("cpu"), probability=1.0
+        )
+        self.assertEqual(selected, 1)
+        self.assertEqual(replacements, 3)
+        completed = batch["node_ids"].ge(0) & batch["targets"].lt(0)
+        self.assertEqual(batch["tokens"][completed].tolist(), [10, 10, 10])
+        active_ids = batch["node_ids"][batch["targets"].ge(0)].tolist()
+        self.assertEqual(active_ids, [0, 2, 4, 6])
+
+    def test_frontier_calibration_applies_round_slopes(self):
+        tokenizer, backbone, head, _ = self.build_native_model()
+        vocab = TextVocabulary(
+            len(tokenizer), PAD=1, GAP=9, MASK=9, LEFT=0, RIGHT=2,
+            EXTRA_STRUCTURAL=(3,),
+        )
+        model = PretrainedGapFrontierModel(
+            vocab.vocab_size,
+            vocab.GAP,
+            vocab.PAD,
+            backbone=backbone,
+            pretrained_tokenizer=tokenizer,
+            pretrained_lm_head=head,
+            direct_joint_actions=True,
+            dropout=0.0,
+        )
+        apply_frontier_calibration_biases(
+            model, [-0.5, -0.5, 0.0, -0.5, 0.0, 0.0, 0.25]
+        )
+        self.assertAlmostEqual(float(model.calibration_root_bias), -0.5)
+        self.assertTrue(torch.allclose(
+            model.calibration_degree_bias[0],
+            torch.tensor([-0.5, 0.0, -0.5]),
+        ))
+        self.assertTrue(torch.allclose(
+            model.calibration_degree_bias[2],
+            torch.tensor([-0.5, 0.0, 0.0]),
+        ))
+
+    def test_robust_frontier_calibration_scores_ordered_histograms(self):
+        target = torch.tensor([0.5, 0.0, 0.5])
+        nearby = torch.tensor([0.5, 0.5, 0.0])
+        exact = cramer_cdf_distance(target, target)
+        displaced = cramer_cdf_distance(nearby, target)
+        self.assertAlmostEqual(float(exact), 0.0)
+        self.assertGreater(float(displaced), 0.0)
+        self.assertAlmostEqual(
+            float(histogram_objective(target, target, "tv")), 0.0
+        )
+        self.assertAlmostEqual(robust_seed_score([1.0, 3.0], 0.0), 2.0)
+        self.assertAlmostEqual(robust_seed_score([1.0, 3.0], 1.0), 3.0)
+        self.assertEqual(parse_seed_list("1901, 1913,1901", 7), [1901, 1913])
+        self.assertEqual(parse_seed_list("", 7), [7])
+        self.assertEqual(
+            parse_calibration_values("-1,-1,1,0,0,0,-1"),
+            [-1.0, -1.0, 1.0, 0.0, 0.0, 0.0, -1.0],
+        )
+        self.assertEqual(parse_search_indices("0,2,2,6"), [0, 2, 6])
+        self.assertEqual(parse_search_indices(""), list(range(7)))
+        self.assertTrue(torch.allclose(
+            balanced_length_target(3, torch.device("cpu")),
+            torch.tensor([0.4, 0.2, 0.2, 0.2, 0.0]),
+        ))
+
+    def test_projected_rollout_length_tracks_leaf_chain_and_binary_tree(self):
+        leaf = projected_total_progeny_distribution(
+            torch.tensor([[1.0, 0.0, 0.0]]), cap=16, horizon=3
+        )
+        chain = projected_total_progeny_distribution(
+            torch.tensor([[0.0, 1.0, 0.0]]), cap=16, horizon=3
+        )
+        binary = projected_total_progeny_distribution(
+            torch.tensor([[0.0, 0.0, 1.0]]), cap=16, horizon=3
+        )
+        stopped = projected_total_progeny_distribution(
+            torch.tensor([[0.0, 0.0, 1.0]]),
+            cap=16,
+            horizon=3,
+            root_stop_probabilities=torch.ones(1),
+        )
+        self.assertAlmostEqual(float(leaf[1]), 1.0, places=6)
+        self.assertAlmostEqual(float(chain[3]), 1.0, places=6)
+        self.assertAlmostEqual(float(binary[7]), 1.0, places=6)
+        self.assertAlmostEqual(float(stopped[0]), 1.0, places=6)
+
+    def test_projected_rollout_length_loss_reaches_structure_heads(self):
+        tokenizer, backbone, head, _ = self.build_native_model()
+        vocab = TextVocabulary(
+            len(tokenizer), PAD=1, GAP=9, MASK=9, LEFT=0, RIGHT=2,
+            EXTRA_STRUCTURAL=(3,),
+        )
+        model = PretrainedGapFrontierModel(
+            vocab.vocab_size,
+            vocab.GAP,
+            vocab.PAD,
+            backbone=backbone,
+            pretrained_tokenizer=tokenizer,
+            pretrained_lm_head=head,
+            direct_joint_actions=True,
+            joint_rank=4,
+            dropout=0.0,
+        )
+        example = TextInfillingExample(((5,), (6,)), ((10, 11, 12),))
+        states = TextGapProposalDataset(
+            [example], vocab, strategy="midpoint", seed=17
+        )
+        batch = collate_compact_frontiers([states[0]], vocab.PAD)
+        losses = frontier_losses(
+            model,
+            batch,
+            vocab,
+            torch.device("cpu"),
+            rollout_length_cap=8,
+            rollout_length_horizon=4,
+            rollout_length_detach_backbone=True,
+        )
+        self.assertTrue(torch.isfinite(losses["rollout_length"]))
+        self.assertEqual(int(losses["rollout_length_count"]), 1)
+        losses["rollout_length"].backward()
+        self.assertIsNotNone(model.degree_head.weight.grad)
+        self.assertGreater(float(model.degree_head.weight.grad.abs().sum()), 0.0)
+        self.assertIsNone(head[-1].weight.grad)
+
+        later = collate_compact_frontiers([states[1]], vocab.PAD)
+        later_losses = frontier_losses(
+            model,
+            later,
+            vocab,
+            torch.device("cpu"),
+            rollout_length_cap=8,
+            rollout_length_horizon=4,
+            rollout_length_root_only=True,
+        )
+        self.assertEqual(int(later_losses["rollout_length_count"]), 0)
+
+    def test_trajectory_energy_coefficients_reward_distributional_distance(self):
+        coefficients, energy = trajectory_energy_coefficients(
+            torch.tensor([1, 1]), torch.tensor([3, 3]), scale=8
+        )
+        self.assertTrue(bool((coefficients > 0).all()))
+        self.assertGreater(float(energy), 0.0)
+
+    def test_sampled_trajectory_length_policy_is_structure_only(self):
+        tokenizer, backbone, head, _ = self.build_native_model()
+        vocab = TextVocabulary(
+            len(tokenizer), PAD=1, GAP=9, MASK=9, LEFT=0, RIGHT=2,
+            EXTRA_STRUCTURAL=(3,),
+        )
+        model = PretrainedGapFrontierModel(
+            vocab.vocab_size,
+            vocab.GAP,
+            vocab.PAD,
+            backbone=backbone,
+            pretrained_tokenizer=tokenizer,
+            pretrained_lm_head=head,
+            direct_joint_actions=True,
+            joint_rank=4,
+            dropout=0.0,
+        )
+        examples = [
+            TextInfillingExample(((5,), (6,)), ((10,),)),
+            TextInfillingExample(((7,), (8,)), ((11, 12, 13),)),
+        ]
+        loss, energy, lengths = sampled_trajectory_length_policy_loss(
+            model,
+            examples,
+            vocab,
+            torch.device("cpu"),
+            samples_per_prompt=1,
+            max_rounds=3,
+            max_decode_span=8,
+            seed=17,
+        )
+        self.assertTrue(torch.isfinite(loss))
+        self.assertTrue(torch.isfinite(energy))
+        self.assertEqual(lengths.numel(), 2)
+        loss.backward()
+        self.assertIsNotNone(model.degree_head.weight.grad)
+        self.assertIsNone(head[-1].weight.grad)
+        self.assertIsNone(backbone.embedding.weight.grad)
 
     def build_conditional_scaffold(self, regimes=2, state_feedback=True):
         tokenizer, backbone, _, _ = self.build_native_model()

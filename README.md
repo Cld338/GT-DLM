@@ -20,10 +20,17 @@ All currently open gaps are expanded in parallel. With a balanced latent tree,
 an `n`-token span therefore needs logarithmically many model evaluations rather
 than one evaluation per inserted token.
 
+The current primary research direction is **semantic branching**: every active
+node emits a token and its `leaf/left/right/both` branch marker as one joint
+action, commits that token to the partial sentence, and re-encodes it on the
+next frontier round. This is distinct from the two-pass shape-then-fill
+scaffold, which remains as a control. See `research/SEMANTIC_BRANCHING.md`.
+
 ## Quick start
 
 ```powershell
 python -m unittest discover -s tests -v
+python experiment_text_frontier_reencode.py --device cuda --direct-joint-actions --no-detach-structure --initial-checkpoint artifacts/text_frontier_joint_control/frontier.pt --epochs 5 --artifact-dir artifacts/text_semantic_branching
 python experiment.py --epochs 80 --device auto
 python ablate_stop.py --artifact-dir artifacts
 python ablate_children.py --artifact-dir artifacts
@@ -128,7 +135,83 @@ python evaluate_length_guided_rollout.py --device cuda --unified --chunk-size 16
 python probe_conditional_length_context.py --device cuda --lexical-artifact-dir artifacts/text_pretrained_masked_roberta_base --artifact-dir artifacts/text_length_probe_finetuned_roberta_base
 python ablate_round_encoding.py --device cuda --unified --chunk-size 16 --conditional-artifact-dir artifacts/text_conditional_length_gap_local_unified_roberta_base --lexical-artifact-dir artifacts/text_pretrained_masked_roberta_base
 python evaluate_self_length_baseline.py --device cuda --unified --conditional-artifact-dir artifacts/text_conditional_length_gap_local_unified_roberta_base --lexical-artifact-dir artifacts/text_pretrained_masked_roberta_base
+python evaluate_length_extrapolation.py --device cuda --unified --chunk-size 16 --conditional-artifact-dir artifacts/text_conditional_length_gap_local_unified_roberta_base --lexical-artifact-dir artifacts/text_pretrained_masked_roberta_base
+python experiment_text_frontier_reencode.py --device cuda --model-name FacebookAI/roberta-base --data-dir artifacts/wikitext_native --local-files-only --direct-joint-actions --no-detach-structure --zero-joint-interaction --decode-batch-size 16 --seed 17 --epochs 5 --initial-checkpoint artifacts/text_frontier_joint_control_roberta_base/frontier.pt --artifact-dir artifacts/text_semantic_branching_roberta_base_zero_interaction
 ```
+
+To train later frontier rounds on lexical histories produced by the model
+itself while keeping gold topology alignment, add
+`--generated-history-probability 0.5 --generated-history-warmup-epochs 2`.
+This remains experimental: the first smoke improves lexical rollout metrics but
+worsens the sampled length distribution.
+
+The completed 5-epoch run reverses that smoke-level diagnosis under 4,096
+ancestral samples: generated history improves length TV but costs token
+accuracy. A held-out seven-bias Monte Carlo calibration reaches TV `0.1670` and
+restores all-sample edit to parity, while matched token accuracy remains below
+the teacher-history direct model. See `research/SEMANTIC_BRANCHING.md`.
+
+A matched roberta-base scale-up is also complete. Scale raises uncalibrated
+teacher-history direct token accuracy from `8.77%` to `11.54%`. After equal
+Monte Carlo calibration, teacher-history roberta-base reaches edit `0.0801` and
+TV `0.1821`, while generated-history reaches `0.0756` and `0.1714`. The larger
+model helps lexical generation but does not remove the generated-history
+trade-off; calibrated teacher-history roberta-base is the current primary arm.
+Repeating that selected arm at training seeds 17, 23, and 41 gives calibrated
+edit `0.08026+/-0.00014`, token accuracy `7.64%+/-0.10`, and length TV
+`0.1962+/-0.0147`. Calibration improves edit in 3/3 seeds but TV in only 2/3,
+so lexical generation is reproducible while topology calibration remains the
+main source of variation.
+
+A differentiable projected rollout-length NLL is also implemented and tested,
+but rejected by its RoBERTa-base smoke gate. Although its internal validation
+NLL improves as its weight rises, actual 1,024-sample length TV worsens from
+`0.2061` at weight zero to `0.2197`, `0.2422`, and `0.2490`; applying it only at
+the root reaches `0.2744`. Recursively reusing one frontier's local degree law
+does not approximate the content-dependent re-encoded rollout. The next length
+objective must operate on actual sampled trajectories.
+
+That actual sampled-trajectory objective is now implemented too. It rolls out
+the direct joint generator with token commitment and re-encoding, and applies a
+structure-only score-function gradient from length-distribution energy distance.
+Four matched smoke settings were tested. Three worsen TV; the lowest-variance
+balanced-prior setting changes TV only `0.2061 -> 0.2051`, without an all-sample
+edit gain. It therefore also stops at the smoke gate. The implementation and
+tests remain, but a full run now waits on a lower-variance rollout-buffer or
+histogram-critic estimator rather than a larger loss weight.
+
+A robust seven-bias alternative is now implemented and evaluated. It uses
+multiple common-random-number search seeds, actual sampled token histories, a
+mean/worst CDF or direct-TV score, and independent multi-seed evaluation. One
+bias selected on training seed 17 transfers unchanged to seeds 23 and 41: over
+three rollout seeds per checkpoint, mean TV moves `0.2321 -> 0.1803` and
+all-sample edit `0.07091 -> 0.07374`. The edit guardrail passes in 9/9 streams,
+but the strict `TV -0.015` gate passes in 8/9; one seed-41 stream improves only
+`0.00195`. Several seed-41-specific CDF and TV refinements do not remove that
+failure. The result is a strong aggregate calibration improvement, not yet a
+uniform topology solution.
+
+The prescribed token/marker dependence ablation is now run, and it rejects the
+coupling. `--zero-joint-interaction` holds the low-rank interaction at its zero
+init and skips the term structurally. Matched at seeds 17, 23, and 41 with both
+arms sharing random numbers over 4,096 samples each, removing it gives the
+better held-out objective in 3/3 seeds and ties every generation metric on the
+mean (token accuracy `9.72%` against `9.66%`, all-sample edit `0.0694` against
+`0.0716`, length TV `0.2364` against `0.2354`). The seed-17 lexical advantage
+for the interaction reverses at seed 41. What changes is variance: token
+accuracy sample SD falls `1.82` to `0.14`. The interaction is the main source of
+this direction's lexical seed instability and buys nothing measurable, so it is
+rejected; token-at-branch emission, immediate commitment, and re-encoding all
+survive unchanged. See `research/SEMANTIC_BRANCHING.md`.
+
+Pooled multi-checkpoint worst-TV fitting is also complete and rejected before
+new-checkpoint training. It selects one bias across seed 17/23/41 and improves
+an independent 9-stream mean TV `0.2359 -> 0.1979`, with mean generated length
+`3.583` against the `3.586` target. But edit falls `0.07115 -> 0.06493`, its
+guardrail passes only 2/9 streams, and the strict TV count remains 8/9. A newly
+trained held-out checkpoint is therefore not justified by the staged protocol;
+direct pooled TV optimization is not the next objective without an explicit
+lexical constraint.
 
 The experiment writes its metrics and checkpoints to `artifacts/`.
 
@@ -888,4 +971,29 @@ at distilroberta the two tie (`0.1512` against `0.1497`). **The
 the evaluation protocol.** One methodological note belongs with that: a single
 draw per prompt put the baseline at `0.2102` and read as a baseline win, while
 `32` draws give `0.1966` — the small-sample estimate was noise at the scale of
-the effect. See `research/FRONTIER_REENCODE.md`.
+the effect.
+
+The last structural difference between the two architectures was then tested,
+and it splits in two. The project's strongest synthetic result is that recursive
+local stopping generalizes to unseen interval lengths (`0.792` against `0.003`);
+on text this had never been run. Both models were trained on spans of `1`--`8`
+and evaluated on `9`--`16` with no retraining, the scaffold getting only `113`
+additive logit biases fitted on long-span validation while all `102,450` learned
+parameters and the backbone stayed frozen.
+
+The mechanism transfers decisively. Those biases take the exact chart's mass on
+the unseen range from `0.0011` to `0.9352`, and the rollout follows: `93.55%` of
+samples reach nine tokens or more at a mean length of `12.12` against the
+target's `12.43`, in `7.41` shape rounds instead of `3.55`. The baseline reaches
+that range `0.00%` of the time — its length head has nine classes, so sixteen is
+unrepresentable rather than unlikely, and no amount of recalibration fixes that.
+
+**The conditional signal does not transfer, and it is not a quality win.** The
+long-span slice is nearly uniform, so the best prompt-blind guess scores
+`14.06%`; the recalibrated chart's argmax scores `10.16%` and the rollout matches
+length on `12.16%`, both below that, where in range the same controller carries
+`+0.3137` nats and `30.47%`. Expected edit similarity is `0.1247` against the
+fairly evaluated baseline's `0.1204` — a tie — with both far below the
+oracle-length baseline's `0.1361`. What survives the move to text is a statement
+about representational reach, not about output quality. See
+`research/FRONTIER_REENCODE.md`.

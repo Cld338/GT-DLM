@@ -313,6 +313,7 @@ matched intervention isolating the surviving twin. See
 | Backbone scale for the scaffold | `FRONTIER_REENCODE.md` | **Done:** roberta-base moves matched token accuracy `20.34% -> 29.39%` and conditional length `+0.063` nats, against a `0.96` point and `0.008` nat seed spread. Four times the training data moves neither |
 | Unconditional generation comparison against the masked baseline | `FRONTIER_REENCODE.md` | **Done, and it reverses:** the `0.3280` figure was the baseline decoding at *oracle* length while the scaffold inferred its own, and its trained length head had never been called. Made to use it, at matched decoding rule and matched sample size, it reaches `0.1966` against the scaffold's `0.2069`, and `21.39%` against `19.61%` at distilroberta. At equal length information roberta-base favours the scaffold and distilroberta ties |
 | Matched sample size for the baseline's sampled-length arm | `FRONTIER_REENCODE.md` | **Done, and it mattered:** one draw per prompt gave `0.2102` and read as a baseline win; `32` draws give `0.1966`. The `128`-sample estimate was noise at the scale of the effect |
+| Length-extrapolation slice on the scaffold | `FRONTIER_REENCODE.md` | **Done, and mixed:** recalibration alone moves the rollout into spans `9`--`16` (`93.55%` against the baseline's `0.00%`), but conditional length accuracy there is below the prompt-blind rate and expected edit similarity only ties. Representational reach transfers; the quality separation does not |
 | Decoding at the exact chart's mode | `FRONTIER_REENCODE.md` | **Done, positive on its own metric and negative downstream:** length match `22.72% -> 27.89%` and `24.83% -> 32.55%` in 6/6 runs, matching the chart's argmax accuracy within noise, but expected edit similarity moves only `-0.004` and `+0.012` because conditioning on the mode costs `0.5`--`1.4` points of token accuracy |
 
 ### 3. Generation quality (deficit attributed to the encoder, not the objective)
@@ -515,12 +516,20 @@ the baseline at oracle length while the scaffold inferred its own; the
 baseline's own trained length head, never called until now, puts it at `0.1966`
 against the scaffold's `0.2069` at roberta-base with a tie at distilroberta.
 
-The hold therefore stands on one thing: the length-extrapolation and
-gap-composition slices, neither of which is a mechanical re-run, since the first
-needs a new slice designed and the second needs the scaffold extended past one
-gap. A backbone carrying more length information at the GAP (item 32) is now an
-improvement rather than a blocker, since both systems read the same
-representation and neither is ahead because of it.
+The length-extrapolation slice has since been run, and it does not discharge the
+gate. The scaffold retargets to spans of `9`--`16` by recalibration alone where
+the baseline's nine-class head cannot be retargeted at all, which is a real
+representational separation; but its conditional length accuracy in the new
+range falls *below* the prompt-blind rate, and its expected edit similarity
+(`0.1247`) only ties the fairly evaluated baseline (`0.1204`). The gate asks for
+improved learned-length accuracy on this slice. Reach improved; accuracy did
+not.
+
+The hold therefore stands on the gap-composition slice, which needs the scaffold
+extended past one gap, and on the unmet accuracy clause above. A backbone
+carrying more length information at the GAP (item 32) is now the direct lever on
+that clause rather than a side improvement, since the conditional signal is
+exactly what failed to transfer.
 
 ## Recommended order
 
@@ -729,13 +738,115 @@ representation and neither is ahead because of it.
    digit in 3/3 seeds at 4,096 samples — and takes backbone passes from
    `4.907+/-0.053` to exactly `2.000`, independent of generated length. Growth
    touches the backbone zero times (`research/FRONTIER_REENCODE.md`).
-34. **Still open:** the length-extrapolation and gap-composition slices. Neither
-   is the mechanical re-run this document previously implied. `anchored_copy` is
-   already recorded as unusable as a long-span slice on this corpus, so
-   length-extrapolation needs a new slice designed first. And the scaffold is
-   single-gap by construction — `prompt_shape_context` requires exactly one mask
-   and reads its position — so gap-composition is an architecture extension
-   (a context per gap, with the chart running per gap), not an evaluation.
+34. **Length extrapolation completed, and it splits in two.** Both models trained
+   on spans `1`--`8`, evaluated on `9`--`16`, no retraining. Moving `113` additive
+   bias parameters — every learned weight frozen — takes the scaffold's chart mass
+   on the unseen range from `0.0011` to `0.9352` and its rollout from `0.15%` to
+   `93.55%` of samples reaching nine tokens, at mean length `12.12` against a
+   target `12.43`. The baseline reaches it `0.00%` of the time, because nine
+   classes cannot be recalibrated into sixteen. **But the conditional signal does
+   not transfer**: against a `14.06%` prompt-blind rate the recalibrated chart's
+   argmax scores `10.16%` and the rollout matches on `12.16%`, both below chance,
+   where in range the same controller carries `+0.3137` nats and `30.47%`. And it
+   is not a quality win — `0.1247` expected edit similarity against the fairly
+   evaluated baseline's `0.1204`, a tie, with both below the oracle-length
+   baseline's `0.1361`. The synthetic `0.792`-against-`0.003` separation does not
+   reproduce on text (`research/FRONTIER_REENCODE.md`).
+35. **Implemented; quality remains open:** semantic branching now requires
+   every non-empty node to emit `(token, leaf/left/right/both)` as one direct
+   joint action. The emitted token is committed immediately and re-encoded on
+   the next frontier round; there is no anonymous completed mask and no final
+   one-shot fill. The implementation uses the same globally normalized joint
+   table in training and rollout, avoiding both gold-token teacher forcing and
+   the earlier Sinkhorn marginal constraint. Unit coverage includes a balanced
+   seven-token rollout in three backbone passes. Across matched seeds 17, 23,
+   and 41, a common 1,024-sample protocol gives mean token-accuracy delta
+   `+0.77 pp`, essentially zero all-sample edit delta (`+0.0006`), and worse
+   length TV in 3/3 pairs (mean `+0.0238`). The lexical effect changes sign.
+   Gold-topology generated-lexical history is also implemented and the full
+   scheduled 50% run is complete. Under a common 4,096-sample protocol it moves
+   teacher-history token accuracy `8.77% -> 6.60%` and all-sample edit
+   `0.0631 -> 0.0589`, while improving length TV `0.2502 -> 0.2158`. A separately
+   validation-fitted seven-parameter Monte Carlo calibration reaches TV `0.1670`
+   and edit `0.0647`, but token accuracy recovers only to `7.15%`. The
+   architecture is constructive; generated history plus calibration gives
+   all-sample lexical parity and a much better length law, not a lexical
+   superiority claim (`research/SEMANTIC_BRANCHING.md`).
+   Backbone scale is now tested directly. A matched roberta-base control and two
+   125.4M direct arms show that teacher-history token accuracy improves
+   `8.77% -> 11.54%` over distilroberta, while generated history still trades
+   lexical quality for length TV. Under equal seven-bias calibration,
+   teacher-history roberta-base wins edit (`0.0801` versus `0.0756`), token
+   accuracy (`7.72%` versus `7.18%`), and length match; generated history wins
+   only TV (`0.1714` versus `0.1821`). Scale helps semantic branching but does
+   not solve exposure coupling. The calibrated teacher-history roberta-base arm
+   is the current primary checkpoint. Its training-seed replication is now
+   complete: seeds 17/23/41 give calibrated edit `0.08026+/-0.00014`, token
+   accuracy `7.64%+/-0.10`, and TV `0.1962+/-0.0147` under the common 4,096
+   sample protocol. Calibration improves edit in 3/3 seeds and TV in 2/3. The
+   primary lexical result is stable; topology calibration is not yet uniformly
+   below the historical `0.20` TV gate.
+36. **Rejected at smoke gate:** a differentiable projected rollout-length NLL.
+   The implementation exactly recovers deterministic 1/3/7-node progeny and
+   can isolate its gradients to the structure stack. But as its validation NLL
+   improves (`2.4816 -> 2.2706 -> 2.0485`), actual stochastic TV worsens
+   (`0.2197 -> 0.2422 -> 0.2490`) against the matched weight-zero `0.2061`.
+   Root-only application is worse at `0.2744`. No full run is justified; future
+   work must score actual sampled trajectories rather than homogeneous local
+   progeny.
+37. **Implemented; rejected at smoke gate:** actual sampled-trajectory length
+   policy training. The auxiliary sampler executes the inference-time direct
+   joint process, commits tokens, re-encodes each round, and applies an
+   energy-distance score-function gradient only to the structure stack. Unit
+   tests cover the distributional coefficients and gradient isolation. Across
+   four 1,024-rollout settings, three worsen TV and the balanced-prior,
+   four-sample every-batch setting changes TV only `0.2061 -> 0.2051`; its
+   all-sample edit is `0.0738` against control `0.0720`. This is noise-scale,
+   not a full-run gate pass. A lower-variance rollout buffer or histogram critic
+   is the next defensible estimator; a larger policy-loss weight is not.
+38. **Strong aggregate improvement; strict gate passes 8/9 streams:** robust
+   low-dimensional rollout calibration. The seven frozen-policy structure
+   biases can now be selected with common-random-number rollout seeds, actual
+   sampled token histories, mean/worst CDF or direct TV, coordinate subsets,
+   and separate multi-seed evaluation. A candidate selected only on training
+   seed 17 transfers unchanged to seeds 23/41. Across three rollout seeds per
+   checkpoint, mean TV changes `0.2321 -> 0.1803` and all-sample edit
+   `0.07091 -> 0.07374`; the edit guardrail passes 9/9. TV improves by at least
+   `0.015` in 8/9, with one seed-41 stream only `0.1953 -> 0.1934`. Three
+   checkpoint-specific CDF/TV refinements fail to remove that exception, so
+   the common bias is retained but uniform robustness is not claimed. The next
+   defensible test is pooled multi-checkpoint fitting followed by a newly
+   trained held-out checkpoint, not another local sweep.
+39. **Implemented; rejected before held-out training:** pooled multi-checkpoint
+   worst-TV calibration. One common search now scores all seed 17/23/41 model x
+   rollout-seed streams against the known balanced prior. Its selected bias
+   changes an independent 9-stream mean TV `0.2359 -> 0.1979` and mean length
+   `2.591 -> 3.583`, but all-sample edit falls `0.07115 -> 0.06493`. The edit
+   guardrail passes only 2/9 and the strict TV count remains 8/9. Because the
+   pooled candidate fails selection, training a new 502 MB holdout checkpoint
+   is correctly stopped. Direct pooled TV fitting is closed; reopening requires
+   an explicit lexical constraint or a richer state-dependent correction.
+40. **Still open:** the gap-composition slice. The scaffold is single-gap by
+   construction — `prompt_shape_context` requires exactly one mask and reads its
+   position — so this is an architecture extension (a context per gap, with the
+   chart running per gap), not an evaluation.
+41. **Completed, and negative: the joint token/marker interaction is rejected.**
+   Item 35's own prescribed dependence ablation had never been run.
+   `--zero-joint-interaction` holds the low-rank coupling at its zero init and
+   skips the term structurally, so a coupled checkpoint cannot reintroduce it on
+   load. Matched on backbone, initialization, data, budget and optimizer, and
+   replicated at seeds 17/23/41 with both arms sharing random numbers at 4,096
+   samples each, the zero-interaction arm has the better held-out objective in
+   3/3 seeds (`-0.0085`, `-0.0254`, `-0.0048`) and ties every generation metric
+   on the three-seed mean: token accuracy `9.72%` against `9.66%`, all-sample
+   edit `0.0694` against `0.0716`, length TV `0.2364` against `0.2354`. The
+   seed-17 lexical advantage of `+1.67` points for the interaction **reverses to
+   `-1.78` at seed 41**. What is not a tie is variance: token-accuracy sample SD
+   falls `1.82 -> 0.14`. The interaction is the dominant source of this
+   direction's lexical seed instability and buys nothing measurable. The
+   constructive claim is untouched — tokens are still emitted with their marker,
+   committed, and re-encoded — since none of it depended on the coupling term
+   (`research/SEMANTIC_BRANCHING.md`).
 
 ## Currently claimable
 

@@ -1049,13 +1049,21 @@ class PretrainedGapFrontierModel(nn.Module):
         detach_structure_encoder: bool = True,
         token_conditioned_topology: bool = False,
         marginal_preserving_joint: bool = False,
+        direct_joint_actions: bool = False,
         joint_rank: int = 32,
         joint_sinkhorn_iterations: int = 12,
+        zero_joint_interaction: bool = False,
     ) -> None:
         super().__init__()
-        if token_conditioned_topology and marginal_preserving_joint:
+        joint_modes = sum((
+            bool(token_conditioned_topology),
+            bool(marginal_preserving_joint),
+            bool(direct_joint_actions),
+        ))
+        if joint_modes > 1:
             raise ValueError(
-                "token-conditioned and marginal-preserving coupling are exclusive"
+                "token-conditioned, marginal-preserving, and direct joint "
+                "actions are mutually exclusive"
             )
         if joint_rank < 1 or joint_sinkhorn_iterations < 1:
             raise ValueError("joint rank and Sinkhorn iterations must be positive")
@@ -1145,16 +1153,18 @@ class PretrainedGapFrontierModel(nn.Module):
         if self.token_condition is not None:
             nn.init.zeros_(self.token_condition.weight)
         self.marginal_preserving_joint = bool(marginal_preserving_joint)
+        self.direct_joint_actions = bool(direct_joint_actions)
         self.joint_rank = int(joint_rank)
         self.joint_sinkhorn_iterations = int(joint_sinkhorn_iterations)
+        joint_actions = self.marginal_preserving_joint or self.direct_joint_actions
         self.joint_token_projection = (
             nn.Linear(d_model, self.joint_rank, bias=False)
-            if self.marginal_preserving_joint
+            if joint_actions
             else None
         )
         self.joint_marker_projection = (
             nn.Linear(d_model, 4 * self.joint_rank)
-            if self.marginal_preserving_joint
+            if joint_actions
             else None
         )
         if self.joint_marker_projection is not None:
@@ -1162,6 +1172,22 @@ class PretrainedGapFrontierModel(nn.Module):
             # marginal and the existing marker marginal exactly at init.
             nn.init.zeros_(self.joint_marker_projection.weight)
             nn.init.zeros_(self.joint_marker_projection.bias)
+        self.zero_joint_interaction = bool(zero_joint_interaction)
+        if self.zero_joint_interaction:
+            if not joint_actions:
+                raise ValueError(
+                    "zeroing the interaction requires a joint action mode"
+                )
+            # The ablation `research/SEMANTIC_BRANCHING.md` prescribes: hold the
+            # token/marker interaction at its zero init so the joint table stays
+            # exactly the independent product in training *and* rollout, while
+            # every other part of the model trains as usual.  Freezing rather
+            # than re-zeroing keeps these out of the optimizer entirely, so
+            # weight decay cannot drift them off zero.
+            for parameter in self.joint_token_projection.parameters():
+                parameter.requires_grad_(False)
+            for parameter in self.joint_marker_projection.parameters():
+                parameter.requires_grad_(False)
 
         if gradient_checkpointing:
             self.backbone.gradient_checkpointing_enable()
@@ -1243,16 +1269,18 @@ class PretrainedGapFrontierModel(nn.Module):
         steps: torch.Tensor,
         generated_token_ids: torch.Tensor,
     ) -> torch.Tensor:
-        """Return a token/marker joint with both supplied marginals preserved.
+        """Return the configured joint distribution over token/marker actions.
 
         Inputs contain only active non-empty nodes, so the returned tensor is
-        ``[nodes, generated vocabulary, 4]``. Iterative proportional fitting
-        turns a learned low-rank interaction into a discrete copula whose row
-        marginal is the native MLM and whose column marginal is the existing
-        topology policy. Root emptiness remains a preceding independent event.
+        ``[nodes, generated vocabulary, 4]``. The direct mode globally
+        normalizes a learned low-rank joint energy, so token identity and the
+        branch marker are genuinely one decision during both training and
+        rollout. The marginal-preserving mode instead applies iterative
+        proportional fitting to retain the supplied lexical and topology
+        marginals. Root emptiness remains a preceding independent event.
         """
-        if not self.marginal_preserving_joint:
-            raise ValueError("marginal-preserving joint actions are disabled")
+        if not (self.marginal_preserving_joint or self.direct_joint_actions):
+            raise ValueError("joint actions are disabled")
         if token_logits.dim() != 2 or hidden.dim() != 2:
             raise ValueError("joint action inputs must be flattened node tensors")
         generated_token_ids = generated_token_ids.to(token_logits.device)
@@ -1262,28 +1290,42 @@ class PretrainedGapFrontierModel(nn.Module):
         marker_logp = self.marker_log_probs(
             degree_logits, direction_logits
         )
-        clipped_steps = steps.clamp(
-            0, self.step_embedding.num_embeddings - 1
-        )
-        root_types = clipped_steps.eq(0).to(torch.long)
-        context = (
-            hidden.detach()
-            + self.step_embedding(clipped_steps)
-            + self.gap_type_embedding(root_types)
-        )
-        marker_features = self.joint_marker_projection(context).view(
-            context.size(0), 4, self.joint_rank
-        )
-        token_vectors = self.token_embedding(generated_token_ids).detach()
-        token_features = self.joint_token_projection(token_vectors)
-        interaction = torch.einsum(
-            "vr,nmr->nvm", token_features, marker_features
-        ) / math.sqrt(self.joint_rank)
-        log_joint = (
-            token_logp.unsqueeze(-1)
-            + marker_logp.unsqueeze(-2)
-            + interaction
-        )
+        if self.zero_joint_interaction:
+            # Structural guarantee for the ablation: the interaction is not
+            # computed at all, so no loaded checkpoint can reintroduce it and
+            # the vocabulary-wide einsum is skipped.
+            log_joint = token_logp.unsqueeze(-1) + marker_logp.unsqueeze(-2)
+        else:
+            clipped_steps = steps.clamp(
+                0, self.step_embedding.num_embeddings - 1
+            )
+            root_types = clipped_steps.eq(0).to(torch.long)
+            context = (
+                hidden.detach()
+                + self.step_embedding(clipped_steps)
+                + self.gap_type_embedding(root_types)
+            )
+            marker_features = self.joint_marker_projection(context).view(
+                context.size(0), 4, self.joint_rank
+            )
+            token_vectors = self.token_embedding(generated_token_ids).detach()
+            token_features = self.joint_token_projection(token_vectors)
+            interaction = torch.einsum(
+                "vr,nmr->nvm", token_features, marker_features
+            ) / math.sqrt(self.joint_rank)
+            log_joint = (
+                token_logp.unsqueeze(-1)
+                + marker_logp.unsqueeze(-2)
+                + interaction
+            )
+        if self.direct_joint_actions:
+            # Training and rollout consume this same joint table. At zero
+            # interaction it nests the independent token/marker product; a
+            # learned interaction may move either marginal when supported by
+            # joint likelihood.
+            return log_joint - torch.logsumexp(
+                log_joint.flatten(start_dim=-2), dim=-1
+            ).view(-1, 1, 1)
         # Alternating log-domain row/column scaling is stable in mixed
         # precision and differentiable through the interaction and marker head.
         for _ in range(self.joint_sinkhorn_iterations):
