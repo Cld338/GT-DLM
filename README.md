@@ -136,6 +136,8 @@ python probe_conditional_length_context.py --device cuda --lexical-artifact-dir 
 python ablate_round_encoding.py --device cuda --unified --chunk-size 16 --conditional-artifact-dir artifacts/text_conditional_length_gap_local_unified_roberta_base --lexical-artifact-dir artifacts/text_pretrained_masked_roberta_base
 python evaluate_self_length_baseline.py --device cuda --unified --conditional-artifact-dir artifacts/text_conditional_length_gap_local_unified_roberta_base --lexical-artifact-dir artifacts/text_pretrained_masked_roberta_base
 python evaluate_length_extrapolation.py --device cuda --unified --chunk-size 16 --conditional-artifact-dir artifacts/text_conditional_length_gap_local_unified_roberta_base --lexical-artifact-dir artifacts/text_pretrained_masked_roberta_base
+python diagnose_emission_context.py --device cuda --artifact-dir artifacts/text_semantic_branching_roberta_base_zero_interaction
+python diagnose_iterative_fill.py --device cuda
 python experiment_text_frontier_reencode.py --device cuda --model-name FacebookAI/roberta-base --data-dir artifacts/wikitext_native --local-files-only --direct-joint-actions --no-detach-structure --zero-joint-interaction --decode-batch-size 16 --seed 17 --epochs 5 --initial-checkpoint artifacts/text_frontier_joint_control_roberta_base/frontier.pt --artifact-dir artifacts/text_semantic_branching_roberta_base_zero_interaction
 ```
 
@@ -212,6 +214,23 @@ guardrail passes only 2/9 streams, and the strict TV count remains 8/9. A newly
 trained held-out checkpoint is therefore not justified by the staged protocol;
 direct pooled TV optimization is not the next objective without an explicit
 lexical constraint.
+
+Two diagnostics then closed the structural search. Semantic branching must emit
+a token at every node the moment it branches, and pricing that on one checkpoint
+gives emission `34.42%` top-1 against a one-position-masked oracle's `59.26%`,
+with the cost concentrated at the start: round zero scores `11.88%` against round
+two's `51.14%`, and `59%` of emitted tokens come from the two worst rounds. The
+constructive reading of that is to commit later, whose endpoint is the
+shape-then-fill scaffold this project already has.
+
+Moving the same idea to the scaffold, whose fill is a single pass, was then
+refuted before a decoder was written. Revealing gold neighbours takes its fill
+checkpoint `27.67% -> 57.29%`, but an actual confidence-ordered fill with no
+retraining gets monotonically worse (`27.67%`, `26.36%`, `25.93%`, `23.97%` at 1,
+2, 3 and 8 passes), because at `27.67%` top-1 about `72%` of every commitment is
+wrong. Break-even sits near `35`--`40%` single-pass accuracy. The headroom is
+real and unreachable by self-conditioning at this lexical quality. See
+`research/SEMANTIC_BRANCHING.md` and `research/FRONTIER_REENCODE.md`.
 
 The experiment writes its metrics and checkpoints to `artifacts/`.
 

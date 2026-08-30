@@ -522,3 +522,64 @@ table now the exact independent product. Nothing in the architecture's stated
 purpose depended on the coupling term. The limits are that this is one backbone,
 one corpus, and one replication axis -- the three seeds share a single seed-17
 frontier-control initialization, as the replication above does.
+
+## What emitting at every node costs
+
+The grammar requires every non-empty node to emit exactly one token at the
+moment it branches, so a node expanded in round `r` predicts its token from a
+canvas holding only the tokens emitted in rounds `< r`, and that choice is
+irrevocable. `diagnose_emission_context.py` prices that by scoring the same gold
+token under three conditions with one checkpoint (the zero-interaction arm at
+seed 17), so the only thing varying is the context:
+
+| condition | positions | token NLL | top-1 |
+|---|---:|---:|---:|
+| emission, the gold frontier state at its own round | 459 | `4.2617` | `34.42%` |
+| fill, every span position masked at once | 459 | `5.0410` | `22.66%` |
+| oracle, only this position masked | 459 | `2.0407` | `59.26%` |
+
+All three are teacher-forced on gold ancestors, so they are upper bounds on the
+rollout figures and are comparable only to each other.
+
+The cost is not spread evenly over the nodes. It is concentrated exactly where
+the context is thinnest:
+
+| round | positions | token NLL | top-1 |
+|---:|---:|---:|---:|
+| 0 | 101 (22%) | `6.2822` | `11.88%` |
+| 1 | 170 (37%) | `5.0127` | `30.59%` |
+| 2 | 176 (38%) | `2.5117` | `51.14%` |
+| 3 | 12 (3%) | `2.2849` | `33.33%` |
+
+Round zero and round two differ by `3.8` nats and `39` points on the same
+weights and the same head. And the distribution is unfavourable: `59%` of all
+emitted tokens come from the two worst rounds, because at a mean span of `4.5`
+the tree has no room to get deep before most of its tokens are already
+committed. A single round-zero node fixes the pivot of the whole span with no
+lexical evidence at all.
+
+So *emitting at every open node* is a real cost, and it is specifically a cost
+of emitting **early**. Late emission is fine: round two at `51.14%` beats the
+one-shot fill condition at `22.66%` on this checkpoint.
+
+Two things follow, and the second one closes a direction.
+
+First, a refill using this checkpoint would make things worse, not better. Its
+own all-masked fill scores `22.66%` against its emission `34.42%`, even with the
+target length supplied, because five epochs on frontier states leave a fully
+masked canvas out of distribution for it. A refill has to use weights trained
+for parallel filling, or train both tasks together; reusing the same head is not
+enough.
+
+Second, the constructive reading of "commit later" has a logical endpoint that
+this project already occupies. Deferring emission entirely *is* the
+shape-then-fill scaffold, which is better on every measured axis at these span
+lengths and additionally has an exact per-prompt length chart. Partial deferral
+would break the unique-derivation typing and the identity between total progeny
+and length to reach a destination that is already taken.
+
+The remaining reading was that the fix belongs on the scaffold rather than here:
+its fill is a single pass, so it never sees any neighbour. That was measured too,
+and it fails for a different reason -- the headroom is real but unreachable by
+self-conditioning at this lexical quality. See
+`research/FRONTIER_REENCODE.md`.

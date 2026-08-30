@@ -848,6 +848,42 @@ exactly what failed to transfer.
    committed, and re-encoded — since none of it depended on the coupling term
    (`research/SEMANTIC_BRANCHING.md`).
 
+42. **Completed as measurement; it prices semantic branching's core
+   constraint.** Every non-empty node must emit its token at the moment it
+   branches, from a canvas holding only earlier rounds. Scoring the same gold
+   token under three contexts on one checkpoint gives emission `34.42%`,
+   one-shot fill `22.66%`, and a one-position-masked oracle `59.26%` top-1. The
+   cost is concentrated at the start: round zero scores `11.88%` against round
+   two's `51.14%`, a `3.8` nat gap on the same weights, and `59%` of all emitted
+   tokens come from the two worst rounds because a mean span of `4.5` leaves the
+   tree no room to deepen first. Emitting at every node is a real cost and it is
+   specifically a cost of emitting *early*
+   (`research/SEMANTIC_BRANCHING.md`).
+43. **Completed, and negative: iterative filling is refuted before it was
+   built.** The scaffold fills in one pass, so every span position is predicted
+   while the others are still masks, and RoBERTa's 15% pretraining masking makes
+   that canvas the out-of-distribution one. Revealing gold neighbours on the
+   scaffold's own fill checkpoint moves top-1 `27.67% -> 57.29%`, so the headroom
+   is about `30` points. An actual confidence-ordered fill with no retraining
+   gets monotonically *worse*: `27.67%`, `26.36%`, `25.93%`, `23.97%` at 1, 2, 3
+   and 8 passes, with one pass reproducing the staircase exactly. At `27.67%`
+   top-1 roughly `72%` of each commitment is wrong, and a wrong revealed
+   neighbour costs about `5.3` points against a correct one's `+9.1`, putting
+   break-even near `35`--`40%` single-pass accuracy. Exact span probability moves
+   the other way (`9.90% -> 10.89%`), so the scheme buys self-consistency and not
+   accuracy. Not rejected in principle, rejected at this lexical quality
+   (`research/FRONTIER_REENCODE.md`).
+
+   Taken with items 35--41 this closes the structural search. Content-to-shape
+   coupling is rejected in four independent parameterizations, emission order has
+   its constructive endpoint already occupied by the scaffold, and decoding order
+   fails at the current `p(token | context)`. All three failures share the cause
+   every other measurement in this project has reached, which is encoder access
+   rather than the objective, the tree, or the schedule. The structural results
+   -- exact conditional length with no length head, two backbone passes at any
+   length, parallel expansion -- are what this architecture contributes, and the
+   remaining structural item is 40.
+
 ## Currently claimable
 
 The synthetic strict multi-gap length-generalization result, and, on natural

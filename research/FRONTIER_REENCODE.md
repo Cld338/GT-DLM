@@ -1244,3 +1244,71 @@ any sample size without new parameters and retraining. This is one seed on one
 backbone, unlike the three-seed results elsewhere in this document. And the
 `16.67%` token accuracy for the untouched scaffold rests on two matched pairs and
 means nothing.
+
+## The single-pass fill leaves headroom that self-conditioning cannot reach
+
+`fill_sampled_scaffolds` completes a scaffold in one masked-LM pass, so every
+span position is predicted while every other span position is still a mask.
+RoBERTa was pretrained at 15% masking, so a fully masked span of up to eight
+tokens is far from the backbone's pretraining distribution and a partly filled
+one is much closer. That made iterative filling -- commit the most confident
+positions, re-encode, repeat -- look like a free gain: it keeps the exact length
+chart, keeps the conditional length model, and keeps the pass count constant in
+length, moving it only from `2` to `2 + k`.
+
+`diagnose_iterative_fill.py` sized the headroom before any decoder was written,
+on the checkpoint the scaffold actually fills with
+(`artifacts/text_pretrained_masked_roberta_base`) at gold length, so the fill is
+isolated from the length model. Revealing `k` gold neighbours of each target:
+
+| gold neighbours revealed | positions | token NLL | top-1 |
+|---:|---:|---:|---:|
+| 0 | 459 | `4.5606` | `27.67%` |
+| 1 | 451 | `3.8218` | `36.81%` |
+| 3 | 377 | `2.8738` | `50.13%` |
+| 5 | 271 | `2.3425` | `55.35%` |
+| 7 | 96 | `1.9638` | `57.29%` |
+
+The headroom is real and large: `27.67% -> 57.29%`, about `30` points, on one set
+of weights with only the context changing. The `k=0` row is the current decoder's
+condition and is consistent with the `30.24%` matched-subset rollout figure
+recorded above, which is measured on a different subset.
+
+**The headroom is not reachable by conditioning on the model's own output.** An
+actual confidence-ordered fill, with no retraining, gets monotonically worse as
+passes are added:
+
+| passes | positions | top-1 | exact span |
+|---:|---:|---:|---:|
+| 1 | 459 | `27.67%` | `9.90%` |
+| 2 | 459 | `26.36%` | `10.89%` |
+| 3 | 459 | `25.93%` | `10.89%` |
+| 8 | 459 | `23.97%` | `10.89%` |
+
+One pass reproduces the `k=0` staircase row exactly, which checks the
+implementation. The staircase reveals gold; the decoder reveals predictions, and
+at `27.67%` top-1 roughly `72%` of every commitment is wrong. Conditioning on a
+wrong token is worse than conditioning on a mask.
+
+The break-even point can be estimated from the same two tables. One correct
+revealed neighbour is worth `+9.1` points, and the observed net at two passes is
+`-1.3`, so a wrong revealed neighbour costs about `5.3` points; the scheme turns
+profitable somewhere near `35`--`40%` single-pass accuracy against the
+checkpoint's `27.67%`. Iterative filling is therefore not rejected in principle,
+it is rejected at this lexical quality, and the quantity that would revive it is
+the base fill accuracy rather than the decoding schedule.
+
+One secondary effect is worth recording because it is the opposite sign: exact
+span probability *improves* with passes (`9.90% -> 10.89%`) while token accuracy
+falls. Iterative decoding makes the output more self-consistent without making
+it more accurate.
+
+This is the third time in this project that a correctly measured gap has failed
+to be a usable lever. The exposure gap was `0.487` nats and training against it
+cost more than it gained; the projected rollout-length objective improved its own
+validation NLL monotonically while actual TV worsened monotonically; and now a
+`30`-point context gap cannot be closed by supplying the context from the model
+itself. The common cause is the same one every other measurement in this project
+has reached: `p(token | context)` is not strong enough for any scheme that feeds
+the model its own output, and that is an encoder-access problem rather than a
+decoding-order problem.
