@@ -280,7 +280,8 @@ Track A claim can quote whole-track coverage rather than its single-GAP half.
 
 ## SSB-12 — Most tokens are emitted in the two worst rounds
 
-**Status:** open; measured, and the largest priced gap in this workspace
+**Status:** closed; the gap is real but it is a premium the binary tree pays
+for reaching single-token GAPs quickly, not a recoverable loss
 
 The grammar makes every non-empty node emit its token when it branches, from a
 canvas holding only earlier rounds, and the choice is irrevocable. On Track A
@@ -331,15 +332,37 @@ The sampler's default convention selects a maximally hard target for `70%` of
 trees, and the control prefers the last position `31%` to `38%` of the time when
 free to choose among its own span tokens.
 
-**Candidates remaining, now with a measured prize:** an edge-first pivot
-strategy in `build_pivot_tree`, and a `midpoint_probability` sweep as its cheap
-approximation. The target is round-zero emission accuracy, currently `12.80%`
-across all span lengths, against `25.00%` for a last-token convention on spans
-of three or more.
+**Candidates 2 and 3, reordering the pivot: rejected, and the item is closed.**
+A four-point sweep at the gold-control budget compared `midpoint_probability`
+`0.70`, `0.35`, `0.00`, and a `last` edge chain. Round zero moved exactly as the
+probe predicted, from `12.80%` to `22.75%`, `23.22%`, and `29.86%`, and the
+oracle stayed at `64.6%` to `65.1%` throughout, so only the schedule changed.
+Every alternative still lost: aggregate emission fell `2.97` to `5.42 pp`, the
+hard bin fell `3.14` to `4.53 pp`, and the chain cost `54%` more rounds.
 
-Design against the cost rather than assuming it away. Pivoting at the last
-position forces marker `left` and degenerates the tree into a chain, raising
-depth from about `log n` to `n`, so rounds and NFE rise and the parallelism the
-binary tree was chosen for disappears. A `midpoint_probability` sweep measures
-the interior of that trade-off without committing to either end. Report rounds
-and NFE next to emission accuracy for every point on it.
+The per-round profiles say why. A balanced tree reduces every GAP to a single
+position in about `log n` rounds, and a single masked position between known
+neighbours scores `60.40%` at round two while carrying `40.8%` of all emitted
+tokens. The chain reaches that state only at its last round. The real split is
+single-token GAPs at `60%` to `65%` against multi-token GAPs at `12%` to `39%`,
+not early rounds against late ones. The midpoint convention buys the fastest
+convergence to the easy regime and pays with the hardest first token, and that
+trade is favourable.
+
+Round zero's `12.80%` is therefore a premium, not a defect, and reordering moves
+it around without changing the total. Do not reopen this item for another pivot
+convention, another `midpoint_probability`, or another selector.
+
+**What the measurement leaves standing:** the quantity that matters is how many
+tokens must be committed from a multi-token GAP at all. That is not a scheduling
+parameter. Reducing it to zero is the shape-then-fill scaffold identified in
+commit `4706077`, where growth rounds emit anonymous slots and one masked-LM
+pass fills every position once all of them are single. Any successor item should
+address that regime, and should first settle whether Selective Semantic
+Branching has a defensible advantage over the scaffold at these span lengths;
+its dynamic-length claim currently matches the target length on `12%` of
+non-empty prompts.
+
+**Artifacts:** `selective_semantic_branching_pivot_mp035`,
+`selective_semantic_branching_pivot_mp000`,
+`selective_semantic_branching_pivot_last`

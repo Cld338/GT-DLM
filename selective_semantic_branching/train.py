@@ -98,7 +98,16 @@ def main():
     parser.add_argument("--samples-per-prompt", type=int, default=32)
     parser.add_argument("--decode-batch-size", type=int, default=32)
     parser.add_argument("--seed", type=int, default=17)
-    parser.add_argument("--tree-strategy", choices=("midpoint", "mixed"), default="mixed")
+    parser.add_argument(
+        "--tree-strategy",
+        choices=("midpoint", "mixed", "uniform", "first", "last"),
+        default="mixed",
+        help=(
+            "which position of the remaining span each node emits; `first` and "
+            "`last` pivot at an edge, next to visible content, and derive a "
+            "chain rather than a balanced tree"
+        ),
+    )
     parser.add_argument("--midpoint-probability", type=float, default=0.7)
     parser.add_argument("--training-gap-fraction", type=float, default=0.5)
     parser.add_argument("--selective-gap-min", type=int, default=1)
@@ -209,10 +218,17 @@ def main():
     )
     if args.max_validation_examples:
         validation_examples = validation_examples[: args.max_validation_examples]
+    # Validation follows the training convention so each run selects its epoch
+    # on the derivation distribution it will actually be used under. This makes
+    # the validation objective incomparable between runs that differ in
+    # --tree-strategy or --midpoint-probability; compare those with the
+    # emission diagnostic, which scores gold tokens rather than a target
+    # definition.
     validation = SelectiveTextGapProposalDataset(
         validation_examples,
         vocab,
-        strategy="midpoint",
+        strategy=args.tree_strategy,
+        midpoint_probability=args.midpoint_probability,
         seed=args.seed + 503,
         fraction=args.training_gap_fraction,
         minimum=args.selective_gap_min,

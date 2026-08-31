@@ -585,3 +585,71 @@ tree exists to buy parallelism and this prices what that parallelism costs at
 round zero rather than showing it is free. And the `last` over `first` asymmetry,
 consistent across both checkpoints and both splits, is unexplained; it is
 recorded rather than theorized about.
+
+## SSB-12 candidates 2 and 3: the midpoint buys fast convergence, and it is worth it
+
+The pivot probe said the midpoint is the hardest token in the span, so the sweep
+trained three alternatives at the gold-control budget: `midpoint_probability`
+`0.35` and `0.0`, and a `last` edge chain that pivots at the end of every
+remaining span. All four are scored with the emission diagnostic on Track A
+test, each under its own schedule.
+
+| run | round 0 | emission | hard bin | oracle | mean rounds |
+|---|---:|---:|---:|---:|---:|
+| mp `0.70`, control | `12.80%` | **`39.47%`** | **`29.27%`** | `65.03%` | **`3.336`** |
+| mp `0.35` | `22.75%` | `34.15%` | `25.44%` | `65.13%` | `3.766` |
+| mp `0.00` | `23.22%` | `34.05%` | `24.74%` | `64.83%` | `3.555` |
+| `last` chain | **`29.86%`** | `36.50%` | `26.13%` | `64.62%` | `5.125` |
+
+The probe's prediction held exactly. Round zero rises from `12.80%` to `22.75%`,
+`23.22%`, and `29.86%` as the convention moves off the midpoint. The oracle stays
+at `64.6%` to `65.1%` everywhere, confirming the backbone's ceiling did not move
+and only the schedule did.
+
+Every alternative still loses. Aggregate emission falls `2.97` to `5.42` points,
+the hard bin falls `3.14` to `4.53`, and the `last` chain costs `54%` more
+rounds. The gate fails on both axes at once, so candidates 2 and 3 are rejected.
+
+The per-round profiles explain why, and the explanation is the useful part:
+
+| round | control top-1 (share) | `last` chain top-1 (share) |
+|---:|---|---|
+| 0 | `12.80%` (`21.6%`) | `29.86%` (`21.6%`) |
+| 1 | `29.86%` (`35.3%`) | `30.81%` (`18.9%`) |
+| 2 | **`60.40%`** (`40.8%`) | `36.88%` (`16.4%`) |
+| 3 | `65.22%` (`2.4%`) | `38.57%` (`14.3%`) |
+| 7 | — | `65.22%` (`2.4%`) |
+
+A balanced binary tree reduces every GAP to a single position in about `log n`
+rounds. At round two a control GAP usually covers one token with real neighbours
+on both sides, which is nearly the oracle condition, and it scores `60.40%` while
+carrying `40.8%` of all emitted tokens. The chain reaches that state only at its
+final round, where it also scores `65.22%`; until then its GAP still spans
+several tokens and it scores `30%` to `39%`.
+
+So the real split is not early rounds against late ones. It is single-token GAPs
+against multi-token GAPs. Predicting one masked position between known
+neighbours runs at `60%` to `65%`, matching the oracle. Predicting a token that
+stands for a whole remaining span runs at `12%` to `39%`, whichever position of
+that span the convention picks. The midpoint convention buys the fastest
+possible convergence to the easy regime, and pays for it with the hardest
+possible first token. That trade is favourable, and this sweep is what
+establishes it rather than assuming it.
+
+This closes the reordering family. Round zero's `12.80%` was never the disease;
+it is the premium the binary tree pays for reaching near-oracle conditions in
+`log n` rounds instead of `n`. Reordering moves the premium around without
+changing the total.
+
+What remains is the regime itself. Every measurement now points at the same
+quantity: how many tokens must be committed from a multi-token GAP at all. That
+is not a scheduling parameter, and the constructive endpoint of reducing it to
+zero is the shape-then-fill scaffold that commit `4706077` already identified,
+where growth rounds emit anonymous slots and one masked-LM pass fills every
+position once all of them are single. This sweep reaches that conclusion from
+the opposite direction, having tried the reordering alternative and priced it.
+
+Each sweep point is one training seed at screening scale. The round-zero
+movement of `+9.95` to `+17.06` points and the aggregate loss of `2.97` to `5.42`
+are large, monotone in the predicted directions, and consistent across all four
+schedules, so the ordering of the conclusion does not rest on the seed.

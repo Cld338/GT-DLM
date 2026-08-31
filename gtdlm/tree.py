@@ -19,17 +19,28 @@ def build_pivot_tree(
     rng: Optional[random.Random] = None,
     midpoint_probability: float = 0.5,
 ) -> Optional[PivotTree]:
-    """Build an ordered binary derivation tree over ``[lo, hi)``."""
+    """Build an ordered binary derivation tree over ``[lo, hi)``.
+
+    ``first`` and ``last`` pivot at an edge of the remaining span, which places
+    the emitted token next to already visible content. They produce a chain of
+    depth ``hi - lo`` rather than a balanced tree, trading rounds for context;
+    the root-pivot diagnosis measured how much context that buys.
+    """
     if lo >= hi:
         return None
-    if strategy not in {"midpoint", "uniform", "mixed"}:
+    if strategy not in {"midpoint", "uniform", "mixed", "first", "last"}:
         raise ValueError("unknown pivot strategy: {}".format(strategy))
     if rng is None:
         rng = random.Random(0)
-    use_midpoint = strategy == "midpoint" or (
-        strategy == "mixed" and rng.random() < midpoint_probability
-    )
-    pivot = (lo + hi) // 2 if use_midpoint else rng.randrange(lo, hi)
+    if strategy == "first":
+        pivot = lo
+    elif strategy == "last":
+        pivot = hi - 1
+    else:
+        use_midpoint = strategy == "midpoint" or (
+            strategy == "mixed" and rng.random() < midpoint_probability
+        )
+        pivot = (lo + hi) // 2 if use_midpoint else rng.randrange(lo, hi)
     return PivotTree(
         pivot,
         build_pivot_tree(
