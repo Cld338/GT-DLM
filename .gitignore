@@ -1,6 +1,7 @@
 __pycache__/
 *.py[cod]
 .pytest_cache/
+.venv-modernbert/
 artifacts_smoke*/
 .hf_cache/
 .codex/

@@ -1,5 +1,9 @@
 # Gap-Tree Diffusion Language Model (GT-DLM)
 
+The current main experimental workspace for unknown-length, partial-frontier
+generation is [`selective_semantic_branching/`](selective_semantic_branching/).
+Its local README and results file are the canonical documents for that new path.
+
 This repository contains a minimal research prototype for variable-length text
 infilling without a preallocated token canvas.
 
@@ -16,9 +20,12 @@ The optional left/right children are predicted jointly. This root/child typing
 is essential: allowing both an omitted child and a created child that immediately
 stops gives the same sequence duplicate derivations.
 
-All currently open gaps are expanded in parallel. With a balanced latent tree,
-an `n`-token span therefore needs logarithmically many model evaluations rather
-than one evaluation per inserted token.
+By default, all currently open gaps are expanded in parallel. With a balanced
+latent tree, an `n`-token span therefore needs logarithmically many model
+evaluations rather than one evaluation per inserted token. A diagnostic
+confidence-selective decoder can instead defer the lower-confidence descendant
+gaps with `--selective-gap-fraction`; it changes only rollout scheduling, not
+the trained likelihood or checkpoint.
 
 The current primary research direction is **semantic branching**: every active
 node emits a token and its `leaf/left/right/both` branch marker as one joint
@@ -31,6 +38,7 @@ scaffold, which remains as a control. See `research/SEMANTIC_BRANCHING.md`.
 ```powershell
 python -m unittest discover -s tests -v
 python experiment_text_frontier_reencode.py --device cuda --direct-joint-actions --no-detach-structure --initial-checkpoint artifacts/text_frontier_joint_control/frontier.pt --epochs 5 --artifact-dir artifacts/text_semantic_branching
+python evaluate_joint_frontier_rollouts.py --device cuda --artifact-dirs artifacts/text_semantic_branching_roberta_base --selective-gap-fraction 0.5 --output-dir artifacts/text_semantic_branching_selective_half
 python experiment.py --epochs 80 --device auto
 python ablate_stop.py --artifact-dir artifacts
 python ablate_children.py --artifact-dir artifacts
@@ -105,6 +113,10 @@ python measure_pretrain_task_mismatch.py --device cuda --examples 512 --artifact
 python prepare_wikitext_pilot.py --output-dir artifacts/wikitext_native --native-vocabulary --model-name distilroberta-base --cache-dir .hf_cache/hub --local-files-only --max-document-tokens 128 --max-train-documents 4000 --max-validation-documents 500 --max-test-documents 500
 python experiment_text_depth_inside_pretrained.py --device cuda --data-dir artifacts/wikitext_native --native-vocabulary --local-files-only --artifact-dir artifacts/text_depth_inside_native
 python experiment_pretrained_masked_baseline.py --device cuda --data-dir artifacts/wikitext_native --native-vocabulary --local-files-only --artifact-dir artifacts/text_pretrained_masked_native
+python experiment_pretrained_masked_baseline.py --device cuda --data-dir artifacts/wikitext_native_large --model-name FacebookAI/roberta-large --native-vocabulary --local-files-only --trainable-backbone-layers 4 --mixed-precision --attention-implementation sdpa --batch-size 4 --eval-batch-size 1 --epochs 2 --artifact-dir artifacts/text_pretrained_masked_roberta_large_top4
+python prepare_wikitext_pilot.py --output-dir artifacts/wikitext_native_modernbert_base --native-vocabulary --model-name answerdotai/ModernBERT-base --cache-dir .hf_cache/hub --dataset-config wikitext-103-raw-v1 --max-document-tokens 128 --max-train-documents 40000 --max-validation-documents 500 --max-test-documents 500 --seed 17
+python experiment_pretrained_masked_baseline.py --device cuda --data-dir artifacts/wikitext_native_modernbert_base --model-name answerdotai/ModernBERT-base --native-vocabulary --local-files-only --trainable-backbone-layers 0 --mixed-precision --attention-implementation eager --eval-batch-size 4 --evaluate-only --artifact-dir artifacts/text_pretrained_masked_modernbert_base_zeroshot
+python experiment_pretrained_masked_baseline.py --device cuda --data-dir artifacts/wikitext_native_modernbert_base --model-name answerdotai/ModernBERT-base --native-vocabulary --local-files-only --trainable-backbone-layers 4 --attention-implementation eager --batch-size 4 --eval-batch-size 4 --epochs 2 --artifact-dir artifacts/text_pretrained_masked_modernbert_base_top4
 python evaluate_native_inside_readout.py --device cuda
 python evaluate_prompt_attention.py --device cuda --local-files-only
 python experiment_text_depth_inside_pretrained.py --device cuda --data-dir artifacts/wikitext_native --native-vocabulary --fixed-mask-bank 8 --local-files-only --artifact-dir artifacts/text_depth_inside_fixed_mask_bank
@@ -140,6 +152,12 @@ python diagnose_emission_context.py --device cuda --artifact-dir artifacts/text_
 python diagnose_iterative_fill.py --device cuda
 python experiment_text_frontier_reencode.py --device cuda --model-name FacebookAI/roberta-base --data-dir artifacts/wikitext_native --local-files-only --direct-joint-actions --no-detach-structure --zero-joint-interaction --decode-batch-size 16 --seed 17 --epochs 5 --initial-checkpoint artifacts/text_frontier_joint_control_roberta_base/frontier.pt --artifact-dir artifacts/text_semantic_branching_roberta_base_zero_interaction
 ```
+
+ModernBERT requires Python 3.9+ and Transformers 4.48+. On the tested RTX 2060
+SUPER with PyTorch 2.4.1, use eager attention and FP32 for training: SDPA caused
+non-finite gradients even though inference was valid. The top-four configuration
+peaks below 1 GiB allocated VRAM, so mixed precision and gradient checkpointing
+are unnecessary on an 8GB card.
 
 To train later frontier rounds on lexical histories produced by the model
 itself while keeping gold topology alignment, add

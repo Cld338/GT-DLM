@@ -49,10 +49,19 @@ def main() -> None:
     parser.add_argument("--native-vocabulary", action="store_true")
     parser.add_argument("--model-name", default="distilroberta-base")
     parser.add_argument("--cache-dir", default=".hf_cache/hub")
+    parser.add_argument(
+        "--dataset-config",
+        default=DATASET_CONFIG,
+        help=(
+            "HuggingFace wikitext config. The pilot corpus is "
+            "wikitext-2-raw-v1, which yields about 287k training "
+            "tokens; wikitext-103-raw-v1 is the large one"
+        ),
+    )
     parser.add_argument("--local-files-only", action="store_true")
     args = parser.parse_args()
 
-    corpus = datasets.load_dataset(DATASET_NAME, DATASET_CONFIG)
+    corpus = datasets.load_dataset(DATASET_NAME, args.dataset_config)
     limits = {
         "train": args.max_train_documents,
         "validation": args.max_validation_documents,
@@ -95,7 +104,7 @@ def main() -> None:
     torch.save(tokenized, corpus_path)
     manifest = {
         "dataset": DATASET_NAME,
-        "config": DATASET_CONFIG,
+        "config": args.dataset_config,
         "datasets_version": datasets.__version__,
         "seed": args.seed,
         "requested_vocab_size": (

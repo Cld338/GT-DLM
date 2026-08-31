@@ -316,6 +316,7 @@ def replace_with_generated_history(
     vocab: TextVocabulary,
     device: torch.device,
     probability: float,
+    generator: Optional[torch.Generator] = None,
 ) -> Tuple[int, int]:
     """Roll out lexical ancestors under gold topology and insert them.
 
@@ -329,7 +330,9 @@ def replace_with_generated_history(
     histories = batch.get("history_states")
     if not isinstance(histories, list):
         raise ValueError("generated-history batches must retain history_states")
-    selected = torch.rand(len(histories), device=device).lt(probability).tolist()
+    selected = torch.rand(
+        len(histories), device=device, generator=generator
+    ).lt(probability).tolist()
     generated = [dict() for _ in histories]
     maximum_depth = max((len(states) for states in histories), default=0)
     generated_ids = torch.tensor(
@@ -386,7 +389,7 @@ def replace_with_generated_history(
                     -1, generated_ids
                 ).softmax(dim=-1)
             sampled = generated_ids[torch.multinomial(
-                token_probabilities, 1
+                token_probabilities, 1, generator=generator
             ).squeeze(-1)]
             active_locations = active.nonzero(as_tuple=False)
             for index, (prefix_row, position) in enumerate(active_locations.tolist()):
@@ -1163,11 +1166,24 @@ def frontier_losses(
         if getattr(model, "token_conditioned_topology", False)
         else None
     )
-    outputs = (
-        model(tokens, padding, steps, structure_token_ids)
-        if structure_token_ids is not None
-        else model(tokens, padding, steps)
-    )
+    node_features = {}
+    if getattr(model, "per_node_frontier_features", False):
+        node_features = {
+            "node_depths": batch["node_depths"].to(device),
+            "node_ages": batch["node_ages"].to(device),
+        }
+    if node_features:
+        outputs = model(
+            tokens,
+            padding,
+            steps,
+            structure_token_ids=structure_token_ids,
+            **node_features,
+        )
+    elif structure_token_ids is not None:
+        outputs = model(tokens, padding, steps, structure_token_ids)
+    else:
+        outputs = model(tokens, padding, steps)
     token_logits, root_stop, degree_logits, direction_logits, _ = outputs
     root_valid = tokens.eq(vocab.GAP) & steps.unsqueeze(1).eq(0)
     root_targets = targets.eq(vocab.stop_action).to(root_stop.dtype)
@@ -1307,6 +1323,84 @@ def frontier_losses(
         joint_terms = (
             -(gold_joint - gold_token) if marginal_joint else -gold_joint
         )
+        node_batch_rows = torch.arange(
+            tokens.size(0), device=device
+        ).unsqueeze(1).expand_as(tokens)[degree_valid]
+        marginalized_nodes = torch.zeros(
+            token_indices.numel(), dtype=torch.bool, device=device
+        )
+        compatible_node_tokens = batch.get("compatible_action_tokens")
+        compatible_node_markers = batch.get("compatible_action_markers")
+        if (
+            direct_joint
+            and compatible_node_tokens is not None
+            and compatible_node_markers is not None
+            and compatible_node_tokens.size(2) > 0
+        ):
+            compatible_node_tokens = compatible_node_tokens.to(device)[
+                degree_valid
+            ]
+            compatible_node_markers = compatible_node_markers.to(device)[
+                degree_valid
+            ]
+            for node in range(token_indices.numel()):
+                valid_actions = (
+                    compatible_node_tokens[node].ge(0)
+                    & compatible_node_markers[node].ge(0)
+                )
+                if not bool(valid_actions.any()):
+                    continue
+                action_tokens = compatible_node_tokens[node, valid_actions]
+                action_markers = compatible_node_markers[node, valid_actions]
+                action_token_indices = token_to_generated[action_tokens]
+                if bool(action_token_indices.lt(0).any()):
+                    raise ValueError(
+                        "compatible node action is outside generated vocabulary"
+                    )
+                joint_terms[node] = -torch.logsumexp(
+                    joint_logp[
+                        node, action_token_indices, action_markers
+                    ],
+                    dim=0,
+                )
+                marginalized_nodes[node] = True
+
+        # Preserve the SSB-1 root-only metadata for every historical dataset.
+        compatible_tokens = batch.get("compatible_root_tokens")
+        compatible_markers = batch.get("compatible_root_markers")
+        if (
+            direct_joint
+            and compatible_tokens is not None
+            and compatible_markers is not None
+            and compatible_tokens.size(1) > 0
+        ):
+            compatible_tokens = compatible_tokens.to(device)
+            compatible_markers = compatible_markers.to(device)
+            root_joint_nodes = (
+                steps.index_select(0, node_batch_rows).eq(0)
+                & ~marginalized_nodes
+            )
+            for node in root_joint_nodes.nonzero().flatten().tolist():
+                batch_row = int(node_batch_rows[node])
+                valid_actions = (
+                    compatible_tokens[batch_row].ge(0)
+                    & compatible_markers[batch_row].ge(0)
+                )
+                if not bool(valid_actions.any()):
+                    continue
+                action_tokens = compatible_tokens[batch_row, valid_actions]
+                action_markers = compatible_markers[batch_row, valid_actions]
+                action_token_indices = token_to_generated[action_tokens]
+                if bool(action_token_indices.lt(0).any()):
+                    raise ValueError(
+                        "compatible root action is outside generated vocabulary"
+                    )
+                joint_terms[node] = -torch.logsumexp(
+                    joint_logp[
+                        node, action_token_indices, action_markers
+                    ],
+                    dim=0,
+                )
         joint_weights = position_weights[degree_valid]
         joint_loss = (
             joint_terms * joint_weights
@@ -1609,16 +1703,44 @@ def decode_frontier_model(
     generator: Optional[torch.Generator] = None,
     sample_tokens: Optional[bool] = None,
     chunk_size: Optional[int] = None,
+    selective_gap_fraction: float = 1.0,
+    selective_gap_min: int = 1,
+    root_lookahead_ranker: Optional[Dict[str, torch.Tensor]] = None,
+    root_lookahead_token_k: int = 4,
+    root_lookahead_candidate_batch_size: int = 4,
+    root_lookahead_temperature: float = 1.0,
+    root_lookahead_cache: Optional[Dict[object, object]] = None,
+    defer_lookahead: bool = False,
+    defer_lookahead_candidate_batch_size: int = 4,
+    defer_lookahead_weight: float = 1.0,
 ) -> Tuple[List[List[List[int]]], List[int], List[bool]]:
-    """Expand every open gap in one backbone pass per round.
+    """Score every open gap, then expand a configurable subset per round.
 
     Greedy decoding is useful for inspecting the conditional mode.  Stochastic
     decoding samples the actual unknown-length generative process; this matters
     when corruption length is independent of the visible prompt and therefore
     cannot be recovered as a deterministic per-prompt label.
+
+    ``selective_gap_fraction < 1`` defers low-confidence descendant gaps.  Root
+    gaps are always resolved together in the first round so their independent
+    empty-span decisions retain the original semantics.  Confidence is the
+    maximum probability of the joint token/marker action when available, and
+    the maximum lexical probability otherwise.
     """
     if chunk_size is not None and chunk_size < 1:
         raise ValueError("decode chunk size must be positive")
+    if not 0.0 < selective_gap_fraction <= 1.0:
+        raise ValueError("selective_gap_fraction must be in (0,1]")
+    if selective_gap_min < 1:
+        raise ValueError("selective_gap_min must be positive")
+    if root_lookahead_token_k < 1 or root_lookahead_candidate_batch_size < 1:
+        raise ValueError("root lookahead sizes must be positive")
+    if root_lookahead_temperature <= 0.0:
+        raise ValueError("root lookahead temperature must be positive")
+    if defer_lookahead_candidate_batch_size < 1:
+        raise ValueError("DEFER lookahead candidate batch size must be positive")
+    if defer_lookahead_weight < 0.0:
+        raise ValueError("DEFER lookahead weight must be non-negative")
     if chunk_size is not None and len(examples) > chunk_size:
         predictions: List[List[List[int]]] = []
         rounds: List[int] = []
@@ -1635,6 +1757,20 @@ def decode_frontier_model(
                 generator=generator,
                 sample_tokens=sample_tokens,
                 chunk_size=None,
+                selective_gap_fraction=selective_gap_fraction,
+                selective_gap_min=selective_gap_min,
+                root_lookahead_ranker=root_lookahead_ranker,
+                root_lookahead_token_k=root_lookahead_token_k,
+                root_lookahead_candidate_batch_size=(
+                    root_lookahead_candidate_batch_size
+                ),
+                root_lookahead_temperature=root_lookahead_temperature,
+                root_lookahead_cache=root_lookahead_cache,
+                defer_lookahead=defer_lookahead,
+                defer_lookahead_candidate_batch_size=(
+                    defer_lookahead_candidate_batch_size
+                ),
+                defer_lookahead_weight=defer_lookahead_weight,
             )
             predictions.extend(chunk_predictions)
             rounds.extend(chunk_rounds)
@@ -1644,6 +1780,14 @@ def decode_frontier_model(
     if sample_tokens is None:
         sample_tokens = stochastic
     canvases = [initial_region_canvas(example, vocab) for example in examples]
+    canvas_depths = [
+        [0 if token == vocab.GAP else -1 for token, _ in canvas]
+        for canvas in canvases
+    ]
+    canvas_opened = [
+        [0 if token == vocab.GAP else -1 for token, _ in canvas]
+        for canvas in canvases
+    ]
     rounds = [0] * len(examples)
     unfinished = [False] * len(examples)
     generated_ids = torch.tensor(vocab.generated_token_ids, device=device)
@@ -1661,6 +1805,8 @@ def decode_frontier_model(
             (len(active), width), vocab.PAD, dtype=torch.long, device=device
         )
         padding = torch.ones_like(tokens, dtype=torch.bool)
+        node_depths = torch.zeros_like(tokens)
+        node_ages = torch.zeros_like(tokens)
         steps = torch.tensor(
             [rounds[index] for index in active],
             dtype=torch.long,
@@ -1670,17 +1816,30 @@ def decode_frontier_model(
             raw = [token for token, _ in canvases[index]]
             tokens[row, : len(raw)] = torch.tensor(raw, device=device)
             padding[row, : len(raw)] = False
+            if getattr(model, "per_node_frontier_features", False):
+                node_depths[row, : len(raw)] = torch.tensor(
+                    canvas_depths[index], device=device
+                ).clamp_min(0)
+                opened = torch.tensor(canvas_opened[index], device=device)
+                node_ages[row, : len(raw)] = torch.where(
+                    opened.ge(0), steps[row] - opened, torch.zeros_like(opened)
+                ).clamp_min(0)
 
+        node_features = (
+            {"node_depths": node_depths, "node_ages": node_ages}
+            if getattr(model, "per_node_frontier_features", False) else {}
+        )
         token_logits, root_stop, degree_logits, direction_logits, hidden = model(
-            tokens, padding, steps
+            tokens, padding, steps, **node_features
         )
         allowed = token_logits.index_select(-1, generated_ids)
+        gap_mask = tokens.eq(vocab.GAP) & ~padding
+        gap_confidence = torch.full_like(tokens, -torch.inf, dtype=token_logits.dtype)
         joint_markers = None
         if (
             getattr(model, "marginal_preserving_joint", False)
             or getattr(model, "direct_joint_actions", False)
         ):
-            gap_mask = tokens.eq(vocab.GAP) & ~padding
             gap_steps = steps.unsqueeze(1).expand_as(tokens)[gap_mask]
             joint_logp = model.joint_action_log_probs(
                 token_logits[gap_mask],
@@ -1690,6 +1849,7 @@ def decode_frontier_model(
                 gap_steps,
                 generated_ids,
             )
+            gap_confidence[gap_mask] = joint_logp.amax(dim=(1, 2))
             chosen_device = generated_ids[allowed.argmax(dim=-1)]
             joint_markers_device = torch.zeros_like(tokens)
             nodes = int(gap_mask.sum())
@@ -1715,9 +1875,40 @@ def decode_frontier_model(
                 marker_values = samples.remainder(4)
             chosen_device[gap_mask] = generated_ids[token_indices]
             joint_markers_device[gap_mask] = marker_values
+            if root_lookahead_ranker is not None and bool(steps.eq(0).all()):
+                from selective_semantic_branching.root_lookahead import (
+                    rerank_root_actions,
+                )
+
+                root_tokens, root_markers, _ = rerank_root_actions(
+                    model,
+                    [canvases[index] for index in active],
+                    token_logits,
+                    degree_logits,
+                    direction_logits,
+                    tokens,
+                    padding,
+                    generated_ids,
+                    vocab.GAP,
+                    vocab.PAD,
+                    root_lookahead_ranker,
+                    token_k=root_lookahead_token_k,
+                    candidate_batch_size=root_lookahead_candidate_batch_size,
+                    stochastic=stochastic and bool(sample_tokens),
+                    generator=generator,
+                    temperature=root_lookahead_temperature,
+                    cache=root_lookahead_cache,
+                )
+                root_positions = gap_mask.to(torch.long).argmax(dim=-1)
+                root_rows = torch.arange(len(active), device=device)
+                chosen_device[root_rows, root_positions] = root_tokens
+                joint_markers_device[root_rows, root_positions] = root_markers
             chosen = chosen_device.cpu()
             joint_markers = joint_markers_device.cpu()
         elif stochastic and sample_tokens:
+            gap_confidence[gap_mask] = allowed[gap_mask].log_softmax(dim=-1).amax(
+                dim=-1
+            )
             token_probabilities = allowed.softmax(dim=-1)
             token_samples = torch.multinomial(
                 token_probabilities.reshape(-1, token_probabilities.size(-1)),
@@ -1726,6 +1917,9 @@ def decode_frontier_model(
             ).reshape(token_probabilities.shape[:-1])
             chosen = generated_ids[token_samples].cpu()
         else:
+            gap_confidence[gap_mask] = allowed[gap_mask].log_softmax(dim=-1).amax(
+                dim=-1
+            )
             chosen = generated_ids[allowed.argmax(dim=-1)].cpu()
         if getattr(model, "token_conditioned_topology", False):
             # The node decides how to branch after seeing what it just emitted,
@@ -1778,12 +1972,66 @@ def decode_frontier_model(
             )
             direction = joint_markers.eq(2).to(torch.long)
 
+        selection_scores = gap_confidence
+        if defer_lookahead and selective_gap_fraction < 1.0:
+            if joint_markers is None:
+                raise ValueError("DEFER lookahead requires joint token/marker actions")
+            from selective_semantic_branching.defer_lookahead import (
+                predicted_defer_expand_scores,
+            )
+
+            defer_scores = predicted_defer_expand_scores(
+                model,
+                [canvases[index] for index in active],
+                gap_mask,
+                steps,
+                chosen,
+                joint_markers,
+                gap_confidence,
+                generated_ids,
+                vocab.GAP,
+                vocab.PAD,
+                candidate_batch_size=defer_lookahead_candidate_batch_size,
+            )
+            selection_scores = (
+                gap_confidence + defer_lookahead_weight * defer_scores
+            )
+
+        selected_gaps = torch.zeros_like(gap_mask)
+        for row in range(len(active)):
+            positions = gap_mask[row].nonzero().flatten()
+            if int(steps[row]) == 0 or selective_gap_fraction == 1.0:
+                selected_gaps[row, positions] = True
+                continue
+            count = min(
+                len(positions),
+                max(
+                    selective_gap_min,
+                    int(math.ceil(len(positions) * selective_gap_fraction)),
+                ),
+            )
+            confidence = selection_scores[row].index_select(0, positions)
+            chosen_positions = positions.index_select(
+                0, confidence.topk(count).indices
+            )
+            selected_gaps[row, chosen_positions] = True
+        selected_gaps = selected_gaps.cpu()
+
         for row, index in enumerate(active):
             expanded: List[Tuple[int, int]] = []
+            expanded_depths: List[int] = []
+            expanded_opened: List[int] = []
             initial = rounds[index] == 0
             for position, (token, region) in enumerate(canvases[index]):
                 if token != vocab.GAP:
                     expanded.append((token, region))
+                    expanded_depths.append(-1)
+                    expanded_opened.append(-1)
+                    continue
+                if not bool(selected_gaps[row, position]):
+                    expanded.append((token, region))
+                    expanded_depths.append(canvas_depths[index][position])
+                    expanded_opened.append(canvas_opened[index][position])
                     continue
                 if initial and bool(stop[row, position]):
                     continue
@@ -1798,9 +2046,15 @@ def decode_frontier_model(
                 )
                 if left_child:
                     expanded.append((vocab.GAP, region))
+                    expanded_depths.append(canvas_depths[index][position] + 1)
+                    expanded_opened.append(rounds[index] + 1)
                 expanded.append((pivot, region))
+                expanded_depths.append(-1)
+                expanded_opened.append(-1)
                 if right_child:
                     expanded.append((vocab.GAP, region))
+                    expanded_depths.append(canvas_depths[index][position] + 1)
+                    expanded_opened.append(rounds[index] + 1)
             rounds[index] += 1
             for gap_index in range(len(examples[index].spans)):
                 generated = sum(
@@ -1810,8 +2064,21 @@ def decode_frontier_model(
                 if generated > max_decode_span:
                     unfinished[index] = True
             if unfinished[index]:
-                expanded = [item for item in expanded if item[0] != vocab.GAP]
+                keep = [item[0] != vocab.GAP for item in expanded]
+                expanded = [
+                    item for item, retain in zip(expanded, keep) if retain
+                ]
+                expanded_depths = [
+                    value for value, retain in zip(expanded_depths, keep)
+                    if retain
+                ]
+                expanded_opened = [
+                    value for value, retain in zip(expanded_opened, keep)
+                    if retain
+                ]
             canvases[index] = expanded
+            canvas_depths[index] = expanded_depths
+            canvas_opened[index] = expanded_opened
 
     predictions: List[List[List[int]]] = []
     for index, (example, canvas) in enumerate(zip(examples, canvases)):
@@ -1842,6 +2109,15 @@ def sample_frontier_rollouts(
     max_decode_span: int = 16,
     seed: int = 1901,
     sample_tokens: bool = True,
+    selective_gap_fraction: float = 1.0,
+    selective_gap_min: int = 1,
+    root_lookahead_ranker: Optional[Dict[str, torch.Tensor]] = None,
+    root_lookahead_token_k: int = 4,
+    root_lookahead_candidate_batch_size: int = 4,
+    root_lookahead_temperature: float = 1.0,
+    defer_lookahead: bool = False,
+    defer_lookahead_candidate_batch_size: int = 4,
+    defer_lookahead_weight: float = 1.0,
 ) -> Tuple[List[List[List[int]]], List[List[int]], List[List[bool]]]:
     """Draw ancestral samples without supplying a target length or canvas."""
     if samples_per_prompt < 1:
@@ -1861,6 +2137,7 @@ def sample_frontier_rollouts(
     ]
     generator = torch.Generator(device=device)
     generator.manual_seed(seed)
+    root_lookahead_cache = {} if root_lookahead_ranker is not None else None
     for start in range(0, len(replicas), chunk_size):
         batch = replicas[start : start + chunk_size]
         predictions, batch_rounds, batch_unfinished = decode_frontier_model(
@@ -1873,6 +2150,20 @@ def sample_frontier_rollouts(
             stochastic=True,
             generator=generator,
             sample_tokens=sample_tokens,
+            selective_gap_fraction=selective_gap_fraction,
+            selective_gap_min=selective_gap_min,
+            root_lookahead_ranker=root_lookahead_ranker,
+            root_lookahead_token_k=root_lookahead_token_k,
+            root_lookahead_candidate_batch_size=(
+                root_lookahead_candidate_batch_size
+            ),
+            root_lookahead_temperature=root_lookahead_temperature,
+            root_lookahead_cache=root_lookahead_cache,
+            defer_lookahead=defer_lookahead,
+            defer_lookahead_candidate_batch_size=(
+                defer_lookahead_candidate_batch_size
+            ),
+            defer_lookahead_weight=defer_lookahead_weight,
         )
         for (owner, _), prediction, steps, failed in zip(
             batch, predictions, batch_rounds, batch_unfinished
@@ -1880,6 +2171,13 @@ def sample_frontier_rollouts(
             samples[owner].append(prediction[0])
             rounds[owner].append(steps)
             unfinished[owner].append(failed)
+        if device.type == "cuda":
+            # Dynamic canvases have different widths across prompts. Under
+            # Windows WDDM, retaining all allocator slabs caused reserved
+            # memory to grow beyond 8 GiB even without root lookahead, despite
+            # live tensors staying below 3 GiB. Return inactive slabs after
+            # every replica chunk for every frontier rollout mode.
+            torch.cuda.empty_cache()
     return samples, rounds, unfinished
 
 

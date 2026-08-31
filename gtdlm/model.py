@@ -8,6 +8,30 @@ from torch import nn
 from torch.nn import functional as F
 
 
+def pretrained_masked_lm_head(masked_lm: nn.Module) -> nn.Module:
+    """Return the hidden-state-to-vocabulary head from a masked LM.
+
+    RoBERTa exposes a single ``lm_head`` module, while ModernBERT splits the
+    equivalent computation across ``head`` and ``decoder``.  Keeping this
+    adapter here lets native-vocabulary models reuse the exact pretrained MLM
+    projection without making the experiment code architecture-specific.
+    """
+    head = getattr(masked_lm, "lm_head", None)
+    if head is not None:
+        return head
+    head = getattr(masked_lm, "cls", None)
+    if head is not None:
+        return head
+    transform = getattr(masked_lm, "head", None)
+    decoder = getattr(masked_lm, "decoder", None)
+    if transform is not None and decoder is not None:
+        return nn.Sequential(transform, decoder)
+    raise ValueError(
+        "cannot locate the hidden-state-to-vocabulary head on masked LM {}"
+        .format(type(masked_lm).__name__)
+    )
+
+
 def immediate_gap_boundaries(
     tokens: torch.Tensor, gap_id: int, pad_id: int = 0
 ):
@@ -530,6 +554,7 @@ class PretrainedIntervalEncoder(nn.Module):
         initialize_custom_embeddings: bool = True,
         native_vocabulary: bool = False,
         fixed_mask_count: int = 0,
+        attn_implementation: Optional[str] = None,
     ) -> None:
         super().__init__()
         if backbone is None or pretrained_tokenizer is None:
@@ -541,18 +566,24 @@ class PretrainedIntervalEncoder(nn.Module):
                 use_fast=True,
                 local_files_only=local_files_only,
             )
+            attention_kwargs = (
+                {"attn_implementation": attn_implementation}
+                if attn_implementation
+                else {}
+            )
             if random_init_backbone:
                 config = AutoConfig.from_pretrained(
                     model_name,
                     cache_dir=cache_dir,
                     local_files_only=local_files_only,
                 )
-                backbone = AutoModel.from_config(config)
+                backbone = AutoModel.from_config(config, **attention_kwargs)
             else:
                 backbone = AutoModel.from_pretrained(
                     model_name,
                     cache_dir=cache_dir,
                     local_files_only=local_files_only,
+                    **attention_kwargs,
                 )
         if pretrained_tokenizer.mask_token_id is None:
             raise ValueError("pretrained tokenizer must define a mask token")
@@ -570,6 +601,21 @@ class PretrainedIntervalEncoder(nn.Module):
             raise ValueError("fixed mask banks require native vocabulary")
         if native_vocabulary and int(pretrained_tokenizer.mask_token_id) != gap_id:
             raise ValueError("native vocabulary requires GAP to be the mask token")
+        if (
+            native_vocabulary
+            and pretrained_tokenizer.pad_token_id is not None
+            and int(pretrained_tokenizer.pad_token_id) != pad_id
+        ):
+            raise ValueError("native vocabulary requires matching pad token ids")
+        if (
+            native_vocabulary
+            and hasattr(source_tokenizer, "get_vocab")
+            and hasattr(pretrained_tokenizer, "get_vocab")
+            and source_tokenizer.get_vocab() != pretrained_tokenizer.get_vocab()
+        ):
+            raise ValueError(
+                "native vocabulary tokenizer mapping does not match the backbone"
+            )
         d_model = int(backbone.config.hidden_size)
         if native_vocabulary:
             self.token_embedding = backbone.get_input_embeddings()
@@ -823,7 +869,7 @@ class PretrainedIntervalInsideModel(nn.Module):
                         local_files_only=local_files_only,
                     )
                 backbone = masked_lm.base_model
-                pretrained_lm_head = getattr(masked_lm, "lm_head", None)
+                pretrained_lm_head = pretrained_masked_lm_head(masked_lm)
             if backbone is None or pretrained_lm_head is None:
                 raise ValueError(
                     "native vocabulary needs both a backbone and pretrained MLM head"
@@ -1053,6 +1099,8 @@ class PretrainedGapFrontierModel(nn.Module):
         joint_rank: int = 32,
         joint_sinkhorn_iterations: int = 12,
         zero_joint_interaction: bool = False,
+        per_node_frontier_features: bool = False,
+        attn_implementation: Optional[str] = None,
     ) -> None:
         super().__init__()
         joint_modes = sum((
@@ -1081,21 +1129,29 @@ class PretrainedGapFrontierModel(nn.Module):
                     use_fast=True,
                     local_files_only=local_files_only,
                 )
+            attention_kwargs = (
+                {"attn_implementation": attn_implementation}
+                if attn_implementation
+                else {}
+            )
             if random_init_backbone:
                 config = AutoConfig.from_pretrained(
                     model_name,
                     cache_dir=cache_dir,
                     local_files_only=local_files_only,
                 )
-                masked_lm = AutoModelForMaskedLM.from_config(config)
+                masked_lm = AutoModelForMaskedLM.from_config(
+                    config, **attention_kwargs
+                )
             else:
                 masked_lm = AutoModelForMaskedLM.from_pretrained(
                     model_name,
                     cache_dir=cache_dir,
                     local_files_only=local_files_only,
+                    **attention_kwargs,
                 )
             backbone = masked_lm.base_model
-            pretrained_lm_head = getattr(masked_lm, "lm_head", None)
+            pretrained_lm_head = pretrained_masked_lm_head(masked_lm)
         if pretrained_tokenizer is None or pretrained_lm_head is None:
             raise ValueError(
                 "pretrained frontier model needs a tokenizer and native MLM head"
@@ -1117,6 +1173,18 @@ class PretrainedGapFrontierModel(nn.Module):
         d_model = int(backbone.config.hidden_size)
         self.step_embedding = nn.Embedding(max_steps, d_model)
         self.gap_type_embedding = nn.Embedding(2, d_model)
+        self.per_node_frontier_features = bool(per_node_frontier_features)
+        self.frontier_depth_embedding = (
+            nn.Embedding(max_steps, d_model)
+            if self.per_node_frontier_features else None
+        )
+        self.frontier_age_embedding = (
+            nn.Embedding(max_steps, d_model)
+            if self.per_node_frontier_features else None
+        )
+        if self.frontier_depth_embedding is not None:
+            nn.init.zeros_(self.frontier_depth_embedding.weight)
+            nn.init.zeros_(self.frontier_age_embedding.weight)
         self.structure_adapter = nn.Sequential(
             nn.LayerNorm(d_model),
             nn.Linear(d_model, d_model),
@@ -1204,6 +1272,8 @@ class PretrainedGapFrontierModel(nn.Module):
         hidden: torch.Tensor,
         steps: torch.Tensor,
         structure_token_ids: Optional[torch.Tensor] = None,
+        node_depths: Optional[torch.Tensor] = None,
+        node_ages: Optional[torch.Tensor] = None,
     ):
         """Branching logits, optionally conditioned on each node's own token.
 
@@ -1220,6 +1290,29 @@ class PretrainedGapFrontierModel(nn.Module):
             + self.step_embedding(steps).unsqueeze(1)
             + self.gap_type_embedding(root_types).unsqueeze(1)
         )
+        if self.per_node_frontier_features:
+            if node_depths is None:
+                node_depths = torch.zeros(
+                    hidden.shape[:2], dtype=torch.long, device=hidden.device
+                )
+            if node_ages is None:
+                node_ages = torch.zeros_like(node_depths)
+            if (
+                node_depths.shape != hidden.shape[:2]
+                or node_ages.shape != hidden.shape[:2]
+            ):
+                raise ValueError(
+                    "node depth/age tensors must match token positions"
+                )
+            structure_input = (
+                structure_input
+                + self.frontier_depth_embedding(
+                    node_depths.clamp(0, self.step_embedding.num_embeddings - 1)
+                )
+                + self.frontier_age_embedding(
+                    node_ages.clamp(0, self.step_embedding.num_embeddings - 1)
+                )
+            )
         structure = self.structure_adapter(structure_input)
         # The root decides emptiness *before* any token exists, so it must not
         # read one.  Conditioning it would also leak the label during training,
@@ -1348,6 +1441,8 @@ class PretrainedGapFrontierModel(nn.Module):
         padding_mask: Optional[torch.Tensor] = None,
         steps: Optional[torch.Tensor] = None,
         structure_token_ids: Optional[torch.Tensor] = None,
+        node_depths: Optional[torch.Tensor] = None,
+        node_ages: Optional[torch.Tensor] = None,
     ):
         if padding_mask is None:
             padding_mask = tokens.eq(self.pad_id)
@@ -1361,7 +1456,7 @@ class PretrainedGapFrontierModel(nn.Module):
         ).last_hidden_state
         token_logits = self.token_head(hidden)
         root_stop, degree, direction = self.structure_logits_from_hidden(
-            hidden, steps, structure_token_ids
+            hidden, steps, structure_token_ids, node_depths, node_ages
         )
         return token_logits, root_stop, degree, direction, hidden
 
@@ -2275,6 +2370,7 @@ class PretrainedLengthMaskedModel(nn.Module):
         bottleneck_context: bool = False,
         native_vocabulary: bool = False,
         pretrained_lm_head=None,
+        attn_implementation: Optional[str] = None,
     ) -> None:
         super().__init__()
         if native_vocabulary:
@@ -2292,21 +2388,29 @@ class PretrainedLengthMaskedModel(nn.Module):
                         use_fast=True,
                         local_files_only=local_files_only,
                     )
+                attention_kwargs = (
+                    {"attn_implementation": attn_implementation}
+                    if attn_implementation
+                    else {}
+                )
                 if random_init_backbone:
                     config = AutoConfig.from_pretrained(
                         model_name,
                         cache_dir=cache_dir,
                         local_files_only=local_files_only,
                     )
-                    masked_lm = AutoModelForMaskedLM.from_config(config)
+                    masked_lm = AutoModelForMaskedLM.from_config(
+                        config, **attention_kwargs
+                    )
                 else:
                     masked_lm = AutoModelForMaskedLM.from_pretrained(
                         model_name,
                         cache_dir=cache_dir,
                         local_files_only=local_files_only,
+                        **attention_kwargs,
                     )
                 backbone = masked_lm.base_model
-                pretrained_lm_head = getattr(masked_lm, "lm_head", None)
+                pretrained_lm_head = pretrained_masked_lm_head(masked_lm)
             if backbone is None or pretrained_lm_head is None:
                 raise ValueError(
                     "native vocabulary needs both a backbone and pretrained MLM head"
@@ -2327,6 +2431,7 @@ class PretrainedLengthMaskedModel(nn.Module):
             pretrained_tokenizer=pretrained_tokenizer,
             initialize_custom_embeddings=initialize_custom_embeddings,
             native_vocabulary=native_vocabulary,
+            attn_implementation=attn_implementation,
         )
         d_model = self.encoder.hidden_size
         self.max_span = max_span

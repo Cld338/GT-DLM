@@ -1303,6 +1303,92 @@ span probability *improves* with passes (`9.90% -> 10.89%`) while token accuracy
 falls. Iterative decoding makes the output more self-consistent without making
 it more accurate.
 
+The first decoder above was commit-only: once a position was filled it could not
+be revised. That is not the Mask-Predict schedule, which re-masks the least
+confident predictions after every round. The re-maskable implementation is now
+included in `diagnose_iterative_fill.py`. It does not change the conclusion. On
+the large-corpus RoBERTa-base checkpoint, two passes move top-1 only
+`28.32% -> 28.98%` before four passes fall to `26.36%`. On the RoBERTa-large
+follow-up below, two passes already fall `28.54% -> 28.10%` and four reach
+`26.36%`. The literature's schedule was therefore tested directly rather than
+inferred from commit-only decoding.
+
+### RoBERTa-large top-four-layer follow-up
+
+The scale test uses the same WikiText-103 subset, seed, two epochs, batch four,
+and learning rates as `artifacts/text_pretrained_masked_roberta_base_large`.
+The 355.5M-parameter RoBERTa-large model keeps its bottom 20 transformer layers
+and embeddings frozen and trains the top four layers plus MLM/length heads
+(51.5M trainable parameters). FP16 and SDPA make the run fit comfortably on an
+8GB GPU; a 10-update gate peaks at `2.18 GiB` allocated.
+
+| model | test token NLL | token top-1 | edit similarity | exact span |
+|---|---:|---:|---:|---:|
+| RoBERTa-base, two epochs | `4.5193` | `28.32%` | `0.3436` | `12.87%` |
+| RoBERTa-large, top four | **`4.4235`** | `28.54%` | `0.3517` | `14.85%` |
+
+These are the corrected, per-token re-evaluation numbers. The historical
+`4.3666 -> 3.8540` NLL comparison weighted each batch mean by its number of
+non-empty spans while the base and large arms used evaluation batches of eight
+and one. That made NLL batch-size dependent. Weighting by target-token count
+reduces the actual likelihood improvement to `0.096` nat; token top-1 moves only
+`+0.22` point.
+On the identical 101-span iterative-fill prompt set, the scale difference is
+smaller still: one-pass top-1 is `28.54%`, gold-neighbour top-1 reaches `57.29%`,
+and Mask-Predict scores `28.10%` at two passes and `26.36%` at four. Larger
+pretrained representations sharpen the distribution and exact-span rate but do
+not cross the estimated `35%--40%` self-conditioning break-even point.
+
+This is a useful scale result, not a pure backbone-size ablation: the base model
+was fully fine-tuned while the large model exposes only its top four layers.
+Claim-grade scale attribution would train the same frozen/top-four policy on both
+backbones or add a full RoBERTa-large arm with an optimizer that fits. The result
+needed here is narrower and already decisive: top-four adaptation is sufficient
+for a modest likelihood gain, and that gain still does not make iterative
+filling accurate.
+
+### ModernBERT-base replacement screen
+
+The next intervention changed pretraining and architecture rather than only
+scale. `answerdotai/ModernBERT-base` is a 149.7M-parameter native MLM. Because it
+uses a different tokenizer, WikiText-103 was re-tokenized with the same document
+selection, seed and limits; the resulting token spans are distribution-matched,
+not identical raw spans, so cross-backbone differences are screening evidence
+rather than a pure paired architecture ablation.
+
+The evaluator now also reports non-empty decoded-span exactness and character
+edit similarity, and token NLL is weighted by target-token count so it is
+batch-size invariant:
+
+| model | state | token NLL | token top-1 | decoded exact | character edit | inference peak |
+|---|---|---:|---:|---:|---:|---:|
+| RoBERTa-large | frozen | `5.7774` | `22.00%` | `10.89%` | `0.3828` | `1.44 GiB` |
+| ModernBERT-base | frozen | **`4.6163`** | **`28.44%`** | **`15.00%`** | **`0.4414`** | **`0.67 GiB`** |
+| RoBERTa-large | top four | `4.4235` | `28.54%` | **`14.85%`** | **`0.4436`** | `1.44 GiB` |
+| ModernBERT-base | top four | **`4.3832`** | **`30.00%`** | `13.00%` | `0.4413` | **`0.67 GiB`** |
+
+The frozen screen is clearly positive. After two-epoch top-four adaptation the
+models are effectively tied on decoded quality: ModernBERT has the better NLL
+and token accuracy, while RoBERTa has the better exact-span and character
+scores. The operational win is efficiency. ModernBERT-base uses `42%` of the
+parameters, top-four training exposes 20.7M parameters and peaks at `0.93 GiB`
+allocated on the 8GB card.
+
+One implementation constraint is empirical and hardware-specific. With
+Transformers 4.48.3, PyTorch 2.4.1 and the RTX 2060 SUPER, ModernBERT's SDPA
+backward produced repeatable FP16 overflows and then a non-finite FP32 epoch.
+Eager attention in FP32 remained finite for the full run. Non-finite loss and
+gradient-norm checks now stop such a run before a corrupt checkpoint can be
+selected.
+
+The stronger backbone still does not revive iterative filling. Gold-neighbour
+top-1 rises from `31.11%` at zero revealed neighbours to `62.50%` at seven, but
+Mask-Predict scores `31.11%`, `30.44%` and `28.67%` at one, two and four passes.
+Decoded exact span does improve `13% -> 17%`, repeating the RoBERTa result that
+extra passes buy consistency rather than token accuracy. ModernBERT-base is
+therefore selected as the memory-efficient backbone candidate, while the
+single-pass lexical ceiling remains open.
+
 This is the third time in this project that a correctly measured gap has failed
 to be a usable lever. The exposure gap was `0.487` nats and training against it
 cost more than it gained; the projected rollout-length objective improved its own

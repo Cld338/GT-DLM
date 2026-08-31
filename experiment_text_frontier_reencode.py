@@ -162,6 +162,8 @@ def train(model, source, validation, vocab, device, args):
     best = None
     os.makedirs(args.artifact_dir, exist_ok=True)
     checkpoint = os.path.join(args.artifact_dir, "frontier.pt")
+    history_generator = torch.Generator(device=device)
+    history_generator.manual_seed(args.seed + 4_789)
 
     for epoch in range(args.epochs):
         source.set_epoch(epoch)
@@ -209,6 +211,7 @@ def train(model, source, validation, vocab, device, args):
                         vocab,
                         device,
                         history_probability,
+                        generator=history_generator,
                     )
                     generated_history_examples += selected
                     generated_history_tokens += replacements
@@ -411,6 +414,21 @@ def main():
     parser.add_argument("--max-decode-span", type=int, default=16)
     parser.add_argument("--max-rounds", type=int, default=16)
     parser.add_argument("--decode-batch-size", type=int, default=32)
+    parser.add_argument(
+        "--selective-gap-fraction",
+        type=float,
+        default=1.0,
+        help=(
+            "expand only the most confident fraction of descendant GAPs per "
+            "round; 1.0 preserves full parallel frontier expansion"
+        ),
+    )
+    parser.add_argument(
+        "--selective-gap-min",
+        type=int,
+        default=1,
+        help="minimum number of descendant GAPs expanded per sample and round",
+    )
     parser.add_argument("--examples", type=int, default=128)
     parser.add_argument("--max-train-examples", type=int, default=0)
     parser.add_argument("--max-validation-examples", type=int, default=128)
@@ -508,6 +526,12 @@ def main():
         parser.error("--trajectory-length-every must be positive")
     if args.decode_batch_size < 1:
         parser.error("--decode-batch-size must be positive")
+    if not 0.0 < args.selective_gap_fraction <= 1.0:
+        parser.error("--selective-gap-fraction must be in (0,1]")
+    if args.selective_gap_min < 1:
+        parser.error("--selective-gap-min must be positive")
+    if args.selective_gap_fraction < 1.0 and not args.direct_joint_actions:
+        parser.error("selective GAP expansion requires --direct-joint-actions")
     if args.generated_history_probability and not args.direct_joint_actions:
         parser.error("--generated-history-probability requires --direct-joint-actions")
     if args.trajectory_length_weight and not args.direct_joint_actions:
@@ -656,6 +680,8 @@ def main():
         max_rounds=args.max_rounds,
         max_decode_span=args.max_decode_span,
         chunk_size=args.decode_batch_size,
+        selective_gap_fraction=args.selective_gap_fraction,
+        selective_gap_min=args.selective_gap_min,
     )
     lexical = lexical_sampling_metrics(
         test,
@@ -689,6 +715,11 @@ def main():
             ),
             "emits_token_with_branch": True,
             "reencodes_emitted_tokens_each_round": True,
+            "gap_expansion_schedule": (
+                "confidence_selective"
+                if args.selective_gap_fraction < 1.0
+                else "full_frontier"
+            ),
             "history_training": (
                 "gold_topology_generated_lexical"
                 if args.generated_history_probability > 0.0

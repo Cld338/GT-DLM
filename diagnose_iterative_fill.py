@@ -9,17 +9,23 @@ fills with, and then simulates the fix.
 Three families are reported, all at gold length so the fill is isolated from
 the length model:
 
-    staircase   gold tokens revealed at `k` of the other span positions. k=0 is
-                the current one-pass condition and k=n-1 is the upper bound for
-                any refill. This is optimistic: it reveals gold, not predictions.
-    iterative   an actual confidence-ordered fill in `p` passes with no
-                retraining. Each pass commits the most confident still-masked
-                positions and re-encodes. p=1 is exactly the current decoder.
-    oracle      k=n-1 from the staircase, repeated for reference.
+    staircase     gold tokens revealed at `k` of the other span positions. k=0
+                  is the current one-pass condition and k=n-1 is the upper bound
+                  for any refill. This is optimistic: it reveals gold, not
+                  predictions.
+    commit-only   a confidence-ordered fill in `p` passes with no retraining.
+                  Each pass commits the most confident still-masked positions
+                  and re-encodes, and a committed position is never revisited.
+                  p=1 is exactly the current decoder.
+    mask-predict  the schedule from Ghazvininejad et al. (2019). Each round
+                  predicts every masked position, then re-masks the least
+                  confident ones, so a round-one mistake can be revised later.
+                  This is the difference the literature's method turns on, and
+                  the commit-only family does not speak to it.
 
 RoBERTa was pretrained at 15% masking, so a fully masked span is far from its
 pretraining distribution and a partly filled one is much closer. That is the
-reason to expect the iterative family to gain without any retraining.
+reason to expect the iterative families to gain without any retraining.
 """
 
 import argparse
@@ -31,7 +37,7 @@ from collections import defaultdict
 import torch
 from transformers import AutoTokenizer
 
-from experiment import choose_device, seed_everything
+from experiment import choose_device, edit_distance, seed_everything
 from gtdlm.model import PretrainedLengthMaskedModel
 from gtdlm.text_data import random_length_windows, sample_text_infilling_examples
 from gtdlm.text_tokenizer import vocabulary_from_pretrained_tokenizer
@@ -46,6 +52,24 @@ def native_canvas(example, vocab, span_tokens):
         + list(example.segments[-1])
         + [vocab.RIGHT]
     )
+
+
+def decoded_pair_metrics(tokenizer, prediction, target):
+    """Return tokenizer-independent character similarity and exactness."""
+    predicted_text = tokenizer.decode(
+        prediction,
+        skip_special_tokens=True,
+        clean_up_tokenization_spaces=False,
+    ).strip()
+    target_text = tokenizer.decode(
+        target,
+        skip_special_tokens=True,
+        clean_up_tokenization_spaces=False,
+    ).strip()
+    similarity = 1.0 - edit_distance(predicted_text, target_text) / max(
+        1, len(predicted_text), len(target_text)
+    )
+    return similarity, int(predicted_text == target_text)
 
 
 def score_canvases(backbone, token_head, rows, vocab, device, generated_ids,
@@ -94,6 +118,15 @@ def main():
             "diagnose_emission_context.py"
         ),
     )
+    parser.add_argument(
+        "--corpus-dir",
+        default="",
+        help=(
+            "evaluate on this corpus instead of the lexical checkpoint's own "
+            "training corpus; required to compare checkpoints trained on "
+            "different corpora on identical prompts"
+        ),
+    )
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
     parser.add_argument("--examples", type=int, default=128)
     parser.add_argument("--batch-size", type=int, default=16)
@@ -117,7 +150,7 @@ def main():
     torch.set_float32_matmul_precision("high")
     device = choose_device(args.device)
 
-    data_dir = str(config["data_dir"])
+    data_dir = args.corpus_dir or str(config["data_dir"])
     tokenizer = AutoTokenizer.from_pretrained(
         data_dir, use_fast=True, local_files_only=True
     )
@@ -150,6 +183,7 @@ def main():
         max_length=int(config["max_length"]),
         local_files_only=True,
         native_vocabulary=True,
+        attn_implementation=str(config.get("attention_implementation", "eager")),
     ).to(device)
     model.load_state_dict(torch.load(
         os.path.join(args.lexical_artifact_dir, "masked.pt"),
@@ -210,11 +244,78 @@ def main():
             "top1_accuracy": correct / max(1, len(golds)),
         }
 
-    # --- iterative: confidence-ordered fill, no retraining ----------------
+    # --- mask-predict: re-maskable fill, no retraining --------------------
+    # The commit-only family below freezes a position once it is filled, so a
+    # round-one mistake conditions every later round. Mask-Predict instead
+    # recomputes the masked set from confidence each round, so any token can be
+    # revised. That is the difference the literature's schedule turns on, and
+    # the commit-only result does not speak to it.
+    maskpredict_results = {}
+    for budget in [int(value) for value in args.passes.split(",") if value]:
+        correct, total, exact = 0, 0, 0
+        decoded_similarity, decoded_exact = 0.0, 0
+        for example, span in spans:
+            n = len(span)
+            prefix = 1 + len(example.segments[0])
+            canvas_span = [vocab.GAP] * n
+            confidence = [float("-inf")] * n
+            for step in range(budget):
+                masked = [i for i in range(n) if canvas_span[i] == vocab.GAP]
+                if not masked:
+                    break
+                rows = [(
+                    native_canvas(example, vocab, canvas_span),
+                    [prefix + i for i in masked],
+                )]
+                logp = score_canvases(
+                    backbone, token_head, rows, vocab, device, generated_ids,
+                    args.batch_size,
+                )[0]
+                for j, position in enumerate(masked):
+                    choice = int(logp[j].argmax())
+                    canvas_span[position] = int(
+                        vocab.generated_token_ids[choice]
+                    )
+                    confidence[position] = float(logp[j].max())
+                # Re-mask the least confident positions for the next round.
+                remaining_rounds = budget - step - 1
+                if remaining_rounds <= 0:
+                    break
+                keep = int(round(n * (step + 1) / budget))
+                order = sorted(range(n), key=lambda i: confidence[i])
+                for position in order[: max(0, n - keep)]:
+                    canvas_span[position] = vocab.GAP
+                    confidence[position] = float("-inf")
+            hits = sum(
+                1 for i in range(n) if int(canvas_span[i]) == int(span[i])
+            )
+            correct += hits
+            total += n
+            exact += int(hits == n)
+            similarity, is_exact = decoded_pair_metrics(
+                tokenizer, canvas_span, span
+            )
+            decoded_similarity += similarity
+            decoded_exact += is_exact
+        maskpredict_results[str(budget)] = {
+            "passes": budget,
+            "positions": total,
+            "top1_accuracy": correct / max(1, total),
+            "exact_span_probability": exact / max(1, len(spans)),
+            "character_edit_similarity": (
+                decoded_similarity / max(1, len(spans))
+            ),
+            "decoded_exact_span_probability": (
+                decoded_exact / max(1, len(spans))
+            ),
+        }
+
+    # --- iterative: commit-only confidence-ordered fill --------------------
     iterative_results = {}
     for budget in [int(value) for value in args.passes.split(",") if value]:
         correct, total = 0, 0
         exact = 0
+        decoded_similarity, decoded_exact = 0.0, 0
         for example, span in spans:
             n = len(span)
             prefix = 1 + len(example.segments[0])
@@ -252,11 +353,22 @@ def main():
             correct += hits
             total += n
             exact += int(hits == n)
+            similarity, is_exact = decoded_pair_metrics(
+                tokenizer, canvas_span, span
+            )
+            decoded_similarity += similarity
+            decoded_exact += is_exact
         iterative_results[str(budget)] = {
             "passes": budget,
             "positions": total,
             "top1_accuracy": correct / max(1, total),
             "exact_span_probability": exact / max(1, len(spans)),
+            "character_edit_similarity": (
+                decoded_similarity / max(1, len(spans))
+            ),
+            "decoded_exact_span_probability": (
+                decoded_exact / max(1, len(spans))
+            ),
         }
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -264,7 +376,8 @@ def main():
         "config": vars(args),
         "spans": len(spans),
         "staircase": staircase_results,
-        "iterative": iterative_results,
+        "iterative_commit_only": iterative_results,
+        "maskpredict": maskpredict_results,
     }
     with open(
         os.path.join(args.output_dir, "results.json"), "w", encoding="utf-8"
@@ -280,15 +393,22 @@ def main():
             100.0 * value["top1_accuracy"],
         ))
     print()
-    print("iterative confidence-ordered fill (actual, no retraining)")
-    print("  passes   positions   top-1     exact span")
-    for key in sorted(iterative_results, key=int):
-        value = iterative_results[key]
-        print("  %-8s %9d %8.2f%% %11.2f%%" % (
-            key, value["positions"],
-            100.0 * value["top1_accuracy"],
-            100.0 * value["exact_span_probability"],
-        ))
+    for label, table in (
+        ("commit-only confidence-ordered fill", iterative_results),
+        ("mask-predict, re-maskable", maskpredict_results),
+    ):
+        print("%s (actual, no retraining)" % label)
+        print("  passes   positions   top-1     exact span  decoded exact  char edit")
+        for key in sorted(table, key=int):
+            value = table[key]
+            print("  %-8s %9d %8.2f%% %11.2f%% %13.2f%% %10.4f" % (
+                key, value["positions"],
+                100.0 * value["top1_accuracy"],
+                100.0 * value["exact_span_probability"],
+                100.0 * value["decoded_exact_span_probability"],
+                value["character_edit_similarity"],
+            ))
+        print()
 
 
 if __name__ == "__main__":

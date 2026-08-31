@@ -83,6 +83,13 @@ def main():
     parser.add_argument("--chunk-size", type=int, default=64)
     parser.add_argument("--seed", type=int, default=1901)
     parser.add_argument(
+        "--selective-gap-fraction",
+        type=float,
+        default=1.0,
+        help="expand only the most confident fraction of descendant GAPs",
+    )
+    parser.add_argument("--selective-gap-min", type=int, default=1)
+    parser.add_argument(
         "--greedy-tokens",
         action="store_true",
         help="sample shape but take the argmax token, matching the scaffold "
@@ -94,6 +101,10 @@ def main():
         help="apply test.calibrated.values from a frontier calibration JSON",
     )
     args = parser.parse_args()
+    if not 0.0 < args.selective_gap_fraction <= 1.0:
+        parser.error("--selective-gap-fraction must be in (0,1]")
+    if args.selective_gap_min < 1:
+        parser.error("--selective-gap-min must be positive")
 
     directories = [name for name in args.artifact_dirs.split(",") if name]
     if args.calibration_results and len(directories) != 1:
@@ -148,6 +159,8 @@ def main():
             max_decode_span=int(config["max_decode_span"]),
             seed=args.seed,
             sample_tokens=not args.greedy_tokens,
+            selective_gap_fraction=args.selective_gap_fraction,
+            selective_gap_min=args.selective_gap_min,
         )
         lexical = lexical_sampling_metrics(test, predictions, unfinished)
         length = distribution_metrics(
@@ -173,6 +186,8 @@ def main():
             ),
             "selected_epoch": None,
             "calibration_values": calibration_values,
+            "selective_gap_fraction": args.selective_gap_fraction,
+            "selective_gap_min": args.selective_gap_min,
             "matched_length_token_accuracy": lexical[
                 "matched_length_token_accuracy"
             ],

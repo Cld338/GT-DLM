@@ -874,7 +874,57 @@ exactly what failed to transfer.
    accuracy. Not rejected in principle, rejected at this lexical quality
    (`research/FRONTIER_REENCODE.md`).
 
-   Taken with items 35--41 this closes the structural search. Content-to-shape
+44. **Completed at seed 17, and negative for the proposed decoder lever:** a
+   memory-feasible RoBERTa-large follow-up. The same large corpus, two epochs,
+   batch four and learning rates as the RoBERTa-base large-data arm are retained;
+   the bottom 20 layers stay frozen and the top four plus heads give 51.5M
+   trainable parameters. A later audit found that the historical NLL evaluator
+   weighted batch means by span count, not token count, while the two arms used
+   different evaluation batch sizes. Batch-invariant re-evaluation gives token
+   NLL `4.5193 -> 4.4235`, edit similarity `0.3436 -> 0.3517`, and exact span
+   `12.87% -> 14.85%`; token top-1 moves only `28.32% -> 28.54%`. On identical
+   iterative-fill prompts,
+   re-maskable Mask-Predict moves `28.54% -> 28.10% -> 26.36%` at one, two and
+   four passes. Scaling modestly sharpens likelihood and exact spans without
+   crossing the `35%--40%` self-conditioning threshold. This is not a pure scale ablation
+   because the base arm was fully fine-tuned; it is sufficient to reject larger
+   lexical representations as an immediate route to iterative filling
+   (`research/FRONTIER_REENCODE.md`).
+
+45. **Completed as a backbone replacement screen:** ModernBERT-base is the
+   selected 8GB efficiency candidate, not a claimable quality winner. Its
+   untouched MLM scores `28.44%` token top-1, `15.00%` decoded exact span and
+   `0.4414` character edit similarity, against frozen RoBERTa-large's `22.00%`,
+   `10.89%` and `0.3828` on each tokenizer's matched WikiText-103 distribution.
+   Top-four adaptation reaches token-weighted NLL `4.3832` and `30.00%` top-1,
+   against RoBERTa-large top-four's `4.4235` and `28.54%`, but decoded quality is
+   a tie (`0.4413` versus `0.4436`) and ModernBERT exact span is lower (`13.00%`
+   versus `14.85%`). The comparison is distribution-matched rather than paired:
+   changing tokenizers changes the exact sampled token spans. ModernBERT uses
+   149.7M parameters instead of 355.5M, peaks at `0.67 GiB` rather than `1.44`
+   GiB for evaluation, and top-four training peaks at `0.93 GiB`. On this RTX
+   2060 SUPER / PyTorch 2.4.1 setup, ModernBERT SDPA produced non-finite training;
+   eager attention in FP32 was stable. Its iterative decoder still stays below
+   the estimated break-even: `31.11%` one-pass top-1, `30.44%` at two-pass
+   Mask-Predict and `28.67%` at four, though decoded exact span rises `13% ->
+   17%`. Use ModernBERT-base for memory/throughput and stronger zero-shot MLM,
+   but do not describe the current partial fine-tune as a text-quality gain
+   (`research/FRONTIER_REENCODE.md`).
+
+46. **Implemented as a decoding diagnostic; not selected:** confidence-selective
+   semantic branching now scores every open GAP but expands only the top fraction
+   of descendant GAPs, leaving the rest for a re-encoded later round. On one
+   4,096-sample seed-17 RoBERTa-base screen, a 25% schedule raises matched-length
+   token top-1 from `11.54%` to `13.37%` and all-nonempty edit from `0.07071` to
+   `0.07267`, but length TV worsens from `0.2585` to `0.3486`, length match falls
+   `14.82% -> 13.55%`, and mean rounds rise `1.999 -> 2.481`. The 50% schedule
+   shows the same length failure; 75% is effectively tied with the full
+   frontier. This is a post-hoc schedule with no new parameters or training
+   objective, and it does not save peak VRAM because all GAPs are still scored.
+   Reopen only with selectively sampled training states plus an explicit WAIT
+   policy (`research/SEMANTIC_BRANCHING.md`).
+
+   Taken with items 35--46 this closes the structural search. Content-to-shape
    coupling is rejected in four independent parameterizations, emission order has
    its constructive endpoint already occupied by the scaffold, and decoding order
    fails at the current `p(token | context)`. All three failures share the cause

@@ -1975,6 +1975,60 @@ class ReencodedFrontierTests(unittest.TestCase):
         self.assertEqual(shape_rounds, [[2, 2]])
         self.assertEqual(shape_unfinished, [[False, False]])
 
+    def test_selective_rollout_defers_lower_ranked_gap(self):
+        vocab = TextVocabulary(
+            20, PAD=0, GAP=9, MASK=9, LEFT=1, RIGHT=2,
+            EXTRA_STRUCTURAL=(3, 4),
+        )
+
+        class ScriptedModel:
+            def __init__(self):
+                self.gap_counts = []
+
+            def eval(self):
+                return self
+
+            def __call__(self, tokens, padding, steps):
+                del padding
+                batch, width = tokens.shape
+                lexical = torch.full((batch, width, 20), -100.0)
+                root = torch.full((batch, width), -100.0)
+                degree = torch.full((batch, width, 3), -100.0)
+                direction = torch.zeros((batch, width, 2))
+                hidden = torch.zeros((batch, width, 4))
+                for row in range(batch):
+                    gaps = tokens[row].eq(vocab.GAP).nonzero().flatten().tolist()
+                    self.gap_counts.append(len(gaps))
+                    for order, position in enumerate(gaps):
+                        if int(steps[row]) == 0:
+                            lexical[row, position, 10] = 20.0
+                            degree[row, position, 2] = 20.0
+                        else:
+                            # The first gap is more confident and is committed
+                            # while the second remains open for the next pass.
+                            lexical[row, position, 11 + order] = 20.0 - order
+                            if order == 1:
+                                lexical[row, position, 13] = 18.0
+                            degree[row, position, 0] = 20.0
+                return lexical, root, degree, direction, hidden
+
+        example = TextInfillingExample(((5,), (6,)), ((11, 10, 11),))
+        model = ScriptedModel()
+        predictions, rounds, unfinished = decode_frontier_model(
+            model,
+            [example],
+            vocab,
+            torch.device("cpu"),
+            max_rounds=4,
+            max_decode_span=8,
+            stochastic=False,
+            selective_gap_fraction=0.5,
+        )
+        self.assertEqual(predictions, [[[11, 10, 11]]])
+        self.assertEqual(rounds, [3])
+        self.assertEqual(unfinished, [False])
+        self.assertEqual(model.gap_counts, [1, 2, 1])
+
     def test_sampled_lengths_keep_empty_and_overflow_mass(self):
         probabilities = sampled_length_probabilities(
             [

@@ -583,3 +583,40 @@ its fill is a single pass, so it never sees any neighbour. That was measured too
 and it fails for a different reason -- the headroom is real but unreachable by
 self-conditioning at this lexical quality. See
 `research/FRONTIER_REENCODE.md`.
+
+## Confidence-selective frontier scheduling
+
+The deferred-emission diagnostic is now implemented. The default decoder still
+expands every active GAP. Setting `--selective-gap-fraction f`, for `0 < f < 1`,
+scores the whole frontier in one backbone pass but commits only the top
+`ceil(f * number_of_gaps)` descendant GAPs according to maximum joint
+`(token, marker)` probability. At least `--selective-gap-min` nodes are expanded.
+Unselected GAPs remain in the canvas and are rescored after the selected tokens
+have been committed. All root GAPs are resolved together in round zero so the
+empty-span semantics are unchanged.
+
+This is a decoding policy, not a new likelihood. It adds no parameters and does
+not reduce peak per-pass memory because every open GAP is still scored. It can
+increase backbone passes, and the existing checkpoint was not trained on these
+asynchronous frontiers. The same tree can also be reached under different
+schedules, so no probability claim is made for the selective rollout.
+
+One 4,096-sample screen used the seed-17 RoBERTa-base direct-joint checkpoint,
+128 prompts x 32 samples, stochastic token/marker actions, and rollout seed
+1901:
+
+| fraction | matched token top-1 | all-nonempty edit | length match | length TV | mean rounds | tokens/round |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1.00 | `11.54%` | `0.07071` | `14.82%` | `0.2585` | `1.999` | `1.193` |
+| 0.75 | `11.68%` | `0.06871` | `15.01%` | `0.2678` | `1.990` | `1.164` |
+| 0.50 | `12.03%` | `0.07143` | `14.16%` | `0.3376` | `2.350` | `0.898` |
+| 0.25 | **`13.37%`** | **`0.07267`** | `13.55%` | `0.3486` | `2.481` | `0.867` |
+
+The aggressive schedules supply the hypothesized lexical-context gain, but it
+is small on the all-sample metric and comes with a much worse generated-length
+law and about 24% more backbone rounds at fraction 0.25. Fraction 0.75 is close
+to the default and provides no consistent quality gain. This single-checkpoint,
+single-rollout-seed diagnostic therefore does not select confidence deferral as
+the primary decoder. A credible revisit would train on selectively scheduled
+frontiers and model an explicit WAIT action or stopping policy instead of using
+a post-hoc top-fraction rule.
