@@ -523,3 +523,65 @@ This is the first result in this workspace rejected before any rollout was run.
 The emission gate cost about thirty minutes of GPU and no sampling at all, where
 the same question asked through rollout metrics has previously taken two seeds
 and produced a mixture that needed stratifying before it could be read.
+
+## The midpoint convention picks the hardest token in the span
+
+Candidate 1's failure raised a question it could not answer: does an easier
+pivot exist at all? The root canvas is identical for every derivation, one GAP
+between the visible segments, so one forward pass per prompt scores every
+candidate pivot under exactly the same context.
+`diagnose_root_pivot_choice.py` reads each span token's probability off that
+single distribution and groups positions as `first`, `last`, `midpoint` (the
+`n // 2` position the sampler uses), and `interior`.
+
+Track A prompts with spans of at least three tokens, so that all four classes
+are distinct:
+
+| top-1 at the root GAP | first | midpoint | interior | last |
+|---|---:|---:|---:|---:|
+| control, test (160) | `14.37%` | `5.00%` | `4.98%` | **`25.00%`** |
+| control, validation (153) | `11.76%` | `5.88%` | `4.70%` | **`18.95%`** |
+| all-node, test (160) | `15.00%` | `4.38%` | `5.45%` | **`23.12%`** |
+| all-node, validation (153) | `9.15%` | `5.88%` | `4.18%` | **`23.53%`** |
+
+| gold token NLL | first | midpoint | interior | last |
+|---|---:|---:|---:|---:|
+| control, test | `6.1710` | `7.8159` | `8.0625` | **`5.1198`** |
+| control, validation | `5.9469` | `7.6259` | `7.9523` | **`5.5661`** |
+| all-node, test | `6.5175` | `8.4384` | `8.6785` | **`5.3894`** |
+| all-node, validation | `6.2425` | `8.1409` | `8.5130` | **`5.8814`** |
+
+The midpoint is not merely harder than the edges. At `4.38%` to `5.88%` it is
+indistinguishable from a randomly chosen interior position at `4.18%` to
+`5.45%`. The training convention selects a maximally hard target, and it does so
+for `70%` of sampled trees.
+
+The span's last token is four to five times more likely to be named correctly,
+at a `2.3` to `2.7` nat lower NLL, from the same canvas and the same forward
+pass. This holds on the control, which was trained with `70%` midpoint
+supervision, so the convention is working directly against what the backbone
+finds easy. Asked which of its own span tokens it would rather emit, even that
+model picks the last position `31%` to `38%` of the time and the midpoint only
+`12%` to `14%`.
+
+This reconciles with the emission breakdown. Round zero scores `12.80%` across
+all span lengths under the mixed `70/30` convention, while the midpoint alone on
+spans of three or more scores `5.00%`; short spans, where first and last
+coincide, lift the mixture.
+
+SSB-12's remaining candidates therefore have a measured prize rather than an
+intuition: `5.00%` against `25.00%` on the single most starved decision in the
+schedule, which carries `211` of `978` emitted tokens. Candidate 1's null result
+is also explained. Marginalization removed the penalty on alternative
+derivations but the model still had to place its mass somewhere, and spreading
+it over all compatible pivots is not the same as being trained to commit to the
+easy one.
+
+Three limits bound the claim. The probe scores the root canvas only, so it says
+which token is easiest to name there, not which derivation is best afterwards.
+Pivoting at the last position forces marker `left` and turns the tree into a
+chain, raising depth from about `log n` to `n` and increasing rounds; the binary
+tree exists to buy parallelism and this prices what that parallelism costs at
+round zero rather than showing it is free. And the `last` over `first` asymmetry,
+consistent across both checkpoints and both splits, is unexplained; it is
+recorded rather than theorized about.

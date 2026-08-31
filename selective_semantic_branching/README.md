@@ -204,3 +204,16 @@ context and nothing else:
 Use this before proposing any change to the objective, the selector, or the
 training states. It reports whether a stratum's failure is recoverable at all
 under this checkpoint.
+
+Compare the candidate root pivots against each other on that same canvas:
+
+```powershell
+.\.venv-modernbert\Scripts\python.exe `
+  selective_semantic_branching/diagnose_root_pivot_choice.py `
+  --device cuda --artifact-dir artifacts/selective_semantic_branching_ssb2_gold_control
+```
+
+One forward pass per prompt scores every span token at the single root GAP, so
+`first`, `midpoint`, `interior`, and `last` are compared under identical
+context. The midpoint convention the sampler uses by default is the hardest of
+the four; see SSB-12.

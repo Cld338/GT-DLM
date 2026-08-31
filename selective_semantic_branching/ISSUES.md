@@ -321,13 +321,25 @@ between the two splits, so no breakdown survives. The removed penalty became
 spread probability mass, not better argmax accuracy. The flag stays for
 ablations; it is not a default.
 
-**Candidates remaining:** a `midpoint_probability` sweep and an edge-first pivot
-strategy in `build_pivot_tree`. Candidate 1's failure weakens both. If an
-edge-adjacent pivot were materially easier to predict at round zero, a model
-free to place mass on any compatible pivot should have found it and raised
-round-zero accuracy. Measure that premise directly before spending another
-training run: at the root canvas, score every span token at the single open GAP
-and break accuracy down by the token's position in the span. If edge positions
-are not more predictable than the midpoint, this whole candidate family is dead
-and SSB-12 needs a different mechanism, such as reducing how many tokens are
-committed in rounds zero and one rather than reordering which ones.
+**Premise measured and confirmed.** `diagnose_root_pivot_choice.py` scores the
+root canvas once per prompt and reads every candidate pivot off the same
+distribution. On Track A spans of three or more tokens, the span's last token is
+named correctly `18.95%` to `25.00%` of the time against the midpoint's `4.38%`
+to `5.88%`, a `2.3` to `2.7` nat NLL gap, replicated on both splits and both
+checkpoints. The midpoint is indistinguishable from a random interior position.
+The sampler's default convention selects a maximally hard target for `70%` of
+trees, and the control prefers the last position `31%` to `38%` of the time when
+free to choose among its own span tokens.
+
+**Candidates remaining, now with a measured prize:** an edge-first pivot
+strategy in `build_pivot_tree`, and a `midpoint_probability` sweep as its cheap
+approximation. The target is round-zero emission accuracy, currently `12.80%`
+across all span lengths, against `25.00%` for a last-token convention on spans
+of three or more.
+
+Design against the cost rather than assuming it away. Pivoting at the last
+position forces marker `left` and degenerates the tree into a chain, raising
+depth from about `log n` to `n`, so rounds and NFE rise and the parallelism the
+binary tree was chosen for disappears. A `midpoint_probability` sweep measures
+the interior of that trade-off without committing to either end. Report rounds
+and NFE next to emission accuracy for every point on it.
