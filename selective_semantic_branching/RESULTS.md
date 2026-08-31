@@ -749,3 +749,60 @@ Taken together, the selection rule is closed. Which GAPs to expand is worth
 not survive a split change, and the deployed ranking is indistinguishable from
 random. A learned `EXPAND/DEFER` head remains unbuilt, and these numbers are why
 it should stay that way until the action model itself improves.
+
+## Length is a selection failure, not a generation failure
+
+Every generation number in this file is an expectation over stochastic draws:
+`nonempty_exact_probability` is the chance one draw is right, not the chance the
+right answer is among the draws. With `86%` of sixteen draws per prompt distinct,
+those are very different quantities and only the first had ever been reported.
+
+`diagnose_sample_oracle.py` reports both, per difficulty bin, on the frozen
+gold-control checkpoint at the 50% schedule:
+
+| Track A test, 211 prompts | expected | best of 16 | ratio |
+|---|---:|---:|---:|
+| all-nonempty edit | `0.10839` | `0.35661` | `3.3x` |
+| exact | `2.15%` | `12.32%` | `5.7x` |
+| **length match** | `11.40%` | **`71.09%`** | **`6.2x`** |
+
+Validation agrees: edit `0.09581` to `0.31961`, exact `1.35%` to `9.31%`, and
+length match `12.07%` to `76.47%`.
+
+The length result is the important one, because dynamic length without a length
+head is the entire reason this architecture exists over the shape-then-fill
+scaffold. The model produces the correct length somewhere in sixteen draws for
+`71%` of prompts and commits to it in `11%`. Length is therefore mostly a
+selection failure, and the `12%` figure quoted throughout this file measures the
+decoder's choice rather than the model's reach.
+
+Content splits by difficulty instead:
+
+| Track A test | expected exact | oracle exact | expected len | oracle len |
+|---|---:|---:|---:|---:|
+| easy (74) | `4.76%` | `17.57%` | `14.77%` | `72.97%` |
+| medium (76) | `1.32%` | `17.11%` | `11.80%` | `80.26%` |
+| hard (61) | `0.00%` | **`0.00%`** | `6.79%` | `57.38%` |
+
+The hard third never produces the right span in any of sixteen draws, so no
+reranker can help its content; that stratum remains a generation failure and
+belongs to SSB-12's regime. Its length is still recoverable at `57.38%`, so even
+there the two axes separate.
+
+Two honest bounds on the claim. The oracle needs the target to pick, so it is a
+ceiling and not an achievable policy; whether any target-free score correlates
+with correctness is untested and is the actual open question. And drawing
+sixteen samples inflates any max mechanically: independent draws at the observed
+per-draw rates would reach `85.6%` length and `29.4%` exact on test, so the
+measured `71.09%` and `12.32%` sit *below* the independence reference. The draws
+are positively correlated, which means the oracle is a real but bounded signal
+rather than a counting artifact, and also that the model concentrates on a mode
+that is usually wrong.
+
+This is the largest headroom measured in this workspace. For comparison, the
+expansion-order oracle was worth `+0.015` edit and zero exact, pivot reordering
+was negative, and all-node marginalization moved emission by `-0.10 pp`. Those
+were all closed. This one is opened as SSB-13.
+
+Best-of-n is a `16x` decode cost as a deployment, although the evaluation
+already draws those samples to compute its expectations.

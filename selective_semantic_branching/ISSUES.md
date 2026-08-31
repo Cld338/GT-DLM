@@ -389,3 +389,39 @@ non-empty prompts.
 **Artifacts:** `selective_semantic_branching_pivot_mp035`,
 `selective_semantic_branching_pivot_mp000`,
 `selective_semantic_branching_pivot_last`
+
+## SSB-13 — The decoder cannot pick its own best sample
+
+**Status:** open; the largest measured headroom in this workspace
+
+Every reported metric is an expectation over stochastic draws, and `86%` of the
+sixteen draws per prompt are distinct sequences. The best draw is far better
+than the average one: on Track A test, length match rises from `11.40%` to
+`71.09%`, exact from `2.15%` to `12.32%`, and edit from `0.10839` to `0.35661`,
+with validation agreeing at `76.47%`, `9.31%`, and `0.31961`.
+
+Length is the axis this architecture exists for, and on that axis the model
+already reaches the right answer for about three quarters of prompts and commits
+to it for one eighth. That is a selection failure at the sequence level, not a
+generation failure, and it is separate from the within-rollout selection
+question closed under SSB-3: this one chooses between finished outputs, not
+between GAPs.
+
+The hard difficulty bin is the exception and confirms the split: it never
+produces the correct span in any draw, so its content belongs to SSB-12's
+multi-token-GAP regime rather than here. Its length is still recoverable at
+`57.38%`.
+
+**Gate:** a scoring function that sees no target recovers a material share of
+the oracle on the untouched test split, at a stated decode cost, without
+worsening length TV or unfinished mass.
+
+**Known obstacle:** the empty-span candidate. A sequence score summed over
+generated positions is zero for an empty draw and negative for every other, so
+naive likelihood always prefers empty. Any candidate scorer must handle the
+empty decision and the length bias explicitly rather than inheriting them, and
+must be fitted on validation and applied once to test, as the threshold policy
+was.
+
+**Cost note:** best-of-n is an `n`-fold decode as a deployment. The gate should
+report quality against decode cost, not quality alone.

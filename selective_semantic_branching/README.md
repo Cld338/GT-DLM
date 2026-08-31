@@ -205,6 +205,19 @@ Use this before proposing any change to the objective, the selector, or the
 training states. It reports whether a stratum's failure is recoverable at all
 under this checkpoint.
 
+Separate what the model cannot generate from what it cannot choose. Every
+reported metric is an expectation over draws; this reports the best draw beside
+it, per difficulty bin:
+
+```powershell
+.\.venv-modernbert\Scripts\python.exe `
+  selective_semantic_branching/diagnose_sample_oracle.py `
+  --device cuda --artifact-dir artifacts/selective_semantic_branching_ssb2_gold_control
+```
+
+Length match is `11.40%` expected against `71.09%` for the best of sixteen
+draws, so length is mostly a selection failure. See SSB-13.
+
 Price the expansion order itself, in output quality rather than in action
 correctness. This runs the decoder with greedy tokens so only the order varies,
 and compares the deployed confidence policy against random orders drawn at the
