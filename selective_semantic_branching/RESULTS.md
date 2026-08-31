@@ -405,3 +405,66 @@ These runs are the Phase 0 frozen baseline on the Phase 1 evaluation contract,
 and future promotion claims should be paired against them rather than against
 freshly sampled prompts. Peak allocation stayed at `2.36 GiB` with `2.96 GiB`
 reserved.
+
+## The hard stratum is recoverable; the schedule loses it
+
+Track A's hard third produced no exact reconstruction at all. That number was
+uninterpretable on its own: a span that no context determines and a span the
+model throws away both score zero. `diagnose_emission_context.py --track` now
+separates them by scoring the same gold token under three contexts on the frozen
+gold-control checkpoint, so the only thing that varies is what the token was
+predicted from.
+
+Track A test, 211 prompts and 978 gold token positions, with the validation
+split alongside as a stability check:
+
+| top-1, test (validation) | emission | all-masked fill | one-masked oracle |
+|---|---:|---:|---:|
+| easy | `48.70%` (`51.61%`) | `38.55%` (`42.74%`) | `72.75%` (`79.84%`) |
+| medium | `38.73%` (`40.57%`) | `25.14%` (`29.87%`) | `63.29%` (`66.04%`) |
+| hard | `29.27%` (`27.97%`) | `11.50%` (`14.41%`) | **`57.84%`** (`58.76%`) |
+| all | `39.47%` (`38.70%`) | `25.87%` (`27.39%`) | `65.03%` (`66.96%`) |
+
+The hard bin's oracle is `57.84%`, within `15 pp` of the easy bin's. Its gold
+tokens are therefore recoverable from context; the bin is not an ambiguity
+stratum. The same prompts reconstruct nothing at rollout. The `28.57 pp` gap
+between hard emission and hard oracle is the largest of the three bins, so the
+headroom is concentrated exactly where generation fails.
+
+This closes the branch that would have retired exact reconstruction as a claim.
+Uniform corruption is recoverable enough to keep measuring, which also answers
+the open half of SSB-6: distributional length calibration does not have to
+replace oracle recovery as the primary Track A claim.
+
+The cost is emission-time context, and it is concentrated at the start:
+
+| emission round | positions | token NLL | top-1 |
+|---:|---:|---:|---:|
+| 0 | `211` | `6.6115` | `12.80%` |
+| 1 | `345` | `4.8438` | `29.86%` |
+| 2 | `399` | `2.0987` | `60.40%` |
+| 3 | `23` | `1.4232` | `65.22%` |
+
+Round zero scores `12.80%` against round two's `60.40%` on the same weights, and
+rounds zero and one carry `556` of `978` emitted tokens, or `56.9%`. A mean span
+of `3.6` leaves the binary pivot tree no room to deepen before most of its
+tokens are already committed. This reproduces on ModernBERT what commit
+`4706077` measured on the earlier checkpoint, where `59%` of tokens came from
+the two worst rounds.
+
+All-masked fill is worse than emission everywhere, and worst in the hard bin
+(`11.50%` against `29.27%`). Parallel refill is not the repair at this quality,
+which agrees with the iterative-fill refutation rather than contradicting it.
+
+Two caveats bound the claim. The oracle is this checkpoint's ceiling, not an
+information-theoretic one; a larger backbone could raise it. And no schedule can
+reach the oracle, because a schedule reveals predicted neighbours rather than
+gold ones, which the earlier iterative-fill diagnostic priced at roughly `-5.3`
+points for a wrong neighbour against `+9.1` for a correct one. Global emission
+accuracy of `39.47%` sits above that break-even band while the hard stratum's
+`29.27%` sits below it, so a context-lengthening change should be expected to
+help the aggregate before it helps the stratum that needs it most.
+
+The next experiment therefore has a measured target rather than a hypothesis:
+move tokens out of rounds zero and one, or give those rounds more context, and
+check the hard bin's emission accuracy against the `57.84%` ceiling.

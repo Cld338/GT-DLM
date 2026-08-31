@@ -36,8 +36,17 @@ confidence and the zero-interaction action model remain the defaults.
 The three most recent results share one signature: a narrow gate passes and
 free-rollout reconstruction regresses. Checkpoints are still selected by
 teacher-forced NLL, which is exactly the currency those screens keep winning
-in, so SSB-7 rollout-based selection is the next structural change rather than
-a fifth scheduling variant.
+in, so SSB-7 rollout-based selection is owed before a fifth scheduling variant.
+
+The largest priced gap is elsewhere. Scoring the same gold token at its emission
+round, under an all-masked fill, and under a one-position-masked oracle gives
+`39.47%`, `25.87%`, and `65.03%` on Track A test. Round zero scores `12.80%`
+against round two's `60.40%`, and rounds zero and one carry `56.9%` of all
+emitted tokens, because a mean span of `3.6` leaves the binary tree no room to
+deepen first. The hard difficulty bin reconstructs nothing at rollout yet has a
+`57.84%` oracle, so its failure is the emission schedule rather than an
+ambiguity floor. That gap is larger than backbone scale or encoder access, the
+two levers previously found to matter here, and it is tracked as SSB-12.
 
 ## 8 GB defaults
 
@@ -179,3 +188,19 @@ Results are reported per difficulty bin as well as in aggregate, and the
 balanced cell weights are written to the result file. Rollout scoring accepts
 only single-GAP prompts, so about half of each track is skipped and counted;
 see SSB-11 in [ISSUES.md](ISSUES.md).
+
+Price the context available when each token is committed, per difficulty bin.
+The root diagnostic scores the same gold token at its emission round, under an
+all-masked fill, and under a one-position-masked oracle, so the difference is
+context and nothing else:
+
+```powershell
+.\.venv-modernbert\Scripts\python.exe diagnose_emission_context.py `
+  --device cuda --artifact-dir artifacts/selective_semantic_branching_ssb2_gold_control `
+  --track artifacts/selective_semantic_branching_data_audit_uniform_tracks/tracks/track_a_length_difficulty_balanced.jsonl `
+  --output-dir artifacts/selective_semantic_branching_ssb2_gold_control/emission_context_track_a_test
+```
+
+Use this before proposing any change to the objective, the selector, or the
+training states. It reports whether a stratum's failure is recoverable at all
+under this checkpoint.

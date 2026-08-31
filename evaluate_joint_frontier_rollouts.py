@@ -54,6 +54,10 @@ def load_model(artifact_dir, vocab, tokenizer, device):
         zero_joint_interaction=bool(
             config.get("zero_joint_interaction", False)
         ),
+        per_node_frontier_features=bool(
+            config.get("per_node_frontier_features", False)
+        ),
+        attn_implementation=config.get("attention_implementation") or None,
         dropout=0.0,
     ).to(device)
     model.load_state_dict(torch.load(

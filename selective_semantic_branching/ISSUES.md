@@ -154,6 +154,15 @@ the model often learns a marginal prior rather than recoverable evidence.
 treat distributional length calibration, rather than oracle length recovery,
 as the primary claim.
 
+**Resolution of the recoverability half:** a one-position-masked oracle on the
+frozen gold-control checkpoint scores `65.03%` top-1 over Track A test and
+`57.84%` inside the hard bin, reproduced at `66.96%` and `58.76%` on
+validation. Uniform corruption is therefore recoverable enough that exact
+reconstruction stays a legitimate Track A claim, and the hard bin's `0.00%`
+rollout exactness is a model failure rather than an ambiguity floor. A
+recoverable-span corruption control is not needed. The remaining SSB-6 work is
+length identifiability specifically, not span identifiability.
+
 **Phase 1 result:** a 21,273-record document-grouped audit compared uniform,
 copy, and anchored-copy corruption with one and two GAPs. Copy-constrained data
 is recoverable by construction but collapses mean span length to 1.30--1.61
@@ -268,3 +277,39 @@ matter where their supervision lives.
 
 **Gate:** multi-GAP rollout produces finite metrics under the 8 GB gate, and a
 Track A claim can quote whole-track coverage rather than its single-GAP half.
+
+## SSB-12 — Most tokens are emitted in the two worst rounds
+
+**Status:** open; measured, and the largest priced gap in this workspace
+
+The grammar makes every non-empty node emit its token when it branches, from a
+canvas holding only earlier rounds, and the choice is irrevocable. On Track A
+test the frozen checkpoint scores `12.80%` at round zero against `60.40%` at
+round two, on the same weights, and rounds zero and one carry `56.9%` of all
+emitted tokens. A mean span of `3.6` gives the binary pivot tree no room to
+deepen before most of its tokens are committed.
+
+The ceiling is known. A one-position-masked oracle reaches `65.03%` overall and
+`57.84%` in the hard bin, against emission accuracies of `39.47%` and `29.27%`.
+This is a larger measured gap than backbone scale (`+9.05 pp`) or encoder access
+(`+5.82 pp`), the two levers this project has previously found to matter.
+
+Training compounds the problem rather than merely inheriting it. The sampled
+tree is `70%` midpoint by default (`--midpoint-probability 0.7`), so the token
+supervised at round zero is usually the position furthest from both context
+edges, and one-hot supervision on that convention denies the model the freedom
+to pivot somewhere easier. The label noise this creates is small: the sampler's
+irreducible entropy is `0.335` nat on the token target and `0.245` on the
+marker, against measured NLLs of `3.758` and `0.771`. The cost is the systematic
+bias, not the noise.
+
+**Gate:** an intervention moves round-zero and round-one emission accuracy
+toward the oracle, and the hard bin's emission accuracy improves, before any
+rollout metric is consulted. Candidates in order: all-node compatible-action
+marginalization, which is implemented in `data.py`, `gtdlm/data.py`, and
+`frontier_reencode.py` but has no `train.py` flag; a `midpoint_probability`
+sweep; and an edge-first pivot strategy in `build_pivot_tree`.
+
+Do not treat a rollout lexical gain as evidence for this item without the
+emission-round breakdown. Three interventions have already improved a narrow
+gate and regressed rollout reconstruction.

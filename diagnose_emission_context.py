@@ -21,6 +21,13 @@ nothing else:
 `emission` broken down by round says whether the cost is concentrated at round
 zero, where a single node must emit the pivot of the whole span with no lexical
 context at all.
+
+With `--track` the same three conditions are reported per frozen-difficulty bin
+of a fixed evaluation track. That separates two explanations of a bin whose
+rollout reconstruction is zero: a high oracle means the span is recoverable and
+the model is losing it, while an oracle near the emission score means the span
+is not identifiable from its context and no scheduling change can recover it.
+The oracle is this checkpoint's ceiling, not an information-theoretic one.
 """
 
 import argparse
@@ -38,6 +45,19 @@ from gtdlm.text_data import (
     sample_text_infilling_examples,
 )
 from gtdlm.text_tokenizer import vocabulary_from_pretrained_tokenizer
+from selective_semantic_branching.evaluation_tracks import (
+    difficulty_groups,
+    load_track_examples,
+    resolve_track_path,
+)
+
+
+def summarize(scored):
+    return {
+        "positions": len(scored),
+        "token_nll": sum(nll for nll, _ in scored) / max(1, len(scored)),
+        "top1_accuracy": sum(1 for _, hit in scored if hit) / max(1, len(scored)),
+    }
 
 
 def score_positions(model, rows, vocab, device, generated_ids, batch_size=16):
@@ -83,6 +103,17 @@ def main():
     parser.add_argument("--examples", type=int, default=128)
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--seed", type=int, default=1901)
+    parser.add_argument(
+        "--track",
+        default="",
+        help=(
+            "fixed evaluation track file; replaces the freshly sampled test "
+            "prompts and adds a per-difficulty-bin breakdown"
+        ),
+    )
+    parser.add_argument("--track-manifest", default="")
+    parser.add_argument("--track-split", default="test")
+    parser.add_argument("--track-limit", type=int, default=0)
     args = parser.parse_args()
 
     with open(
@@ -104,19 +135,29 @@ def main():
     corpus = torch.load(
         os.path.join(data_dir, "corpus.pt"), map_location="cpu", weights_only=True
     )
-    data_seed = int(config["data_seed"])
-    test = sample_text_infilling_examples(
-        random_length_windows(
-            corpus["test"],
-            data_seed + 403,
-            int(config["random_window_min"]),
-            int(config["random_window_max"]),
-        ),
-        data_seed + 101,
-        gap_counts=(1,),
-        min_span=1,
-        max_span=int(config["max_span"]),
-    )[: args.examples]
+    data_seed = int(config.get("data_seed", config["seed"]))
+    if args.track:
+        test, track_records, track_summary = load_track_examples(
+            resolve_track_path(args.track),
+            manifest_path=args.track_manifest or None,
+            split=args.track_split,
+            limit=args.track_limit,
+        )
+        print(json.dumps({"track": track_summary}, indent=2), flush=True)
+    else:
+        track_records, track_summary = [], None
+        test = sample_text_infilling_examples(
+            random_length_windows(
+                corpus["test"],
+                data_seed + 403,
+                int(config["random_window_min"]),
+                int(config["random_window_max"]),
+            ),
+            data_seed + 101,
+            gap_counts=(1,),
+            min_span=1,
+            max_span=int(config["max_span"]),
+        )[: args.examples]
 
     model, _ = load_model(args.artifact_dir, vocab, tokenizer, device)
     model.eval()
@@ -124,7 +165,8 @@ def main():
 
     emission_rows, emission_rounds = [], []
     fill_rows, oracle_rows = [], []
-    for example in test:
+    owners = {"emission": [], "fill": [], "oracle": []}
+    for example_index, example in enumerate(test):
         span = example.spans[0]
         if not span:
             continue
@@ -145,6 +187,7 @@ def main():
                     (list(state["tokens"]), position, int(target))
                 )
                 emission_rounds.append(int(state["step"]))
+                owners["emission"].append(example_index)
 
         # Fill and oracle share the completed canvas layout.
         prefix = [vocab.LEFT] + list(example.segments[0])
@@ -157,6 +200,13 @@ def main():
                 for index, token in enumerate(span)
             ] + suffix
             oracle_rows.append((one_masked, len(prefix) + offset, int(gold)))
+            owners["fill"].append(example_index)
+            owners["oracle"].append(example_index)
+
+    bin_of_example = {}
+    for name, indices in difficulty_groups(track_records).items():
+        for index in indices:
+            bin_of_example[index] = name
 
     conditions = {}
     for name, rows in (
@@ -167,13 +217,14 @@ def main():
         scored = score_positions(
             model, rows, vocab, device, generated_ids, args.batch_size
         )
-        conditions[name] = {
-            "positions": len(scored),
-            "token_nll": sum(nll for nll, _ in scored) / max(1, len(scored)),
-            "top1_accuracy": sum(
-                1 for _, hit in scored if hit
-            ) / max(1, len(scored)),
-        }
+        conditions[name] = summarize(scored)
+        if bin_of_example:
+            by_bin = defaultdict(list)
+            for value, example_index in zip(scored, owners[name]):
+                by_bin[bin_of_example[example_index]].append(value)
+            conditions[name]["by_difficulty"] = {
+                key: summarize(values) for key, values in sorted(by_bin.items())
+            }
         if name == "emission":
             by_round = defaultdict(list)
             for (nll, hit), step in zip(scored, emission_rounds):
@@ -189,6 +240,8 @@ def main():
 
     os.makedirs(args.output_dir, exist_ok=True)
     payload = {"config": vars(args), "conditions": conditions}
+    if track_summary is not None:
+        payload["track"] = track_summary
     with open(
         os.path.join(args.output_dir, "results.json"), "w", encoding="utf-8"
     ) as handle:
@@ -212,6 +265,22 @@ def main():
             value["token_nll"],
             100.0 * value["top1_accuracy"],
         ))
+
+    if bin_of_example:
+        print()
+        print("by difficulty bin (top-1):")
+        bins = sorted(conditions["oracle"]["by_difficulty"])
+        print("  %-10s %10s %10s %10s %10s" % (
+            "bin", "positions", "emission", "fill", "oracle"
+        ))
+        for key in bins:
+            print("  %-10s %10d %9.2f%% %9.2f%% %9.2f%%" % (
+                key,
+                conditions["oracle"]["by_difficulty"][key]["positions"],
+                100.0 * conditions["emission"]["by_difficulty"][key]["top1_accuracy"],
+                100.0 * conditions["fill"]["by_difficulty"][key]["top1_accuracy"],
+                100.0 * conditions["oracle"]["by_difficulty"][key]["top1_accuracy"],
+            ))
 
 
 if __name__ == "__main__":
