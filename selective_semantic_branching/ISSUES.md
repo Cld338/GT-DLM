@@ -461,8 +461,10 @@ scored far below the expectation, so the gain is not a length artifact. This is
 the first validation-selected setting in this workspace to survive the split
 change.
 
-**Open, length half:** the same policy moves length match `+2.82 pp` against an
-oracle gap of `59.69 pp`. The derivation score is dominated by lexical terms and
-cannot see which candidate has the right token count, though some candidate
-almost always does. A length-aware candidate score is the remaining work here,
-and it is worth more than the content half was.
+**Length half: closed by analysis, not by an experiment.** The same policy moves
+length match `+2.82 pp` against an oracle gap of `59.69 pp`, and
+[THEORY.md](THEORY.md) section 4 shows why that gap is unreachable rather than
+unexploited. Span length is drawn independently of the context, so the ceiling
+for any target-free scorer is the modal-constant bound of `16.59%` on Track A
+test, not the oracle's `71.09%`. The deployed reranker already reaches `14.22%`.
+Do not build a length-aware candidate score for this corruption distribution.

@@ -152,6 +152,8 @@ so repeated samples pay for candidate re-encoding once rather than once per
 sample.
 
 Verified runs are summarized in [RESULTS.md](RESULTS.md).
+[THEORY.md](THEORY.md) derives from those measurements which remaining gaps are
+information-limited and closed to any method, and which are not.
 The ordered bottleneck backlog and resolution gates are tracked in
 [ISSUES.md](ISSUES.md).
 The data-centered theory, hypotheses, staged ablations, promotion gates, and
