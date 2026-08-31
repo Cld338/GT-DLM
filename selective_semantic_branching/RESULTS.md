@@ -468,3 +468,58 @@ help the aggregate before it helps the stratum that needs it most.
 The next experiment therefore has a measured target rather than a hypothesis:
 move tokens out of rounds zero and one, or give those rounds more context, and
 check the hard bin's emission accuracy against the `57.84%` ceiling.
+
+## SSB-12 candidate 1: all-node marginalization does not move emission
+
+`train.py --all-node-compatible-actions` extends the SSB-1 root target to every
+open GAP: each one is supervised with the log-sum probability of all
+sequence-compatible `(token, marker)` actions for the span it still owns, rather
+than the one action the sampled tree happens to take. The hypothesis was that
+one-hot supervision on a `70%`-midpoint convention denies the model the freedom
+to pivot somewhere easier, and that freeing it would raise the starved early
+rounds.
+
+Validation deliberately keeps the single sampled-tree target in both runs. A
+log-sum target is mechanically easier than a one-hot one, so sharing it would
+make the two validation objectives incomparable.
+
+The pilot reused the frozen gold-control run as its control: same initial SSB-1
+checkpoint, 4,096 documents, two epochs, seed 17, batch 64, top four layers,
+eager/FP32. The only difference is the flag. Peak allocation was `2.414 GiB` in
+both.
+
+The training objective fell from `3.9275` to `3.0445`, so the model does use the
+freedom the loss gives it. None of it reached the predictions:
+
+| Track A test top-1 | control | all-node | delta |
+|---|---:|---:|---:|
+| emission | `39.47%` | `39.37%` | `-0.10 pp` |
+| all-masked fill | `25.87%` | `25.26%` | `-0.61 pp` |
+| one-masked oracle | `65.03%` | `64.52%` | `-0.51 pp` |
+| round 0 | `12.80%` | `12.32%` | `-0.47 pp` |
+| round 1 | `29.86%` | `29.57%` | `-0.29 pp` |
+| hard bin emission | `29.27%` | `28.22%` | `-1.05 pp` |
+
+Validation agrees on the aggregate at `-0.11 pp` and disagrees on every
+breakdown: round zero moves `+0.49 pp` there against `-0.47 pp` on test, and the
+hard bin `+1.69 pp` against `-1.05 pp`. The per-bin and per-round differences
+flip sign between splits, so they are noise. The aggregate is flat to within a
+tenth of a point on both splits.
+
+The SSB-12 gate is not passed and this candidate is rejected. The model absorbed
+the removed penalty as spread probability mass rather than better argmax
+accuracy on gold tokens: it stopped being punished for valid alternatives
+without becoming more likely to name the right one.
+
+Two caveats. The marginalized run selected epoch 1 while the control selected
+epoch 2, because both of its epochs scored worse on the shared single-action
+validation objective, which is biased against a marginalized model by
+construction. And two epochs on 4,096 documents may be too small a budget for a
+policy-shaped change to appear. Neither caveat explains an aggregate that is
+flat to `0.1 pp` on two independent splits while the training objective moved
+`0.88` nat.
+
+This is the first result in this workspace rejected before any rollout was run.
+The emission gate cost about thirty minutes of GPU and no sampling at all, where
+the same question asked through rollout metrics has previously taken two seeds
+and produced a mixture that needed stratifying before it could be read.

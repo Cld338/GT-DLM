@@ -305,11 +305,29 @@ bias, not the noise.
 
 **Gate:** an intervention moves round-zero and round-one emission accuracy
 toward the oracle, and the hard bin's emission accuracy improves, before any
-rollout metric is consulted. Candidates in order: all-node compatible-action
-marginalization, which is implemented in `data.py`, `gtdlm/data.py`, and
-`frontier_reencode.py` but has no `train.py` flag; a `midpoint_probability`
-sweep; and an edge-first pivot strategy in `build_pivot_tree`.
+rollout metric is consulted.
 
 Do not treat a rollout lexical gain as evidence for this item without the
 emission-round breakdown. Three interventions have already improved a narrow
 gate and regressed rollout reconstruction.
+
+**Candidate 1, all-node compatible-action marginalization: rejected.**
+`train.py --all-node-compatible-actions` supervises every open GAP with the
+log-sum probability of all sequence-compatible actions for the span it owns.
+Against the gold-control run at an identical budget, the training objective fell
+from `3.9275` to `3.0445` while emission top-1 moved `-0.10 pp` on test and
+`-0.11 pp` on validation. Round zero, round one, and the hard bin all flip sign
+between the two splits, so no breakdown survives. The removed penalty became
+spread probability mass, not better argmax accuracy. The flag stays for
+ablations; it is not a default.
+
+**Candidates remaining:** a `midpoint_probability` sweep and an edge-first pivot
+strategy in `build_pivot_tree`. Candidate 1's failure weakens both. If an
+edge-adjacent pivot were materially easier to predict at round zero, a model
+free to place mass on any compatible pivot should have found it and raised
+round-zero accuracy. Measure that premise directly before spending another
+training run: at the root canvas, score every span token at the single open GAP
+and break accuracy down by the token's position in the span. If edge positions
+are not more predictable than the midpoint, this whole candidate family is dead
+and SSB-12 needs a different mechanism, such as reducing how many tokens are
+committed in rounds zero and one rather than reordering which ones.

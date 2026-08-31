@@ -108,6 +108,16 @@ def main():
     parser.add_argument("--gradient-checkpointing", action="store_true")
     parser.add_argument("--mixed-precision", action="store_true")
     parser.add_argument("--per-node-frontier-features", action="store_true")
+    parser.add_argument(
+        "--all-node-compatible-actions",
+        action="store_true",
+        help=(
+            "supervise every open GAP with the log-sum probability of all "
+            "sequence-compatible (token, marker) actions for the span it still "
+            "owns, instead of the one action the sampled tree happens to take; "
+            "the root already uses this target"
+        ),
+    )
     parser.add_argument("--local-files-only", action="store_true")
     parser.add_argument("--initial-checkpoint", default="")
     parser.add_argument(
@@ -179,7 +189,12 @@ def main():
         fraction=args.training_gap_fraction,
         minimum=args.selective_gap_min,
         midpoint_probability=args.midpoint_probability,
+        all_node_compatible_actions=args.all_node_compatible_actions,
     )
+    # Validation deliberately keeps the single sampled-tree target even when
+    # training marginalizes. A log-sum target is mechanically easier than a
+    # one-hot one, so sharing it would make the validation objective
+    # incomparable between a marginalized run and its control.
     validation_examples = sample_text_infilling_examples(
         random_length_windows(
             corpus["validation"],
