@@ -1713,6 +1713,8 @@ def decode_frontier_model(
     defer_lookahead: bool = False,
     defer_lookahead_candidate_batch_size: int = 4,
     defer_lookahead_weight: float = 1.0,
+    selection_policy: str = "confidence",
+    selection_threshold: float = 0.0,
 ) -> Tuple[List[List[List[int]]], List[int], List[bool]]:
     """Score every open gap, then expand a configurable subset per round.
 
@@ -1726,6 +1728,13 @@ def decode_frontier_model(
     empty-span decisions retain the original semantics.  Confidence is the
     maximum probability of the joint token/marker action when available, and
     the maximum lexical probability otherwise.
+
+    ``selection_policy`` chooses how many gaps that budget covers and which
+    ones.  ``confidence`` keeps the fixed-share top-k rule.  ``threshold``
+    replaces the fixed share with ``selection_threshold``, a probability every
+    committed action must reach, so an easy frontier commits in one round and a
+    doubtful one commits a single gap.  ``random`` keeps the fixed share but
+    picks uninformed gaps, which prices the confidence ranking at equal NFE.
     """
     if chunk_size is not None and chunk_size < 1:
         raise ValueError("decode chunk size must be positive")
@@ -1741,6 +1750,16 @@ def decode_frontier_model(
         raise ValueError("DEFER lookahead candidate batch size must be positive")
     if defer_lookahead_weight < 0.0:
         raise ValueError("DEFER lookahead weight must be non-negative")
+    if selection_policy not in {"confidence", "threshold", "random"}:
+        raise ValueError("unknown selection policy: {}".format(selection_policy))
+    if selection_policy == "threshold" and not 0.0 < selection_threshold <= 1.0:
+        raise ValueError("threshold selection needs a probability in (0,1]")
+    if selection_policy == "random" and generator is None:
+        raise ValueError("random selection requires a generator")
+    selection_threshold_logp = (
+        math.log(selection_threshold)
+        if selection_policy == "threshold" else -math.inf
+    )
     if chunk_size is not None and len(examples) > chunk_size:
         predictions: List[List[List[int]]] = []
         rounds: List[int] = []
@@ -1771,6 +1790,8 @@ def decode_frontier_model(
                     defer_lookahead_candidate_batch_size
                 ),
                 defer_lookahead_weight=defer_lookahead_weight,
+                selection_policy=selection_policy,
+                selection_threshold=selection_threshold,
             )
             predictions.extend(chunk_predictions)
             rounds.extend(chunk_rounds)
@@ -2000,20 +2021,44 @@ def decode_frontier_model(
         selected_gaps = torch.zeros_like(gap_mask)
         for row in range(len(active)):
             positions = gap_mask[row].nonzero().flatten()
-            if int(steps[row]) == 0 or selective_gap_fraction == 1.0:
+            everything = (
+                int(steps[row]) == 0
+                or (
+                    selection_policy != "threshold"
+                    and selective_gap_fraction == 1.0
+                )
+            )
+            if everything:
                 selected_gaps[row, positions] = True
                 continue
-            count = min(
-                len(positions),
-                max(
-                    selective_gap_min,
-                    int(math.ceil(len(positions) * selective_gap_fraction)),
-                ),
-            )
             confidence = selection_scores[row].index_select(0, positions)
-            chosen_positions = positions.index_select(
-                0, confidence.topk(count).indices
-            )
+            if selection_policy == "threshold":
+                # An adaptive budget: commit every GAP the model is already
+                # confident about, rather than a fixed share of the frontier.
+                above = confidence.ge(selection_threshold_logp)
+                count = max(selective_gap_min, int(above.sum()))
+                count = min(len(positions), count)
+            else:
+                count = min(
+                    len(positions),
+                    max(
+                        selective_gap_min,
+                        int(math.ceil(
+                            len(positions) * selective_gap_fraction
+                        )),
+                    ),
+                )
+            if selection_policy == "random":
+                # Same budget, uninformed order. This prices the confidence
+                # ranking itself at equal NFE.
+                order = torch.randperm(
+                    len(positions), device=positions.device, generator=generator
+                )
+                chosen_positions = positions.index_select(0, order[:count])
+            else:
+                chosen_positions = positions.index_select(
+                    0, confidence.topk(count).indices
+                )
             selected_gaps[row, chosen_positions] = True
         selected_gaps = selected_gaps.cpu()
 
@@ -2118,6 +2163,8 @@ def sample_frontier_rollouts(
     defer_lookahead: bool = False,
     defer_lookahead_candidate_batch_size: int = 4,
     defer_lookahead_weight: float = 1.0,
+    selection_policy: str = "confidence",
+    selection_threshold: float = 0.0,
 ) -> Tuple[List[List[List[int]]], List[List[int]], List[List[bool]]]:
     """Draw ancestral samples without supplying a target length or canvas."""
     if samples_per_prompt < 1:
@@ -2164,6 +2211,8 @@ def sample_frontier_rollouts(
                 defer_lookahead_candidate_batch_size
             ),
             defer_lookahead_weight=defer_lookahead_weight,
+            selection_policy=selection_policy,
+            selection_threshold=selection_threshold,
         )
         for (owner, _), prediction, steps, failed in zip(
             batch, predictions, batch_rounds, batch_unfinished

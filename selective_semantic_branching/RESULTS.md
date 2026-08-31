@@ -653,3 +653,99 @@ Each sweep point is one training seed at screening scale. The round-zero
 movement of `+9.95` to `+17.06` points and the aggregate loss of `2.97` to `5.42`
 are large, monotone in the predicted directions, and consistent across all four
 schedules, so the ordering of the conclusion does not rest on the seed.
+
+## The expansion order is worth nothing, measured in output quality
+
+Every scheduling result in this workspace has been judged either as immediate
+action correctness (SSB-3) or as gold-action NLL benefit (SSB-10). Neither says
+what a better order is worth in final output quality, which is the only thing a
+learned `EXPAND/DEFER` head could improve.
+
+`diagnose_expansion_order_oracle.py` runs the production decoder with greedy
+tokens, so the token emitted at a GAP depends only on the canvas, and varies
+nothing but which GAPs are committed each round. The deployed confidence policy
+is compared against 24 random orders drawn at the same budget, and therefore at
+the same NFE.
+
+| Track A, greedy tokens | test (211) | validation (204) |
+|---|---:|---:|
+| random order, mean edit | `0.18544` | `0.17609` |
+| confidence order, edit | `0.18640` | `0.17110` |
+| oracle over searched orders, edit | `0.20096` | `0.18829` |
+| confidence over random | `+0.00097` | `-0.00499` |
+| oracle over confidence | `+0.01455` | `+0.01719` |
+| prompts where some order won | `9.00%` | `8.82%` |
+| exact, confidence to oracle | `3.79%` to `3.79%` | `2.94%` to `2.94%` |
+
+Two results, both stronger than anything the earlier screens could say.
+
+The deployed confidence ranking is worth nothing. It beats an uninformed order
+of the same size by `+0.00097` on test and loses to it by `-0.00499` on
+validation. In final-output currency, max-joint confidence and a coin flip are
+the same policy.
+
+A perfect scheduler is worth about `+0.015` edit and no exact reconstruction at
+all. The oracle found `3.79%` exact on test against the confidence policy's
+`3.79%`, and `2.94%` against `2.94%` on validation: not one prompt was rescued
+by reordering. For scale, the difficulty bins span `0.197` easy to `0.019` hard,
+so the entire ordering family competes for `0.015` of an `0.18` range.
+
+The search is close to exhaustive here rather than a loose lower bound. At
+fraction `0.5` a frontier of two or three GAPs offers two or three subsets, over
+two or three deciding rounds, so most prompts admit between four and eighteen
+distinct orders and twenty-four draws cover them.
+
+This retroactively explains SSB-3 and SSB-10. Both tried to learn a ranking
+whose achievable value is `0.015` edit, against a baseline that is itself
+indistinguishable from random.
+
+## An adaptive budget does not survive the untouched split either
+
+Ordering is only half of the selection rule. The fixed fraction also sets how
+many GAPs a round commits, which is a separate lever: changing the budget
+changes the number of rounds and therefore how much context accumulates, so it
+is not bounded by the order oracle above.
+
+`--selection-policy threshold` replaces the fixed share with a probability every
+committed action must reach, so a confident frontier commits at once and a
+doubtful one commits a single GAP. Sweeping it on Track A validation:
+
+| policy, validation | rounds | edit | token | exact | length TV |
+|---|---:|---:|---:|---:|---:|
+| fraction `0.5` | `3.735` | `0.09554` | `11.49%` | `11.22%` | `0.3045` |
+| `tau 0.02` | `3.343` | `0.09301` | `11.83%` | `12.12%` | `0.3416` |
+| `tau 0.05` | `3.471` | `0.09473` | `12.53%` | `13.05%` | `0.3223` |
+| `tau 0.10` | `3.777` | `0.09426` | **`13.01%`** | **`13.17%`** | **`0.2779`** |
+| `tau 0.20` | `3.932` | `0.09648` | `11.94%` | `12.95%` | `0.2684` |
+| `tau 0.40` | `3.949` | `0.09647` | `11.52%` | `13.11%` | `0.2659` |
+
+The threshold does control cost as intended: `0.02` cuts rounds by `10.5%` at
+the price of over-generation, and `0.20` upward spends more. At `0.10` it looked
+like a real gain, `+1.52 pp` token and `+1.95 pp` exact with `-0.027` length TV
+at unchanged rounds.
+
+Applied once to the untouched test split at both rollout seeds, it reversed:
+
+| two-seed mean, Track A test | fraction `0.5` | `tau 0.10` | delta |
+|---|---:|---:|---:|
+| matched token accuracy | **`14.52%`** | `12.88%` | `-1.64 pp` |
+| matched exact | **`17.37%`** | `15.97%` | `-1.41 pp` |
+| all-nonempty edit | **`0.10905`** | `0.10637` | `-0.00267` |
+| length TV | **`0.29280`** | `0.30495` | `+0.01214` |
+| length match | `12.17%` | **`13.20%`** | `+1.02 pp` |
+| mean rounds | `3.613` | `3.627` | `+0.014` |
+
+The validation gain was selection noise. Under the rule that a
+validation-chosen policy must reproduce on the untouched split, the threshold
+policy is not promoted, and the fixed fraction stays the default.
+
+Both flags are kept because they are what makes the measurement repeatable, not
+because either is recommended: `--selection-policy random` is the equal-NFE
+control that prices the confidence ranking, and `threshold` is the adaptive
+budget that was tried and rejected.
+
+Taken together, the selection rule is closed. Which GAPs to expand is worth
+`+0.015` edit and no exact matches even under an oracle, how many to expand does
+not survive a split change, and the deployed ranking is indistinguishable from
+random. A learned `EXPAND/DEFER` head remains unbuilt, and these numbers are why
+it should stay that way until the action model itself improves.

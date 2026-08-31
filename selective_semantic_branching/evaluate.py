@@ -61,6 +61,17 @@ def main():
     parser.add_argument("--track-manifest", default="")
     parser.add_argument("--track-split", default="test")
     parser.add_argument(
+        "--selection-policy",
+        choices=("confidence", "threshold", "random"),
+        default="confidence",
+        help=(
+            "how the round budget is set and filled: a fixed share of the "
+            "frontier by confidence, every GAP above --selection-threshold, "
+            "or the same share chosen at random for an equal-NFE control"
+        ),
+    )
+    parser.add_argument("--selection-threshold", type=float, default=0.0)
+    parser.add_argument(
         "--track-limit",
         type=int,
         default=0,
@@ -74,6 +85,10 @@ def main():
         parser.error("evaluation sizes must be positive")
     if args.track_limit < 0:
         parser.error("--track-limit must not be negative")
+    if args.selection_policy == "threshold" and not (
+        0.0 < args.selection_threshold <= 1.0
+    ):
+        parser.error("--selection-threshold must be a probability in (0,1]")
 
     with open(
         os.path.join(args.artifact_dir, "results.json"), encoding="utf-8"
@@ -169,6 +184,8 @@ def main():
                 args.defer_lookahead_candidate_batch_size
             ),
             defer_lookahead_weight=args.defer_lookahead_weight,
+            selection_policy=args.selection_policy,
+            selection_threshold=args.selection_threshold,
         )
         lexical = lexical_sampling_metrics(test, predictions, unfinished)
         length = distribution_metrics(

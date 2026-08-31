@@ -69,8 +69,18 @@ topology/action state, which requires SSB-3.
 
 ## SSB-3 — Untrained random-versus-confidence selector
 
-**Status:** static calibration rejected; on-policy topology deferred until the
+**Status:** closed for the selector; on-policy topology deferred until the
 joint action model improves
+
+**Closing measurement:** the expansion order was finally priced in output
+quality rather than immediate action correctness. With greedy tokens and 24
+random orders per prompt at the same budget and NFE, the deployed confidence
+ranking beat an uninformed order by `+0.00097` edit on Track A test and lost to
+it by `-0.00499` on validation, while an oracle over the searched orders bought
+`+0.015` edit and no additional exact reconstruction on either split. Confidence
+ordering is indistinguishable from random and a perfect selector is worth almost
+nothing, so no learned ranking over the current action model can pay. Do not
+open another selector item before the action model itself improves.
 
 Training expands random gold GAP subsets. Inference chooses the maximum-joint-
 confidence subset, but confidence is neither a ranking target nor a measure of
@@ -253,6 +263,17 @@ prices the family: `-0.2035` selected wait benefit against the default's
 residual error is action quality, not expansion order. Do not open a fourth
 scheduling variant before SSB-7 makes free rollout the checkpoint-selection
 currency.
+
+**Why the hierarchical head was never built:** the screen was the gate for
+building it, and the closing measurement under SSB-3 now bounds what it could
+have won. A trained `EXPAND/DEFER` head decides two things. Which GAP goes
+first is bounded by the order oracle at `+0.015` edit and zero exact. How many
+go per round is not bounded by that oracle, so it was tested separately with
+`--selection-policy threshold`: a validation sweep picked `tau 0.10` for
+`+1.52 pp` token and `+1.95 pp` exact, and the untouched test split returned
+`-1.64 pp` and `-1.41 pp`. Both halves of the head are therefore measured, and
+neither pays. Build it only if the action model's own accuracy rises far enough
+to make context ordering matter.
 
 **Artifacts:** `counterfactual_defer_2k`, `counterfactual_defer_lookahead_2k`,
 `counterfactual_defer_predicted`, `counterfactual_defer_hybrid_sweep`, and

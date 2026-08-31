@@ -205,6 +205,24 @@ Use this before proposing any change to the objective, the selector, or the
 training states. It reports whether a stratum's failure is recoverable at all
 under this checkpoint.
 
+Price the expansion order itself, in output quality rather than in action
+correctness. This runs the decoder with greedy tokens so only the order varies,
+and compares the deployed confidence policy against random orders drawn at the
+same budget:
+
+```powershell
+.\.venv-modernbert\Scripts\python.exe `
+  selective_semantic_branching/diagnose_expansion_order_oracle.py `
+  --device cuda --artifact-dir artifacts/selective_semantic_branching_ssb2_gold_control
+```
+
+`evaluate.py --selection-policy` exposes the same controls for full rollouts:
+`confidence` is the default fixed-share top-k rule, `threshold` replaces the
+fixed share with `--selection-threshold`, a probability every committed action
+must reach, and `random` is the equal-NFE control. Neither alternative is
+recommended; both exist because they are what made the measurement possible.
+See SSB-3 and SSB-10 in [ISSUES.md](ISSUES.md).
+
 Compare the candidate root pivots against each other on that same canvas:
 
 ```powershell
