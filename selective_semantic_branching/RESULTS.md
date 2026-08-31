@@ -856,3 +856,74 @@ sampling.
 
 Nothing about the model, the grammar, or the schedule changed. The default
 decode path returns three values as before, with a test pinning it.
+
+## Scaling the fine-tuning corpus: a third negative, now compute-controlled
+
+Every SSB objective change since the base run has been fine-tuned on 4,096
+documents, including the SSB-1 root marginalization that is this workspace's only
+success and every paired pilot since. Only the base checkpoint ever saw the full
+accepted corpus, so scaling the fine-tuning stage was untested even though the
+repository has twice recorded data scaling as negative.
+
+Scaling documents at fixed epochs also scales optimizer steps, so a compute
+control is required. Three runs from the same SSB-1 checkpoint, same seed, batch
+64, top four layers:
+
+| run | unique documents | optimizer steps |
+|---|---:|---:|
+| A' | `4,096` | `128` |
+| B | full accepted corpus | `~810` |
+| C | `4,096`, repeated | `832` |
+
+`B` against `A'` is data and compute together. `B` against `C` is data alone at
+matched compute.
+
+| teacher-forced validation | A' | B | C |
+|---|---:|---:|---:|
+| objective | `4.2874` | `4.1752` | **`4.1392`** |
+| token NLL | `3.8150` | `3.7639` | **`3.7010`** |
+| marker NLL | `0.9564` | `0.9163` | **`0.9088`** |
+
+`C` wins. It sees `6.3x` fewer unique documents and reaches a better held-out
+objective than `B`, so the `A'` to `B` gain is optimizer steps rather than new
+text. The data axis alone points the wrong way.
+
+The ceiling did not move at all:
+
+| Track A test | A' | B | C |
+|---|---:|---:|---:|
+| **one-masked oracle** | **`65.03%`** | **`65.03%`** | `64.31%` |
+| all-masked fill | `25.87%` | `26.89%` | `25.87%` |
+| emission, round 0 | `12.80%` | `14.22%` | `13.74%` |
+| emission, round 2 | `60.40%` | `60.90%` | `58.40%` |
+| emission, hard bin | `29.27%` | `29.62%` | `29.62%` |
+
+A `6.3x` corpus did not widen the backbone's reach by a single point. Round zero
+moved `+1.42 pp`, and `C` captured most of that without any new text.
+
+The deployed metric did not move either. Ranking sixteen draws by the
+length-normalized derivation score, on the untouched test split:
+
+| Track A test | A' | B | C |
+|---|---:|---:|---:|
+| **reranked exact** | **`8.06%`** | **`8.06%`** | `6.64%` |
+| reranked edit | `0.19072` | `0.19621` | `0.19362` |
+| reranked length match | `14.22%` | `14.22%` | `15.17%` |
+| expected exact | `2.15%` | `2.22%` | `1.81%` |
+| oracle exact | `12.32%` | `10.90%` | `9.95%` |
+| oracle length match | `71.09%` | `76.30%` | `77.25%` |
+
+Reranked exact is identical between `A'` and `B` to the digit, and `C` is worse.
+More training does shift the sample distribution, tightening it toward better
+length coverage, since the length oracle rises from `71.09%` to `77.25%` while
+the exact oracle falls from `12.32%` to `9.95%`. None of that reached a
+deployable number.
+
+This is the third independent negative for data scaling in this repository and
+the first with a compute-matched control, so the earlier two results extend to
+SSB and to the root-marginalization objective. Fine-tuning on 4,096 documents is
+not what limits this model.
+
+It is also the fourth time a teacher-forced improvement failed to reach the
+generated output. Validation objective improved `0.148` nat from `A'` to `C`
+while reranked exact fell `1.42 pp`. SSB-7 remains owed.

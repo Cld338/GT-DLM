@@ -200,6 +200,30 @@ trees, while the target outcome is mixed-tree free rollout quality.
 **Gate:** checkpoint selection uses a small deterministic rollout composite and
 outperforms NLL-only selection on held-out seeds.
 
+## SSB-14 — Fine-tuning corpus size
+
+**Status:** closed; scaling the fine-tuning stage is neutral to negative
+
+Every objective change since the base run, including SSB-1, was fine-tuned on
+4,096 documents. A three-point ladder from the same SSB-1 checkpoint compared
+`4,096 x 2` epochs, the full accepted corpus at `2` epochs, and `4,096 x 13`
+epochs, the last matching the full corpus run's optimizer steps.
+
+At matched compute the repeated small corpus wins on held-out objective
+(`4.1392` against `4.1752`) and token NLL (`3.7010` against `3.7639`), so the
+gain from scaling documents is optimizer steps rather than new text. The
+one-masked oracle stayed at `65.03%`, `65.03%`, and `64.31%`, so a `6.3x` corpus
+widened the backbone's reach by nothing. Reranked exact on the untouched test
+split was `8.06%`, `8.06%`, and `6.64%`.
+
+This is the repository's third independent negative on data scaling and the
+first with a compute control, so the earlier two extend to SSB. Do not scale the
+fine-tuning corpus again without first moving the oracle by another means.
+
+**Artifacts:** `selective_semantic_branching_data_a_4k_e2`,
+`selective_semantic_branching_data_b_full_e2`,
+`selective_semantic_branching_data_c_4k_e13`
+
 ## SSB-8 — Limited backbone adaptation
 
 **Status:** queued; low priority
