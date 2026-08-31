@@ -106,7 +106,7 @@ failed its first training batch with CUDA OOM and must not be used on this GPU.
 
 Use 50% as the balanced default rollout schedule. Use 25% when generated-length
 calibration and over-generation control are more important than matched-length
-token precision. See [ANALYSIS.md](ANALYSIS.md) for the selection rationale.
+token precision.
 
 Re-evaluate an existing checkpoint without retraining:
 
@@ -150,6 +150,11 @@ GPU: batch 64 crossed the dedicated-memory limit directly, while a longer batch
 Both cases spilled into shared GPU memory. Rollout scores are cached per prompt,
 so repeated samples pay for candidate re-encoding once rather than once per
 sample.
+
+The probability model, what the training objective actually minimizes, and the
+decomposition that accounts for the closed results are in
+[ANALYSIS.md](ANALYSIS.md). It also states the test any new proposal should pass
+before it costs a training run.
 
 Verified runs are summarized in [RESULTS.md](RESULTS.md).
 [THEORY.md](THEORY.md) derives from those measurements which remaining gaps are
