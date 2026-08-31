@@ -154,7 +154,8 @@ ranking bottleneck: better root ranks alone do not fix mixed-depth descendants.
 
 ## SSB-6 — Missing-length identifiability
 
-**Status:** Phase 1 data audit complete; evaluation strata still in progress
+**Status:** span recoverability resolved; fixed Track A/B strata built and
+loadable; length identifiability still open
 
 Uniform corruption draws missing length mostly independently of visible
 semantics. Exact per-prompt length recovery can therefore be unidentifiable;
@@ -221,8 +222,9 @@ safe.
 
 ## SSB-10 — Budget-conditioned learned DEFER policy
 
-**Status:** screened; learned regret ranker rejected, predicted lookahead
-rejected for the main path and retained as an opt-in mode
+**Status:** closed; learned regret ranker rejected, predicted lookahead
+rejected for the main path and retained as an opt-in mode, and the hierarchical
+head deliberately never built
 
 Max-joint confidence measures certainty of the current action, not the utility
 of expanding that GAP now. Add an explicit hierarchical `EXPAND/DEFER` head
