@@ -806,3 +806,53 @@ were all closed. This one is opened as SSB-13.
 
 Best-of-n is a `16x` decode cost as a deployment, although the evaluation
 already draws those samples to compute its expectations.
+
+## SSB-13: a target-free reranker captures most of the exact-match headroom
+
+The sample oracle only bounds what a reranker could win. This is the reranker.
+
+The decoder now optionally returns the log-probability of the derivation that
+produced each sample: the sum of every committed action plus the root empty
+decision. That decision being inside the score is what makes candidates of
+different lengths comparable without an invented normalizer, which was the
+obstacle recorded with SSB-13. A length-normalized variant is screened beside
+it precisely because it is invented, so validation rather than taste decides,
+and a `longest` policy is included as a control that ignores the score.
+
+Validation chose the normalized variant on all three metrics. Applied once to
+the untouched test split:
+
+| Track A test, 211 prompts, 16 draws | edit | exact | length match |
+|---|---:|---:|---:|
+| expected draw (deployed) | `0.10839` | `2.15%` | `11.40%` |
+| derivation log-probability | `0.17762` | `7.58%` | `12.32%` |
+| **length-normalized** | **`0.19072`** | **`8.06%`** | **`14.22%`** |
+| longest draw (control) | `0.07532` | `0.00%` | `5.21%` |
+| oracle over draws | `0.35661` | `12.32%` | `71.09%` |
+
+Validation, where the choice was made, gave `0.16240`, `5.39%`, and `11.76%` for
+the same policy against `0.09581`, `1.35%`, and `12.07%` expected.
+
+Exact reconstruction rises from `2.15%` to `8.06%`, which is `58%` of the
+available oracle gap and the largest quality improvement measured in this
+workspace. Edit rises `76%`, capturing `33%` of its gap. The `longest` control
+is far worse than the expectation everywhere, so the gain is not a length
+artifact.
+
+This is also the first intervention here whose validation-selected setting
+reproduced on the untouched split. SSB-4, SSB-5, SSB-10, and the threshold
+policy all reversed at this step.
+
+Length is the exception and it is the interesting one. The reranker moves length
+match by `+2.82 pp` against an oracle gap of `59.69 pp`, so it captures under
+`5%` of what is there. The derivation score is dominated by lexical terms and
+does not know which candidate has the right number of tokens, even though some
+candidate almost always does. Length remains a selection failure with no scorer
+that can see it.
+
+The cost is honest: this is a `16x` decode. The expectation row does not improve
+by drawing more samples, so the whole `16x` buys the reranking rather than the
+sampling.
+
+Nothing about the model, the grammar, or the schedule changed. The default
+decode path returns three values as before, with a test pinning it.

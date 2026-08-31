@@ -218,6 +218,19 @@ it, per difficulty bin:
 Length match is `11.40%` expected against `71.09%` for the best of sixteen
 draws, so length is mostly a selection failure. See SSB-13.
 
+Then try to recover that headroom with a score that sees no target:
+
+```powershell
+.\.venv-modernbert\Scripts\python.exe `
+  selective_semantic_branching/screen_sample_reranker.py `
+  --device cuda --track-split validation
+```
+
+Ranking sixteen draws by their length-normalized derivation log-probability
+raises exact reconstruction from `2.15%` to `8.06%` on the untouched test split,
+at a `16x` decode cost. It barely moves length match, which is where most of the
+oracle still sits.
+
 Price the expansion order itself, in output quality rather than in action
 correctness. This runs the decoder with greedy tokens so only the order varies,
 and compares the deployed confidence policy against random orders drawn at the

@@ -392,7 +392,8 @@ non-empty prompts.
 
 ## SSB-13 — The decoder cannot pick its own best sample
 
-**Status:** open; the largest measured headroom in this workspace
+**Status:** open; content half addressed by a reranker that reproduced on the
+untouched split, length half still unexploited
 
 Every reported metric is an expectation over stochastic draws, and `86%` of the
 sixteen draws per prompt are distinct sequences. The best draw is far better
@@ -425,3 +426,19 @@ was.
 
 **Cost note:** best-of-n is an `n`-fold decode as a deployment. The gate should
 report quality against decode cost, not quality alone.
+
+**Result, content half:** the decoder can now return each sample's derivation
+log-probability, the sum of every committed action plus the root empty decision,
+which sidesteps the obstacle above because the empty decision is inside the
+score. Validation chose a length-normalized variant and the untouched test split
+reproduced it: exact rose from `2.15%` to `8.06%` and edit from `0.10839` to
+`0.19072`, capturing `58%` and `33%` of their oracle gaps. A `longest` control
+scored far below the expectation, so the gain is not a length artifact. This is
+the first validation-selected setting in this workspace to survive the split
+change.
+
+**Open, length half:** the same policy moves length match `+2.82 pp` against an
+oracle gap of `59.69 pp`. The derivation score is dominated by lexical terms and
+cannot see which candidate has the right token count, though some candidate
+almost always does. A length-aware candidate score is the remaining work here,
+and it is worth more than the content half was.

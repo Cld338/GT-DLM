@@ -1715,6 +1715,7 @@ def decode_frontier_model(
     defer_lookahead_weight: float = 1.0,
     selection_policy: str = "confidence",
     selection_threshold: float = 0.0,
+    return_action_logp: bool = False,
 ) -> Tuple[List[List[List[int]]], List[int], List[bool]]:
     """Score every open gap, then expand a configurable subset per round.
 
@@ -1756,16 +1757,28 @@ def decode_frontier_model(
         raise ValueError("threshold selection needs a probability in (0,1]")
     if selection_policy == "random" and generator is None:
         raise ValueError("random selection requires a generator")
+    if return_action_logp and not (
+        getattr(model, "marginal_preserving_joint", False)
+        or getattr(model, "direct_joint_actions", False)
+    ):
+        raise ValueError(
+            "the derivation log-probability needs the joint token/marker head"
+        )
     selection_threshold_logp = (
         math.log(selection_threshold)
         if selection_policy == "threshold" else -math.inf
     )
+    # The derivation log-probability sums every committed action and the root
+    # empty decision, so candidates of different lengths stay comparable
+    # without an invented normalizer.
+    action_logp = [0.0] * len(examples)
     if chunk_size is not None and len(examples) > chunk_size:
         predictions: List[List[List[int]]] = []
         rounds: List[int] = []
         unfinished: List[bool] = []
+        scores: List[float] = []
         for start in range(0, len(examples), chunk_size):
-            chunk_predictions, chunk_rounds, chunk_unfinished = decode_frontier_model(
+            chunk = decode_frontier_model(
                 model,
                 examples[start : start + chunk_size],
                 vocab,
@@ -1792,10 +1805,15 @@ def decode_frontier_model(
                 defer_lookahead_weight=defer_lookahead_weight,
                 selection_policy=selection_policy,
                 selection_threshold=selection_threshold,
+                return_action_logp=return_action_logp,
             )
-            predictions.extend(chunk_predictions)
-            rounds.extend(chunk_rounds)
-            unfinished.extend(chunk_unfinished)
+            predictions.extend(chunk[0])
+            rounds.extend(chunk[1])
+            unfinished.extend(chunk[2])
+            if return_action_logp:
+                scores.extend(chunk[3])
+        if return_action_logp:
+            return predictions, rounds, unfinished, scores
         return predictions, rounds, unfinished
     model.eval()
     if sample_tokens is None:
@@ -1896,6 +1914,14 @@ def decode_frontier_model(
                 marker_values = samples.remainder(4)
             chosen_device[gap_mask] = generated_ids[token_indices]
             joint_markers_device[gap_mask] = marker_values
+            if return_action_logp:
+                node_rows = torch.arange(nodes, device=device)
+                chosen_logp_device = torch.zeros_like(
+                    tokens, dtype=joint_logp.dtype
+                )
+                chosen_logp_device[gap_mask] = joint_logp[
+                    node_rows, token_indices, marker_values
+                ]
             if root_lookahead_ranker is not None and bool(steps.eq(0).all()):
                 from selective_semantic_branching.root_lookahead import (
                     rerank_root_actions,
@@ -1926,6 +1952,10 @@ def decode_frontier_model(
                 joint_markers_device[root_rows, root_positions] = root_markers
             chosen = chosen_device.cpu()
             joint_markers = joint_markers_device.cpu()
+            if return_action_logp:
+                chosen_logp = chosen_logp_device.cpu()
+                stop_logp = torch.nn.functional.logsigmoid(root_stop).cpu()
+                keep_logp = torch.nn.functional.logsigmoid(-root_stop).cpu()
         elif stochastic and sample_tokens:
             gap_confidence[gap_mask] = allowed[gap_mask].log_softmax(dim=-1).amax(
                 dim=-1
@@ -2079,7 +2109,13 @@ def decode_frontier_model(
                     expanded_opened.append(canvas_opened[index][position])
                     continue
                 if initial and bool(stop[row, position]):
+                    if return_action_logp:
+                        action_logp[index] += float(stop_logp[row, position])
                     continue
+                if return_action_logp:
+                    if initial:
+                        action_logp[index] += float(keep_logp[row, position])
+                    action_logp[index] += float(chosen_logp[row, position])
                 pivot = int(chosen[row, position])
                 child_count = int(degree[row, position])
                 unary_direction = int(direction[row, position])
@@ -2139,6 +2175,8 @@ def decode_frontier_model(
                 for gap_index in range(len(example.spans))
             ]
         )
+    if return_action_logp:
+        return predictions, rounds, unfinished, action_logp
     return predictions, rounds, unfinished
 
 
@@ -2165,8 +2203,15 @@ def sample_frontier_rollouts(
     defer_lookahead_weight: float = 1.0,
     selection_policy: str = "confidence",
     selection_threshold: float = 0.0,
+    return_scores: bool = False,
 ) -> Tuple[List[List[List[int]]], List[List[int]], List[List[bool]]]:
-    """Draw ancestral samples without supplying a target length or canvas."""
+    """Draw ancestral samples without supplying a target length or canvas.
+
+    With ``return_scores`` each sample also carries the log-probability of the
+    derivation that produced it, including the root empty decision, which is the
+    only score that compares candidates of different lengths without an invented
+    normalizer.
+    """
     if samples_per_prompt < 1:
         raise ValueError("samples_per_prompt must be positive")
     if chunk_size < 1:
@@ -2177,6 +2222,7 @@ def sample_frontier_rollouts(
     samples: List[List[List[int]]] = [[] for _ in examples]
     rounds: List[List[int]] = [[] for _ in examples]
     unfinished: List[List[bool]] = [[] for _ in examples]
+    scores: List[List[float]] = [[] for _ in examples]
     replicas = [
         (index, example)
         for index, example in enumerate(examples)
@@ -2187,7 +2233,7 @@ def sample_frontier_rollouts(
     root_lookahead_cache = {} if root_lookahead_ranker is not None else None
     for start in range(0, len(replicas), chunk_size):
         batch = replicas[start : start + chunk_size]
-        predictions, batch_rounds, batch_unfinished = decode_frontier_model(
+        decoded = decode_frontier_model(
             model,
             [example for _, example in batch],
             vocab,
@@ -2213,13 +2259,17 @@ def sample_frontier_rollouts(
             defer_lookahead_weight=defer_lookahead_weight,
             selection_policy=selection_policy,
             selection_threshold=selection_threshold,
+            return_action_logp=return_scores,
         )
-        for (owner, _), prediction, steps, failed in zip(
-            batch, predictions, batch_rounds, batch_unfinished
+        predictions, batch_rounds, batch_unfinished = decoded[:3]
+        batch_scores = decoded[3] if return_scores else [0.0] * len(batch)
+        for (owner, _), prediction, steps, failed, score in zip(
+            batch, predictions, batch_rounds, batch_unfinished, batch_scores
         ):
             samples[owner].append(prediction[0])
             rounds[owner].append(steps)
             unfinished[owner].append(failed)
+            scores[owner].append(score)
         if device.type == "cuda":
             # Dynamic canvases have different widths across prompts. Under
             # Windows WDDM, retaining all allocator slabs caused reserved
@@ -2227,6 +2277,8 @@ def sample_frontier_rollouts(
             # live tensors staying below 3 GiB. Return inactive slabs after
             # every replica chunk for every frontier rollout mode.
             torch.cuda.empty_cache()
+    if return_scores:
+        return samples, rounds, unfinished, scores
     return samples, rounds, unfinished
 
 
