@@ -1,0 +1,9 @@
+[submodule "selective_semantic_branching/dreamon/DreamOn"]
+	path = selective_semantic_branching/dreamon/DreamOn
+	url = https://github.com/Cld338/DreamOn.git
+[submodule "selective_semantic_branching/third_party/DiffuLLaMA"]
+	path = selective_semantic_branching/third_party/DiffuLLaMA
+	url = https://github.com/HKUNLP/DiffuLLaMA.git
+[submodule "selective_semantic_branching/third_party/dllm"]
+	path = selective_semantic_branching/third_party/dllm
+	url = https://github.com/ZHZisZZ/dllm.git
