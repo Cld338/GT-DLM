@@ -18,7 +18,13 @@ from experiment_text_depth_inside import (
     evaluate_depth_likelihoods,
 )
 from experiment_text_inside import sample_inside_lengths
+from exposure_gap import (
+    pivot_posterior_marginals,
+    self_boundary_token_loss,
+    self_token_topology_loss,
+)
 from gtdlm.model import PretrainedIntervalInsideModel
+from shape_prior import posterior_mean_token_depth
 from gtdlm.text_data import (
     DynamicTextExampleDataset,
     random_length_windows,
@@ -82,6 +88,12 @@ def train_pretrained_depth(
         model.train()
         exact_total = 0.0
         lexical_total = 0.0
+        topology_total = 0.0
+        boundary_total = 0.0
+        depth_total = 0.0
+        topology_batches = 0
+        boundary_batches = 0
+        depth_batches = 0
         example_count = 0
         token_count = 0
         for examples in loader:
@@ -91,15 +103,23 @@ def train_pretrained_depth(
                 if mixed_precision
                 else contextlib.nullcontext()
             )
+            exposure = bool(
+                args.self_topology_weight
+                or args.self_boundary_weight
+                or args.shape_prior_weight
+            )
             with autocast:
-                exact, _ = depth_batch_log_likelihoods(
+                outputs = depth_batch_log_likelihoods(
                     model,
                     examples,
                     vocab,
                     device,
                     args.penalty_start_depth,
                     args.late_depth_child_penalty,
+                    return_internals=exposure,
                 )
+                exact = outputs[0]
+                internals = outputs[2] if exposure else None
                 loss = -exact.mean()
                 lexical_logp = exact.new_empty(0)
                 if args.lexical_weight:
@@ -108,6 +128,45 @@ def train_pretrained_depth(
                     )
                     if lexical_logp.numel():
                         loss = loss - args.lexical_weight * lexical_logp.mean()
+                if exposure and internals["records"]:
+                    # One extra backward through the O(D n^3) chart only;
+                    # it stops at the local scores, not at the backbone.
+                    marginals = pivot_posterior_marginals(
+                        exact, internals["flat_scores"]
+                    )
+                    if args.self_topology_weight:
+                        term = self_token_topology_loss(
+                            model,
+                            internals,
+                            marginals,
+                            args.penalty_start_depth,
+                            args.late_depth_child_penalty,
+                        )
+                        if term is not None:
+                            loss = loss + args.self_topology_weight * term
+                            topology_total += float(term.detach())
+                            topology_batches += 1
+                    if args.self_boundary_weight:
+                        term = self_boundary_token_loss(
+                            model,
+                            internals,
+                            marginals,
+                            args.self_boundary_probability,
+                            substitute=not args.self_boundary_control,
+                        )
+                        if term is not None:
+                            loss = loss + args.self_boundary_weight * term
+                            boundary_total += float(term.detach())
+                            boundary_batches += 1
+                    if args.shape_prior_weight:
+                        # Penalise the posterior itself, not the local weights:
+                        # a depth bias inside the likelihood is absorbable by
+                        # the topology head. See research/CHAIN_COLLAPSE.md.
+                        term = posterior_mean_token_depth(exact, internals)
+                        if term is not None:
+                            loss = loss + args.shape_prior_weight * term
+                            depth_total += float(term.detach())
+                            depth_batches += 1
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -135,6 +194,15 @@ def train_pretrained_depth(
             "training_sequence_nll": exact_total / max(example_count, 1),
             "training_lexical_nll": (
                 lexical_total / token_count if token_count else None
+            ),
+            "training_self_topology_loss": (
+                topology_total / topology_batches if topology_batches else None
+            ),
+            "training_self_boundary_nll": (
+                boundary_total / boundary_batches if boundary_batches else None
+            ),
+            "training_posterior_mean_token_depth": (
+                depth_total / depth_batches if depth_batches else None
             ),
             "validation_sequence_nll": validation_likelihood["sequence_nll"],
         }
@@ -181,6 +249,41 @@ def main() -> None:
     parser.add_argument("--weight-decay", type=float, default=0.01)
     parser.add_argument("--warmup-ratio", type=float, default=0.1)
     parser.add_argument("--lexical-weight", type=float, default=0.0)
+    parser.add_argument(
+        "--self-topology-weight",
+        type=float,
+        default=0.0,
+        help="weight on the topology head trained under its own sampled token",
+    )
+    parser.add_argument(
+        "--self-boundary-weight",
+        type=float,
+        default=0.0,
+        help="weight on token scoring against self-generated boundary tokens",
+    )
+    parser.add_argument(
+        "--self-boundary-probability",
+        type=float,
+        default=1.0,
+        help="per-side probability of replacing a gold boundary token",
+    )
+    parser.add_argument(
+        "--shape-prior-weight",
+        type=float,
+        default=0.0,
+        help=(
+            "weight on the posterior mean token depth, the shape prior that"
+            " the topology head cannot absorb"
+        ),
+    )
+    parser.add_argument(
+        "--self-boundary-control",
+        action="store_true",
+        help=(
+            "matched control: keep the auxiliary and its record draw but leave"
+            " the gold boundaries in place, isolating the substitution"
+        ),
+    )
     parser.add_argument("--examples", type=int, default=128)
     parser.add_argument("--samples-per-prompt", type=int, default=32)
     parser.add_argument("--penalty-start-depth", type=int, default=4)

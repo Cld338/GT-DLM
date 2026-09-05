@@ -551,12 +551,15 @@ class TextGapProposalDataset(Dataset):
                     actions = [-100]
                     left_targets = [-100]
                     right_targets = [-100]
+                    node_ids = [-100]
+                    node_offset = 0
                     for gap_index, (span, tree) in enumerate(zip(example.spans, trees)):
                         context = list(example.segments[gap_index])
                         tokens.extend(context)
                         actions.extend([-100] * len(context))
                         left_targets.extend([-100] * len(context))
                         right_targets.extend([-100] * len(context))
+                        node_ids.extend([-100] * len(context))
                         frontier = make_tree_frontier(
                             span,
                             tree,
@@ -568,22 +571,43 @@ class TextGapProposalDataset(Dataset):
                         actions.extend(frontier[1])
                         left_targets.extend(frontier[2])
                         right_targets.extend(frontier[3])
+                        identity_frontier = make_tree_frontier(
+                            list(range(node_offset, node_offset + len(span))),
+                            tree,
+                            level,
+                            -1,
+                            -2,
+                        )
+                        node_ids.extend([
+                            int(action_id) if int(action_id) >= 0 else int(canvas_id)
+                            if int(canvas_id) >= 0 else -100
+                            for canvas_id, action_id in zip(
+                                identity_frontier[0], identity_frontier[1]
+                            )
+                        ])
+                        node_offset += len(span)
                     context = list(example.segments[-1])
                     tokens.extend(context)
                     actions.extend([-100] * len(context))
                     left_targets.extend([-100] * len(context))
                     right_targets.extend([-100] * len(context))
+                    node_ids.extend([-100] * len(context))
                     tokens.append(vocab.RIGHT)
                     actions.append(-100)
                     left_targets.append(-100)
                     right_targets.append(-100)
+                    node_ids.append(-100)
                     self.examples.append(
                         {
                             "tokens": tokens,
                             "targets": actions,
                             "left_targets": left_targets,
                             "right_targets": right_targets,
+                            "node_ids": node_ids,
                             "step": level,
+                            "target_length": sum(
+                                len(value) for value in example.spans
+                            ),
                         }
                     )
 

@@ -455,19 +455,108 @@ def collate_compact_frontiers(
     width = batch["tokens"].size(1)
     left = torch.full((len(examples), width), -100, dtype=torch.long)
     right = torch.full((len(examples), width), -100, dtype=torch.long)
+    semantic = torch.full((len(examples), width), -100, dtype=torch.long)
+    node_ids = torch.full((len(examples), width), -100, dtype=torch.long)
+    node_depths = torch.full((len(examples), width), -100, dtype=torch.long)
+    node_ages = torch.full((len(examples), width), -100, dtype=torch.long)
+    compatible_width = max(
+        (len(example.get("compatible_root_tokens", [])) for example in examples),
+        default=0,
+    )
+    compatible_root_tokens = torch.full(
+        (len(examples), compatible_width), -100, dtype=torch.long
+    )
+    compatible_root_markers = torch.full(
+        (len(examples), compatible_width), -100, dtype=torch.long
+    )
+    compatible_action_width = max(
+        (
+            len(actions)
+            for example in examples
+            for actions in example.get("compatible_action_tokens", [])
+        ),
+        default=0,
+    )
+    compatible_action_tokens = torch.full(
+        (len(examples), width, compatible_action_width),
+        -100,
+        dtype=torch.long,
+    )
+    compatible_action_markers = torch.full(
+        (len(examples), width, compatible_action_width),
+        -100,
+        dtype=torch.long,
+    )
     for row, example in enumerate(examples):
         left_values = example["left_targets"]  # type: ignore[assignment]
         right_values = example["right_targets"]  # type: ignore[assignment]
         left[row, : len(left_values)] = torch.tensor(left_values, dtype=torch.long)  # type: ignore[arg-type]
         right[row, : len(right_values)] = torch.tensor(right_values, dtype=torch.long)  # type: ignore[arg-type]
+        semantic_values = example.get("semantic_tokens", [])  # type: ignore[union-attr]
+        semantic[row, : len(semantic_values)] = torch.tensor(
+            semantic_values, dtype=torch.long
+        )
+        node_values = example.get("node_ids", [])  # type: ignore[union-attr]
+        node_ids[row, : len(node_values)] = torch.tensor(
+            node_values, dtype=torch.long
+        )
+        depth_values = example.get("node_depths", [])  # type: ignore[union-attr]
+        node_depths[row, : len(depth_values)] = torch.tensor(
+            depth_values, dtype=torch.long
+        )
+        age_values = example.get("node_ages", [])  # type: ignore[union-attr]
+        node_ages[row, : len(age_values)] = torch.tensor(
+            age_values, dtype=torch.long
+        )
+        compatible_tokens = example.get("compatible_root_tokens", [])
+        compatible_markers = example.get("compatible_root_markers", [])
+        if len(compatible_tokens) != len(compatible_markers):
+            raise ValueError("compatible root tokens and markers must align")
+        compatible_root_tokens[row, : len(compatible_tokens)] = torch.tensor(
+            compatible_tokens, dtype=torch.long
+        )
+        compatible_root_markers[row, : len(compatible_markers)] = torch.tensor(
+            compatible_markers, dtype=torch.long
+        )
+        node_tokens = example.get("compatible_action_tokens", [])
+        node_markers = example.get("compatible_action_markers", [])
+        if bool(node_tokens) != bool(node_markers):
+            raise ValueError("compatible node token and marker metadata must align")
+        if node_tokens and len(node_tokens) != len(example["tokens"]):
+            raise ValueError("compatible node actions must align with token positions")
+        if len(node_tokens) != len(node_markers):
+            raise ValueError("compatible node token and marker positions must align")
+        for position, (action_tokens, action_markers) in enumerate(
+            zip(node_tokens, node_markers)
+        ):
+            if len(action_tokens) != len(action_markers):
+                raise ValueError("compatible node tokens and markers must align")
+            compatible_action_tokens[
+                row, position, : len(action_tokens)
+            ] = torch.tensor(action_tokens, dtype=torch.long)
+            compatible_action_markers[
+                row, position, : len(action_markers)
+            ] = torch.tensor(action_markers, dtype=torch.long)
     batch["left_targets"] = left
     batch["right_targets"] = right
+    batch["semantic_tokens"] = semantic
+    batch["node_ids"] = node_ids
+    batch["node_depths"] = node_depths
+    batch["node_ages"] = node_ages
+    batch["compatible_root_tokens"] = compatible_root_tokens
+    batch["compatible_root_markers"] = compatible_root_markers
+    batch["compatible_action_tokens"] = compatible_action_tokens
+    batch["compatible_action_markers"] = compatible_action_markers
     batch["sample_weights"] = torch.tensor(
         [float(example.get("sample_weight", 1.0)) for example in examples],
         dtype=torch.float,
     )
     batch["regimes"] = torch.tensor(
         [int(example.get("regime", -100)) for example in examples],
+        dtype=torch.long,
+    )
+    batch["target_lengths"] = torch.tensor(
+        [int(example.get("target_length", -100)) for example in examples],
         dtype=torch.long,
     )
     return batch

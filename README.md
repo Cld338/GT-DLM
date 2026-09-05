@@ -1,5 +1,9 @@
 # Gap-Tree Diffusion Language Model (GT-DLM)
 
+The current main experimental workspace for unknown-length, partial-frontier
+generation is [`selective_semantic_branching/`](selective_semantic_branching/).
+Its local README and results file are the canonical documents for that new path.
+
 This repository contains a minimal research prototype for variable-length text
 infilling without a preallocated token canvas.
 
@@ -16,14 +20,25 @@ The optional left/right children are predicted jointly. This root/child typing
 is essential: allowing both an omitted child and a created child that immediately
 stops gives the same sequence duplicate derivations.
 
-All currently open gaps are expanded in parallel. With a balanced latent tree,
-an `n`-token span therefore needs logarithmically many model evaluations rather
-than one evaluation per inserted token.
+By default, all currently open gaps are expanded in parallel. With a balanced
+latent tree, an `n`-token span therefore needs logarithmically many model
+evaluations rather than one evaluation per inserted token. A diagnostic
+confidence-selective decoder can instead defer the lower-confidence descendant
+gaps with `--selective-gap-fraction`; it changes only rollout scheduling, not
+the trained likelihood or checkpoint.
+
+The current primary research direction is **semantic branching**: every active
+node emits a token and its `leaf/left/right/both` branch marker as one joint
+action, commits that token to the partial sentence, and re-encodes it on the
+next frontier round. This is distinct from the two-pass shape-then-fill
+scaffold, which remains as a control. See `research/SEMANTIC_BRANCHING.md`.
 
 ## Quick start
 
 ```powershell
 python -m unittest discover -s tests -v
+python experiment_text_frontier_reencode.py --device cuda --direct-joint-actions --no-detach-structure --initial-checkpoint artifacts/text_frontier_joint_control/frontier.pt --epochs 5 --artifact-dir artifacts/text_semantic_branching
+python evaluate_joint_frontier_rollouts.py --device cuda --artifact-dirs artifacts/text_semantic_branching_roberta_base --selective-gap-fraction 0.5 --output-dir artifacts/text_semantic_branching_selective_half
 python experiment.py --epochs 80 --device auto
 python ablate_stop.py --artifact-dir artifacts
 python ablate_children.py --artifact-dir artifacts
@@ -98,11 +113,142 @@ python measure_pretrain_task_mismatch.py --device cuda --examples 512 --artifact
 python prepare_wikitext_pilot.py --output-dir artifacts/wikitext_native --native-vocabulary --model-name distilroberta-base --cache-dir .hf_cache/hub --local-files-only --max-document-tokens 128 --max-train-documents 4000 --max-validation-documents 500 --max-test-documents 500
 python experiment_text_depth_inside_pretrained.py --device cuda --data-dir artifacts/wikitext_native --native-vocabulary --local-files-only --artifact-dir artifacts/text_depth_inside_native
 python experiment_pretrained_masked_baseline.py --device cuda --data-dir artifacts/wikitext_native --native-vocabulary --local-files-only --artifact-dir artifacts/text_pretrained_masked_native
+python experiment_pretrained_masked_baseline.py --device cuda --data-dir artifacts/wikitext_native_large --model-name FacebookAI/roberta-large --native-vocabulary --local-files-only --trainable-backbone-layers 4 --mixed-precision --attention-implementation sdpa --batch-size 4 --eval-batch-size 1 --epochs 2 --artifact-dir artifacts/text_pretrained_masked_roberta_large_top4
+python prepare_wikitext_pilot.py --output-dir artifacts/wikitext_native_modernbert_base --native-vocabulary --model-name answerdotai/ModernBERT-base --cache-dir .hf_cache/hub --dataset-config wikitext-103-raw-v1 --max-document-tokens 128 --max-train-documents 40000 --max-validation-documents 500 --max-test-documents 500 --seed 17
+python experiment_pretrained_masked_baseline.py --device cuda --data-dir artifacts/wikitext_native_modernbert_base --model-name answerdotai/ModernBERT-base --native-vocabulary --local-files-only --trainable-backbone-layers 0 --mixed-precision --attention-implementation eager --eval-batch-size 4 --evaluate-only --artifact-dir artifacts/text_pretrained_masked_modernbert_base_zeroshot
+python experiment_pretrained_masked_baseline.py --device cuda --data-dir artifacts/wikitext_native_modernbert_base --model-name answerdotai/ModernBERT-base --native-vocabulary --local-files-only --trainable-backbone-layers 4 --attention-implementation eager --batch-size 4 --eval-batch-size 4 --epochs 2 --artifact-dir artifacts/text_pretrained_masked_modernbert_base_top4
 python evaluate_native_inside_readout.py --device cuda
 python evaluate_prompt_attention.py --device cuda --local-files-only
 python experiment_text_depth_inside_pretrained.py --device cuda --data-dir artifacts/wikitext_native --native-vocabulary --fixed-mask-bank 8 --local-files-only --artifact-dir artifacts/text_depth_inside_fixed_mask_bank
 python analyze_single_gap_tree_scoring.py --device cuda
+python measure_exposure_gap.py --device cuda --artifact-dir artifacts/text_depth_inside_fixed_mask_bank
+python experiment_text_depth_inside_pretrained.py --device cuda --data-dir artifacts/wikitext_native --native-vocabulary --fixed-mask-bank 8 --local-files-only --self-boundary-weight 1 --artifact-dir artifacts/text_exposure_self_boundary
+python experiment_text_depth_inside_pretrained.py --device cuda --data-dir artifacts/wikitext_native --native-vocabulary --fixed-mask-bank 8 --local-files-only --self-boundary-weight 1 --self-boundary-control --artifact-dir artifacts/text_exposure_boundary_control
+python aggregate_exposure_gap.py
+python analyze_branching_length_family.py
+python analyze_length_parallelism_frontier.py
+python evaluate_rerank_decoding.py --device cuda --artifact-dir artifacts/text_depth_inside_fixed_mask_bank
+python diagnose_chain_collapse.py --device cuda --artifact-dir artifacts/text_depth_inside_fixed_mask_bank
+python diagnose_chain_collapse.py --device cuda --artifact-dir artifacts/text_depth_inside_native --output-dir artifacts/text_chain_collapse_pooled
+python experiment_text_depth_inside_pretrained.py --device cuda --data-dir artifacts/wikitext_native --native-vocabulary --fixed-mask-bank 8 --local-files-only --shape-prior-weight 2 --artifact-dir artifacts/text_shape_prior_w2p0
+python experiment_text_frontier_reencode.py --device cuda --local-files-only --epochs 5 --artifact-dir artifacts/text_frontier_reencode_weighted
+python evaluate_frontier_scaffold.py --device cuda
+python experiment_scaffold_topology.py --device cuda --local-files-only --regimes 4 --artifact-dir artifacts/text_scaffold_topology
+python experiment_scaffold_topology.py --device cuda --local-files-only --regimes 4 --state-feedback --artifact-dir artifacts/text_scaffold_topology_feedback
+python calibrate_scaffold_length_distribution.py --device cuda --topology-artifact-dir artifacts/text_scaffold_topology_feedback --artifact-dir artifacts/text_scaffold_topology_feedback_exact
+python evaluate_semantic_scaffold.py --device cuda
+python evaluate_continuous_scaffold.py --device cuda
+python experiment_unified_scaffold.py --device cuda --local-files-only --state-feedback --shape-checkpoint artifacts/text_scaffold_topology_feedback_exact/topology.pt --posterior-only --artifact-dir artifacts/text_scaffold_unified_exact_posterior
+python experiment_conditional_length.py --device cuda --epochs 8 --max-train-examples 2048 --artifact-dir artifacts/text_conditional_length_output_zero
+python probe_conditional_length_context.py --device cuda --train-examples 4096
+python experiment_conditional_length.py --device cuda --context-source gap --unified-lexical-artifact-dir artifacts/text_pretrained_masked_roberta_base --artifact-dir artifacts/text_conditional_length_gap_local_unified_roberta_base_seed23 --seed 23
+python evaluate_conditional_scaffold.py --device cuda --unified --chunk-size 16 --conditional-artifact-dir artifacts/text_conditional_length_gap_local_unified_roberta_base_seed23 --lexical-artifact-dir artifacts/text_pretrained_masked_roberta_base
+python evaluate_length_guided_rollout.py --device cuda --unified --chunk-size 16 --conditional-artifact-dir artifacts/text_conditional_length_gap_local_unified_roberta_base --lexical-artifact-dir artifacts/text_pretrained_masked_roberta_base
+python probe_conditional_length_context.py --device cuda --lexical-artifact-dir artifacts/text_pretrained_masked_roberta_base --artifact-dir artifacts/text_length_probe_finetuned_roberta_base
+python ablate_round_encoding.py --device cuda --unified --chunk-size 16 --conditional-artifact-dir artifacts/text_conditional_length_gap_local_unified_roberta_base --lexical-artifact-dir artifacts/text_pretrained_masked_roberta_base
+python evaluate_self_length_baseline.py --device cuda --unified --conditional-artifact-dir artifacts/text_conditional_length_gap_local_unified_roberta_base --lexical-artifact-dir artifacts/text_pretrained_masked_roberta_base
+python evaluate_length_extrapolation.py --device cuda --unified --chunk-size 16 --conditional-artifact-dir artifacts/text_conditional_length_gap_local_unified_roberta_base --lexical-artifact-dir artifacts/text_pretrained_masked_roberta_base
+python diagnose_emission_context.py --device cuda --artifact-dir artifacts/text_semantic_branching_roberta_base_zero_interaction
+python diagnose_iterative_fill.py --device cuda
+python experiment_text_frontier_reencode.py --device cuda --model-name FacebookAI/roberta-base --data-dir artifacts/wikitext_native --local-files-only --direct-joint-actions --no-detach-structure --zero-joint-interaction --decode-batch-size 16 --seed 17 --epochs 5 --initial-checkpoint artifacts/text_frontier_joint_control_roberta_base/frontier.pt --artifact-dir artifacts/text_semantic_branching_roberta_base_zero_interaction
 ```
+
+ModernBERT requires Python 3.9+ and Transformers 4.48+. On the tested RTX 2060
+SUPER with PyTorch 2.4.1, use eager attention and FP32 for training: SDPA caused
+non-finite gradients even though inference was valid. The top-four configuration
+peaks below 1 GiB allocated VRAM, so mixed precision and gradient checkpointing
+are unnecessary on an 8GB card.
+
+To train later frontier rounds on lexical histories produced by the model
+itself while keeping gold topology alignment, add
+`--generated-history-probability 0.5 --generated-history-warmup-epochs 2`.
+This remains experimental: the first smoke improves lexical rollout metrics but
+worsens the sampled length distribution.
+
+The completed 5-epoch run reverses that smoke-level diagnosis under 4,096
+ancestral samples: generated history improves length TV but costs token
+accuracy. A held-out seven-bias Monte Carlo calibration reaches TV `0.1670` and
+restores all-sample edit to parity, while matched token accuracy remains below
+the teacher-history direct model. See `research/SEMANTIC_BRANCHING.md`.
+
+A matched roberta-base scale-up is also complete. Scale raises uncalibrated
+teacher-history direct token accuracy from `8.77%` to `11.54%`. After equal
+Monte Carlo calibration, teacher-history roberta-base reaches edit `0.0801` and
+TV `0.1821`, while generated-history reaches `0.0756` and `0.1714`. The larger
+model helps lexical generation but does not remove the generated-history
+trade-off; calibrated teacher-history roberta-base is the current primary arm.
+Repeating that selected arm at training seeds 17, 23, and 41 gives calibrated
+edit `0.08026+/-0.00014`, token accuracy `7.64%+/-0.10`, and length TV
+`0.1962+/-0.0147`. Calibration improves edit in 3/3 seeds but TV in only 2/3,
+so lexical generation is reproducible while topology calibration remains the
+main source of variation.
+
+A differentiable projected rollout-length NLL is also implemented and tested,
+but rejected by its RoBERTa-base smoke gate. Although its internal validation
+NLL improves as its weight rises, actual 1,024-sample length TV worsens from
+`0.2061` at weight zero to `0.2197`, `0.2422`, and `0.2490`; applying it only at
+the root reaches `0.2744`. Recursively reusing one frontier's local degree law
+does not approximate the content-dependent re-encoded rollout. The next length
+objective must operate on actual sampled trajectories.
+
+That actual sampled-trajectory objective is now implemented too. It rolls out
+the direct joint generator with token commitment and re-encoding, and applies a
+structure-only score-function gradient from length-distribution energy distance.
+Four matched smoke settings were tested. Three worsen TV; the lowest-variance
+balanced-prior setting changes TV only `0.2061 -> 0.2051`, without an all-sample
+edit gain. It therefore also stops at the smoke gate. The implementation and
+tests remain, but a full run now waits on a lower-variance rollout-buffer or
+histogram-critic estimator rather than a larger loss weight.
+
+A robust seven-bias alternative is now implemented and evaluated. It uses
+multiple common-random-number search seeds, actual sampled token histories, a
+mean/worst CDF or direct-TV score, and independent multi-seed evaluation. One
+bias selected on training seed 17 transfers unchanged to seeds 23 and 41: over
+three rollout seeds per checkpoint, mean TV moves `0.2321 -> 0.1803` and
+all-sample edit `0.07091 -> 0.07374`. The edit guardrail passes in 9/9 streams,
+but the strict `TV -0.015` gate passes in 8/9; one seed-41 stream improves only
+`0.00195`. Several seed-41-specific CDF and TV refinements do not remove that
+failure. The result is a strong aggregate calibration improvement, not yet a
+uniform topology solution.
+
+The prescribed token/marker dependence ablation is now run, and it rejects the
+coupling. `--zero-joint-interaction` holds the low-rank interaction at its zero
+init and skips the term structurally. Matched at seeds 17, 23, and 41 with both
+arms sharing random numbers over 4,096 samples each, removing it gives the
+better held-out objective in 3/3 seeds and ties every generation metric on the
+mean (token accuracy `9.72%` against `9.66%`, all-sample edit `0.0694` against
+`0.0716`, length TV `0.2364` against `0.2354`). The seed-17 lexical advantage
+for the interaction reverses at seed 41. What changes is variance: token
+accuracy sample SD falls `1.82` to `0.14`. The interaction is the main source of
+this direction's lexical seed instability and buys nothing measurable, so it is
+rejected; token-at-branch emission, immediate commitment, and re-encoding all
+survive unchanged. See `research/SEMANTIC_BRANCHING.md`.
+
+Pooled multi-checkpoint worst-TV fitting is also complete and rejected before
+new-checkpoint training. It selects one bias across seed 17/23/41 and improves
+an independent 9-stream mean TV `0.2359 -> 0.1979`, with mean generated length
+`3.583` against the `3.586` target. But edit falls `0.07115 -> 0.06493`, its
+guardrail passes only 2/9 streams, and the strict TV count remains 8/9. A newly
+trained held-out checkpoint is therefore not justified by the staged protocol;
+direct pooled TV optimization is not the next objective without an explicit
+lexical constraint.
+
+Two diagnostics then closed the structural search. Semantic branching must emit
+a token at every node the moment it branches, and pricing that on one checkpoint
+gives emission `34.42%` top-1 against a one-position-masked oracle's `59.26%`,
+with the cost concentrated at the start: round zero scores `11.88%` against round
+two's `51.14%`, and `59%` of emitted tokens come from the two worst rounds. The
+constructive reading of that is to commit later, whose endpoint is the
+shape-then-fill scaffold this project already has.
+
+Moving the same idea to the scaffold, whose fill is a single pass, was then
+refuted before a decoder was written. Revealing gold neighbours takes its fill
+checkpoint `27.67% -> 57.29%`, but an actual confidence-ordered fill with no
+retraining gets monotonically worse (`27.67%`, `26.36%`, `25.93%`, `23.97%` at 1,
+2, 3 and 8 passes), because at `27.67%` top-1 about `72%` of every commitment is
+wrong. Break-even sits near `35`--`40%` single-pass accuracy. The headroom is
+real and unreachable by self-conditioning at this lexical quality. See
+`research/SEMANTIC_BRANCHING.md` and `research/FRONTIER_REENCODE.md`.
 
 The experiment writes its metrics and checkpoints to `artifacts/`.
 
@@ -565,6 +711,326 @@ prior ELBO NLL improves `25.829 -> 20.512`, and length TV improves
 `0.157 -> 0.126`. This is not a gold-posterior artifact. Generation moves much
 less: oracle-midpoint token accuracy is `9.80%`, while topology-aligned sampled
 rollout reaches `12.24%` on length-matched pairs against the native masked
-baseline's `20.04%`. The next blocker is gold-token/boundary exposure in the
-topology training path, not encoder likelihood. See
-`research/FIXED_MASK_BANK.md`.
+baseline's `20.04%`. See `research/FIXED_MASK_BANK.md`.
+
+That document named gold-token/boundary exposure as the next blocker. Measuring
+it first shows it is not. Dropping the gold pivot token from the topology head
+costs `0.005` nats, so the head barely uses it; self-generated boundaries do
+cost `0.487` nats of token NLL, but training against them loses `0.454` nats of
+test exact NLL, and a matched control that keeps the gold boundaries while
+adding the identical auxiliary reproduces the entire `-0.028` length-TV gain.
+The substitution therefore contributes nothing except cost. Without that control
+the treatment alone would have been recorded as a success. A measured train/test
+discrepancy is not by itself a reason to train against it. See
+`research/EXPOSURE_GAP.md`.
+
+Treating the rollout as the branching process it is then explains two older
+results and produces one new one. The generated length is the total progeny of a
+binary Galton-Watson tree, so the reachable length laws form a family. A
+depth-homogeneous process has `P(N=2) = b * P(N=1) < P(N=1)` for every parameter
+setting, so it cannot represent a flat corpus law at all; its TV floor is
+`0.2234`, and the depth-free exact model sat at `0.234`. That model failed the
+`TV < 0.20` gate for a representational reason, not a training one, and adding
+root-relative depth — recorded in `research/DEPTH_INSIDE.md` as an empirical
+repair — is exactly the minimal fix, since it frees `P(N=2) = b_0 a_1` from
+`P(N=1) = a_0`. Depth-indexing reaches TV `0` exactly, through a chain whose
+stop hazard is `1/(8-d)`, at a cost of `4.5` rollout rounds.
+
+That cost is the new result. Counting the expansion rounds the greedy rollout
+actually consumes gives `5.758` rounds for `5.758` emitted tokens, equal on all
+128 test prompts. A depth holding `k` open nodes emits `k` tokens while costing
+one round, so equality forces one open node per depth: **the model never selects
+the two-child topology, and natural-text generation is a pure chain at the same
+sequential cost as an autoregressive filler.** The opening claim of this file —
+logarithmically many evaluations rather than one per inserted token — holds on
+the synthetic task at `2.95` NFE and does not hold here. It also removes the
+excuse for the length defect: at `5.758` rounds the chain-only TV floor is zero,
+so the model's `0.126` is entirely fitting failure.
+
+The collapse has since been diagnosed, and it is not the decoder. The two-child
+topology carries `1.07%` of the model's own chart posterior, `1.90%` on the
+nodes wide enough to use it and `0.06%` at the root, so greedy is not discarding
+mass it holds; ancestral sampling does not branch either, at `0.937` tokens per
+round over 512 rollouts. At the root the posterior places `99.59%` on "right
+only", which recursed is left-to-right generation: that checkpoint has
+rediscovered autoregressive decoding.
+
+**The cause is the fixed mask bank.** The pooled native model shares corpus,
+tokenizer, seed, epochs, batch size and optimization settings with the bank
+model and differs only in whether each node reads eight native mask states or
+one pooled vector. It branches: `61.83%` two-child posterior at the root,
+`84.42%` two-child argmax there, `1.261` tokens per round, and posterior mean
+token depth `1.5428` against the chain's maximum of `2.3115`. The bank model
+gets `0.06%`, `0.00%`, `1.000` and `2.2748`. So the bank buys `4.5` nats of
+exact NLL and `0.03` of length TV, and spends the entire parallel saving — a
+trade that stayed invisible because rollout rounds had never been measured.
+
+An earlier reading of this blamed the objective: summing over every derivation
+makes tree shape invisible to the loss, so a sequential model sits at an
+optimum. That is necessary but not sufficient, and the pooled model refutes it
+as a complete explanation — same indifferent objective, and it branches anyway.
+Indifference lets the model concentrate on whichever shape it scores best; the
+encoder decides which shape that is.
+
+The mechanism is still open, and the obvious hypothesis is already dead.
+Bank slots are ordered left to right, and in a left-to-right chain a node's
+root-relative depth equals the position of the token it emits, so depth could
+have served as a slot index — which no other tree shape permits under
+length-blindness. Measured, the correlation between node depth and selected slot
+is `-0.104`. The bank is not a position index. See `research/CHAIN_COLLAPSE.md`.
+
+Decoding by the trained objective was then tried, since the exact chart is
+available once a candidate's length is known even though it is unavailable
+during generation. Sampling 16 candidates per prompt and selecting by the exact
+marginal, or by minimum Bayes risk, does not beat greedy on decoded character
+similarity (`0.214` and `0.288` against `0.308`); unrestricted MAP reranking
+collapses onto the empty string. That test is not clean — the candidate pool
+scores below greedy to begin with, and matched-pair counts are `10` to `17` — so
+it is recorded as negative-but-inconclusive. See
+`research/GENERATION_THEORY.md`.
+
+The replacement architecture removes the mask bank entirely. In
+`experiment_text_frontier_reencode.py` the model state is the current partial
+sequence: every open gap is one native mask token at its own position, all open
+gaps are scored in one backbone pass, and the partial sequence is re-encoded
+each round. No node reads a shared linear bank, and no target length enters the
+input. Trained jointly on tokens and topology it reaches only `13.74%`
+matched-length token accuracy, because emitting a token at every structural
+expansion and feeding it back compounds exposure.
+
+Splitting the two factors fixes that. Writing generation as
+`p(shape scaffold | prompt) * p(tokens | completed scaffold, prompt)`, the first
+factor expands gaps in parallel but emits native mask slots rather than lexical
+tokens, and the second fills every dynamically created slot in one native-MLM
+pass. Length is still the total progeny of the branching process, not a
+prediction. On 128 prompts with 32 samples each the scaffold reaches `21.32%`
+matched token accuracy against the oracle-length native masked baseline's
+`20.04%`, in `2.18` parallel shape rounds plus one lexical pass, with no
+unfinished samples. Lexical feasibility therefore passes without giving the
+model target length; length TV was `0.201` against the fixed bank's `0.126`, so
+shape became the isolated bottleneck.
+
+Shape was then given its own model: depth-indexed priors, zero-gated prompt
+residuals, and one categorical regime sampled per round and shared by all open
+gaps, with only `204,107` trainable shape parameters over a frozen encoder.
+Four shared regimes beat one (`0.155` against `0.164` TV). Regime scope
+ablations follow in `research/FRONTIER_REENCODE.md`: a single persistent regime
+(`0.195` empirical TV) and a Markov regime across depths (`0.190`) are both
+worse than independent per-round regimes (`0.181`), and validation-only
+calibration of local topology likelihood failed at `0.231`, because a better
+local topology score need not calibrate total progeny.
+
+What does calibrate it is exposing the already-realized process state
+`(completed slots, open gaps, depth)` and training against an exact total-progeny
+likelihood rather than local topology loss alone. This is not length prediction:
+the state is readable from the current scaffold at inference and carries no
+target information. Exactly marginalizing the context-free state-feedback
+process over those states and optimizing `657` shape parameters against the
+training length histogram reaches exact train TV `0.00069`; a 4,096-sample
+rollout obtains `0.0718` TV to the finite test histogram against `0.1812` for
+the previous best scaffold, with overflow at `0.024%` and `2.84` shape rounds.
+The architecture passes the shape criterion while remaining at roughly baseline
+lexical quality (`19.07%` on 300 matched pairs).
+
+Two attempts to reintroduce lexical information into shape then failed their
+validation gates. A node-local 16-way discrete code is learnable (code NLL
+`2.477` against `log 16 = 2.773`) and preserves lexical quality at `21.30%`, but
+every positive code logit bias reduced validation accuracy, so validation
+selected zero bias. A node-local continuous vector trained to reconstruct the
+frozen gold-token embedding reaches `23.01%` while the MLM ignores it, but every
+nonzero residual scale also lost on validation. A vector resembling an input
+token embedding is not a valid residual for a pretrained MLM's contextual
+computation; post-hoc semantic coupling is rejected, node-local state itself is
+not. See `research/FRONTIER_REENCODE.md`.
+
+A third coupling attempt inverts the direction: instead of injecting a node
+state into the final MLM, the shared backbone pass that already runs each round
+supplies a native token posterior for every open node, and that posterior
+reaches the *topology* heads through an attention path with a zero-initialized
+gate. The lexical path is untouched, and the measured KL to the native masked
+baseline stays at `0.000000`. It also fails. Trained on top of the exactly
+calibrated shape model, the coupling lowers validation frontier topology NLL
+from `1.712` to `1.229` and moves matched token accuracy only `21.04% ->
+21.51%`, within this family's sampling spread, while length TV doubles from
+`0.074` to `0.148` and overflow returns from `0.024%` to `2.5%`. Since
+checkpoint selection uses the local frontier objective, it selects against the
+length law the architecture is judged on. **A better local topology likelihood
+is not a better length law** — now shown three independent ways.
+
+Re-calibrating the unified model at equal footing then explains why, and
+settles what a single model can be asked to do. The exact chart fits better
+than it ever has (training TV `0.00030` against the split model's `0.00069`)
+while the sampled rollout gets worse (`0.148 -> 0.187`), because
+`scaffold_length_distribution` marginalizes a *context-free* process and the
+token-posterior coupling is not context-free: the two numbers describe
+different processes. This is not an argument against one model. Every unified
+row is one model — one frozen backbone, one native MLM head, shape heads on
+top, one backbone pass per growth round, and that same head filling the
+completed scaffold — and the unified model with the token-to-shape gate held at
+zero is the best configuration in the project, at `0.074` sampled TV and
+`21.04%` matched token accuracy, matching the two-checkpoint split (`0.0718`,
+`19.07%`) within sampling noise while running as one set of weights. What fails
+is only letting token beliefs steer branching: the moment shape depends on
+lexical content, the length law becomes prompt-conditioned and the project's
+only exact length objective stops applying. See
+`research/FRONTIER_REENCODE.md`.
+
+Conditional length was then made exactly trainable, and the result is negative
+in an informative way. If the shape logits read the prompt only through an
+encoding fixed at round zero, plus the realized state, the process stays
+context-free *given the prompt*, so the same total-progeny dynamic program runs
+per prompt and yields exact differentiable `p(length | prompt)` with no length
+head. That is implemented, and verified against a 20,000-sample Monte-Carlo
+rollout and against exact reduction to the shared chart at zero gate. Training
+only the residual path against `-log p(gold length | prompt)` moves held-out
+identifiable nats to `+0.00074` and `+0.00001` under two different nestings
+whose validation gains (`+0.0084`, `+0.0163`) do not transfer.
+
+An unconstrained categorical probe on the same tensors then locates the cause.
+Linear and MLP probes on the shape context and on the raw pooled backbone state
+also land at zero on test (`-0.0145` to `+0.0051`), so the length information is
+absent from the frozen mean-pooled representation the shape policy reads, and
+the branching parameterization is not what fails. This also corrects the
+comparison to the `+0.235` identifiable nats in
+`research/PRETRAINED_IDENTIFIABILITY.md`: that probe fine-tuned the backbone and
+read every position. The gap is encoder access, not the objective. See
+`research/FRONTIER_REENCODE.md`.
+
+Acting on that diagnosis turns the result positive. Two oracle probes were run
+first, and they redirected the work: the gold pivot token carries no held-out
+information about a node's marker in 3/3 probe seeds, which retires the
+token-to-shape coupling family as a property of the task rather than of any
+particular parameterization; and the length information absent from the
+mean-pooled state is present at the native `<mask>` GAP hidden state
+(`+0.0918` identifiable nats). Encoding the prompt once, reading the hidden
+state at that single GAP token, and holding it fixed through tree growth keeps
+the process context-free *given the prompt*, so the exact total-progeny chart
+still applies per prompt. There is still no length head, no target-length input
+and no preallocated canvas: length remains the number of emitted tree nodes.
+Trained this way, 102,450 shape parameters over a frozen backbone take
+per-prompt length matching from `11.30%` — at, in fact just below, the `11.94%`
+a prompt-blind sampler gets — to `23.02%`, inside one unified MLM that both
+grows the scaffold and fills it.
+
+Three controller seeds on each of two backbones then replicate it and separate
+the two effects that matter. Held-out identifiable nats are `0.2512+/-0.0079`
+on distilroberta and `0.3137+/-0.0062` on roberta-base, positive in 6/6 runs
+with non-overlapping families, while four times the training data changes
+nothing (`0.2499`) — the shortage is encoder access, not examples. Matched
+token accuracy is `20.34%+/-0.63` against that backbone's oracle-length masked
+baseline at `20.04%`, and `29.39%+/-0.96` against `27.45%` at roberta-base,
+where all three seeds are above the baseline. A model never told the target
+length now matches, then beats, one that is handed it, in `2.82`--`2.97` shape
+rounds plus one lexical pass.
+
+Two limits keep that from being a generation claim. The comparison is on the
+length-matched subset (`416`--`421` of `4096` samples) while the baseline is
+scored on all 128 oracle-length prompts; over every sample the scaffold's
+expected edit similarity is `0.2074` against `0.3280`, because only about a
+quarter of its samples hit the target length. And each family's baseline is a
+single checkpoint.
+
+Raising that match rate is the one quantity separating a matched-subset lead
+from an unconditional one, and attacking it directly has now located the real
+constraint. The scaffold computes `p(length | prompt)` exactly and then samples
+from it, so its length agreement is the chart's mass rather than its mode.
+Decoding at the mode instead — no target information, nothing retrained —
+raises length match `22.72% -> 27.89%` and `24.83% -> 32.55%` in 6/6 runs, and
+lands on the chart's own argmax accuracy to within noise, so the decoder now
+extracts everything the chart knows. It does not convert into text quality:
+expected edit similarity moves `-0.004` and `+0.012`, because conditioning on
+the mode costs `0.5`--`1.4` points of matched token accuracy.
+
+An oracle-length arm sizes what remains. At roberta-base, true length is worth
+`0.2074 -> 0.3324` expected edit similarity, a `0.1250` swing against a `0.1206`
+total gap to the oracle-length masked baseline — length selection is not one
+contributor to the deficit but the whole of it. Modal guidance recovers about a
+tenth of that, because the chart's mode is right only `32.8%` of the time. The
+binding constraint is the length distribution itself rather than the decoder
+that reads it.
+
+Locating that constraint required fixing the instrument. The probe used to bound
+what the shape path could know was reading the *base* pretrained backbone, while
+the controller reads the frozen lexical baseline's fine-tuned one — which is why
+it reported a `+0.0918` nat ceiling under a controller that scores `+0.3137`.
+Re-measured on the representation the controller actually reads, three probe
+seeds give `+0.3207+/-0.0322` linear and `+0.3111+/-0.0149` MLP against that
+`+0.3137+/-0.0062`. An unconstrained categorical probe, with no branching
+constraint and no exactness requirement, does not beat a 102,450-parameter
+total-progeny policy on the same tensor: the branching parameterization is at
+its input's ceiling and has no headroom left. Reading more positions at round
+zero is refuted outright, scoring `0.056` and `0.019` nats *below* the single
+GAP state.
+
+What does move the quantity is what the backbone was fine-tuned on. The same GAP
+position carries `+0.0918` nats before MLM fine-tuning and `+0.3404` after, a
+factor of `3.7`, while pooled states stay at zero either way. The length signal
+is concentrated at the mask position, which is where the corruption is and where
+masked-filling training applies its pressure. The remaining direction is to do
+deliberately what that fine-tuning did by accident.
+
+Separately, the cost model this project has used throughout turns out to have
+been counting passes that do nothing. Growth was billed at one backbone pass per
+round, but `unified_logits` does not forward `slot_semantics` into
+`structure_logits`, so the node-local token posterior that pass produces reaches
+neither the backbone encode nor the token head — only a topology coupling path
+that the conditional model discards in favour of its round-zero context.
+Dropping the pass is exactly output-preserving: every quality metric is
+identical to the digit in 3/3 seeds at 4,096 samples each, while backbone passes
+fall from `4.907+/-0.053` to exactly `2.000`.
+
+**A complete generation is therefore two backbone passes — one for the
+round-zero context, one for the parallel fill — whatever length it emits**,
+against one pass per token for a sequential filler. Two tests hold the
+invariant, one of which passes with randomly initialized coupling heads, so the
+property comes from the wiring rather than from a gate setting. This is not
+evidence that node-local token beliefs fail to help the fill: they were never
+connected to it, so that remains untested and is now cheap to try against a
+two-pass baseline. Nor is it a throughput claim — measured wall clock spans
+`1.61x`--`4.93x` across seeds, which is contention on a shared GPU. The baseline
+is also a two-pass system (`predict_length`, then `predict_tokens`), so this is
+an advantage over a sequential filler at one pass per token, not over it.
+
+The comparison that the quality half of the scale-up gate rested on then turned
+out to be unfair, in the scaffold's favour. `PretrainedLengthMaskedModel` has
+had a trained length head all along -- a linear layer on the GAP mask's hidden
+state, optimized jointly with the token loss -- and no evaluation ever called
+it: the baseline was decoded at *oracle* length while the scaffold inferred its
+own. The two length models are otherwise closely matched, reading the same
+backbone at the same position, and they score the same to within noise
+(`+0.3696` against `+0.3622` identifiable nats).
+
+Made to use its own head, at matched decoding rule and matched sample size, the
+baseline reaches `0.1966` expected edit similarity against the scaffold's
+`0.2069` at roberta-base, with matched token accuracy `26.88%` against `30.24%`;
+at distilroberta the two tie (`0.1512` against `0.1497`). **The
+`0.2074`-against-`0.3280` deficit carried through this record is an artifact of
+the evaluation protocol.** One methodological note belongs with that: a single
+draw per prompt put the baseline at `0.2102` and read as a baseline win, while
+`32` draws give `0.1966` — the small-sample estimate was noise at the scale of
+the effect.
+
+The last structural difference between the two architectures was then tested,
+and it splits in two. The project's strongest synthetic result is that recursive
+local stopping generalizes to unseen interval lengths (`0.792` against `0.003`);
+on text this had never been run. Both models were trained on spans of `1`--`8`
+and evaluated on `9`--`16` with no retraining, the scaffold getting only `113`
+additive logit biases fitted on long-span validation while all `102,450` learned
+parameters and the backbone stayed frozen.
+
+The mechanism transfers decisively. Those biases take the exact chart's mass on
+the unseen range from `0.0011` to `0.9352`, and the rollout follows: `93.55%` of
+samples reach nine tokens or more at a mean length of `12.12` against the
+target's `12.43`, in `7.41` shape rounds instead of `3.55`. The baseline reaches
+that range `0.00%` of the time — its length head has nine classes, so sixteen is
+unrepresentable rather than unlikely, and no amount of recalibration fixes that.
+
+**The conditional signal does not transfer, and it is not a quality win.** The
+long-span slice is nearly uniform, so the best prompt-blind guess scores
+`14.06%`; the recalibrated chart's argmax scores `10.16%` and the rollout matches
+length on `12.16%`, both below that, where in range the same controller carries
+`+0.3137` nats and `30.47%`. Expected edit similarity is `0.1247` against the
+fairly evaluated baseline's `0.1204` — a tie — with both far below the
+oracle-length baseline's `0.1361`. What survives the move to text is a statement
+about representational reach, not about output quality. See
+`research/FRONTIER_REENCODE.md`.
