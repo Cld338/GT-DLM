@@ -149,7 +149,7 @@ state를 생성하는 별도 corruption/edit process와 그 확률을 먼저 정
 | E0 | closed: mechanics | deletion forward process에서 유도한 insertion ELBO가 정확히 정규화되는가? | tiny exact normalization/ELBO test 통과 |
 | E1 | closed: mechanics | sampled deletion posterior와 Rao-Blackwellized target이 일치하는가? | exhaustive gradient/DP gate 통과 |
 | E1b | closed: mechanics | early supercritical posterior와 finite termination을 한 bridge에서 만족하는가? | endpoint-safe generator exact gate 통과 |
-| E2 | active | head-only joint token-marker reverse model이 실제 rollout을 학습하는가? | 단일-GAP selection gate 통과 |
+| E2 | active: single-step vs rollout signal separation | head-only joint token-marker reverse model이 실제 rollout을 학습하는가? | 단일-GAP selection gate 통과 |
 | E3 | blocked by E2 | compressed-gap lexical query에 backbone adaptation이 필요한가? | retention을 지키며 E2 개선 |
 | E4 | blocked by E3 | explicit empty-gap process로 DELETE recovery를 학습할 수 있는가? | calibrated DELETE/recovery gate 통과 |
 
@@ -216,6 +216,140 @@ length search 비용도 과도했다. 이 경로는 학습 objective로 승격�
 clean token deletion process를 먼저 고정하고 그 reverse event를 SSB joint action으로
 정의하는 것이다. 학습은 하나의 initial GAP에서 시작하며 16-mask length scaffold를 쓰지
 않는다.
+
+### E2 — head-only pilot (active: single-step vs rollout signal separation)
+
+첫 정식 500-step pilot 결과는 `RESULTS.md`의 "E2 head-only pilot" 절에 있다. N0-N2와
+달리 구조 action이 실제로 다수(`55-58%`)를 차지하고 target-24 length MAE는 지금까지
+기록된 dynamic-length arm 중 최선(`7.3125`)이지만, `BOTH` 방향으로 과도하게
+편향(`initial P(BOTH) 87-89%`)되어 rollout 중 모델 자신의 predicted remaining count가
+줄지 않고 오히려 증가한다(`3.5 -> 9-10`). retention은 backbone frozen과 head가
+`token_logits`를 변형하지 않는 구조상 `100%`로 이미 만족한다.
+
+두 원인 후보는 분리 실험으로 이미 기각했다(`RESULTS.md`의 "E2 over-branching: the
+rollout time formula and head undertraining are both ruled out"). rollout의
+remaining-count 기반 time 갱신식을 step-linear로 교체해도(순환 의존 제거) 모든 지표가
+악화됐고, 학습 분포(`make_bridge_example`) 위에서 head를 직접 조회하면 `t`에 따라
+`P(BOTH)`가 `63.5% -> 1.6%`로 정확하게, 단조적으로 줄어든다 — head는 시간 의존성을
+올바르게 학습했다.
+
+그 구조적 가설은 이제 측정으로 확인됐다(`RESULTS.md`의 "E2 single-large-GAP
+coverage"). 낮은 `t`(`[0.02,0.3)`)에서 remaining count가 rollout 규모(`12-24`)인
+학습 상태 중 실제로 단일 GAP인 비율은 `15-19%`뿐이고, remaining `>=24`인 상태 자체가
+`3,809`개 중 `6`개(`0.16%`)만 나타난다. remaining count가 늘수록 단일 GAP 비율이
+`51.45% -> 26.79% -> 18.89% -> 15.11%`로 단조 감소한다 — 즉 학습 corruption은
+남은 양이 많을수록 그것을 여러 개의 작은 GAP으로 쪼개서 표현하는 경향이 강하고, 모든
+실제 rollout이 시작하는 "하나의 큰 GAP" 모양은 낮은 `t`에서조차 학습 상태의 소수
+(`2.65%`, 두 관련 bucket 합산)에 불과하다.
+
+따라서 E2 head는 시간 함수 자체는 올바르게 배웠지만, rollout이 실제로 의존하는 상태
+영역을 학습 corruption이 거의 방문하지 않는다는 것이 이제 수치로 확인된 원인이다. 9절
+중단 기준에 따라 이 측정 자체는 개입을 허가하지 않지만, corruption process 변경을
+고려하기 위한 독립적 causal evidence는 이제 확보됐다.
+
+그 evidence로 (a)를 실행했다. `src/ssb/time_sampling.py`가 원래의 `Uniform(0.02,
+0.98)` 목표 분포를 유지한 채(`stratify_probability=0`이면 기존과 정확히 동일),
+importance-weight로 보정된 defensive mixture proposal로 낮은 `t` 구간을 의도적으로
+더 자주 뽑는다 — forward process 자체(E0-E1b의 exact gate)는 바꾸지 않고 그 분포에서
+minibatch를 뽑는 방식만 바꿨다. `stratify_probability=0.3`으로 재학습한 결과
+(`RESULTS.md`의 "E2 stratified time sampling"), initial `P(BOTH)`가 절반 가까이
+줄고(`88.6% -> 53.9%`) `LEFT`가 처음으로 유의미하게 나타나며 target-12 finish/length
+MAE와 두 target의 similarity가 개선됐다. 하지만 완전한 해결은 아니다 — target-24
+length MAE는 악화됐고, predicted remaining count는 여전히 증가한다(다만 증가율은
+`2.6-2.8x`에서 `2.0-2.3x`로 줄었다).
+
+즉 초기 상태 coverage는 실재하는 원인이지만 유일한 원인은 아니다. 그 다음 causal
+question(rollout 중간 상태 coverage)도 이제 측정했다(`RESULTS.md`의 "E2
+intermediate-state coverage"). Rollout 전체 979 step 중 가장 큰 단일 구간(`39.3%`)은
+`t∈[0.3,0.5)`에서 GAP이 4개 이상 열려 있는 상태인데, 같은 stratified corruption은 이
+상태를 `7.7%`만 만들어낸다 — `5배` 과소 대표이며, 두 결합분포 전체의 total variation
+거리(`51.5%`) 중 이 한 칸이 `61%`를 차지한다. 즉 이미 고친 "시작 상태 희귀성"보다 더
+크고 구조적으로 다른 격차다: `make_bridge_example`은 하나의 span을 corrupt해서 GAP
+개수가 우연히 몇 개가 되는지 통제하지 않으므로, "여러 GAP이 중간 시간에 공존하는"
+상태를 목표로 stratify할 방법이 애초에 없다.
+
+이 재설계를 실행했다(`RESULTS.md`의 "E2 GAP-count-conditional corruption
+redesign"). 실행 전 모델 없이 corruption만으로 확인한 결과, `t∈[0.3,0.5)` bin
+**안에서** GAP 개수 분포는 이미 4개 이상이 `52-57%`로 자연스럽게 흔했다 — 진짜
+부족한 건 그 시간 구간에 애초에 확률질량이 `~14%`밖에 배정되지 않는다는 점(rollout은
+전체 step의 `~46%`를 그 구간에서 보냄)이었다. 그래서 두 가지를 함께 구현했다:
+
+1. `src/ssb/time_sampling.py`를 두 번째 독립 stratified interval(`mid_low`,
+   `mid_high`, `mid_stratify_probability`)을 지원하도록 일반화 — 기존 낮은-`t`
+   interval과 같은 importance-weight 원리를 그대로 N개 interval로 확장했다.
+2. `src/ssb/gap_arrangement_sampling.py` — 고정된 missing count `r` 중 정확히
+   목표 GAP 개수 `k`를 만드는 배열을 stars-and-bars로 균등 샘플링하고
+   (`count_arrangements_with_k_gaps(L,r,k)=C(L-r+1,k)*C(r-1,k-1)`, brute-force
+   전수조사로 검증), 원래의 "모든 배열이 균등"이라는 law에 대해 unbiased하도록
+   importance weight를 계산한다. 진단 결과 이 축의 기여는 부수적이었지만
+   (`mid` 단독으로 해당 칸의 "4+" 비율이 `7.2%→20.3%`, `gap` 추가는
+   `20.3%→20.6%`), 정확하고 재사용 가능한 도구라 함께 유지했다.
+
+같은 500-step pilot을 세 축(`stratify_probability=0.3`, `mid_stratify_probability
+=0.3`, `gap_stratify_probability=0.3`) 모두 켜고 재학습한 결과: intermediate-state
+total variation distance가 `51.5%→34.8%`로 줄었고, 가장 심했던 칸(`[0.3,0.5)`,
+`4+`)의 격차는 `31.6%p`에서 `6.5%p`(방향도 반전, 이제는 오히려 살짝 과다 대표)로
+줄었다. topology는 두 target 모두에서 `LEAF/LEFT/RIGHT/BOTH` 중
+`LEFT/RIGHT/BOTH`가 거의 균등해졌고(`BOTH` 편향 `86-89%→36-38%`), remaining count
+증가율도 다시 절반 가까이 줄었다(`2.0-2.3x→1.2-1.6x`, 기존 baseline `2.6-2.8x`).
+
+하지만 새로운 문제가 나타났다: target-24 length MAE가 오히려 악화됐다(`9.72→14.91`,
+원래 unstratified baseline의 `7.31`보다도 나쁨) — 평균 생성 길이가 `9.09`로
+target `24`에 크게 못 미친다. 반면 target-12는 거의 정확해졌다(생성 길이 `12.28`,
+target `12`). 즉 "너무 늦게 멈춘다"는 문제를 "target 길이에 따라 제대로 스케일되지
+않는 멈춤/예산 감각"으로 바꿔치기한 모양새였다.
+
+그 causal question을 분리했다(`RESULTS.md`의 "E2 target-length undershoot").
+Free rollout 없이, 실제 rollout이 시작하는 바로 그 상태(완전히 마스킹된 GAP 하나,
+`t=0`, 진짜 held-out context)에서 head를 직접 조회하면, true target 길이를
+`4`부터 `24`까지 6배 바꿔도 predicted remaining count는 `7.19~7.24`로 사실상
+고정이다. 이건 head가 못 배운 게 아니다 — `make_bridge_example`이 `span_length`를
+context(record/prefix/suffix)와 **무관하게** 균등 샘플링하므로, 학습 분포 안에서
+true 길이는 context와 상호정보량이 0이다. Bayes-optimal 예측 자체가 거의 상수이고,
+`make_infill`도 evaluation 쪽에서 똑같이 임의의 `target_length`를 외부에서
+고정한다 — 즉 target-12/24 length MAE는 "context로부터 자연스러운 완성 경계를
+추론하는 능력"을 애초에 측정하고 있지 않았다. 게다가 canvas 자체가
+`prefix + [MASK] + suffix`로, true target이 12든 24든 완전히 같은 문자열이 되므로
+구조적으로 신호가 전달될 수 없다 — DreamOn의 `<expand>`/EOS는 `number_of_mask`개의
+실제 mask token을 남겨 이 정보를 보존하는데, SSB의 단일-GAP 압축(불변식 4, 고정
+scaffold 금지)은 그 대가로 이 신호를 포기한 것이다.
+
+즉 D4부터 지금까지 기록된 모든 target-12/target-24 length MAE 수치는 이 harness가
+구조적으로 측정 불가능하게 만든 것을 측정해온 것이지, 특정 arm의 결함이 아니다.
+9절 중단 기준에 따라 step 증가나 backbone adaptation(E3)으로 대응하지 않는다 —
+그런 개입으로 만들어낼 수 있는 신호가 corruption/evaluation 설계 자체에 없기
+때문이다. 남은 결정은 모델이 아니라 harness에 대한 것이다: 이 한계를 있는 그대로
+받아들이고 target-length MAE를 모델 결함 지표로 더 이상 읽지 않을지, 아니면
+corruption/evaluation을 target 길이가 context에서 복원 가능하도록(예: 임의 고정
+길이 대신 자연스러운 완성 경계) 다시 설계할지 — 아직 결정하지 않았다.
+
+두 번째 방향을 실행했다(`RESULTS.md`의 "E2 context-linked corruption redesign").
+`src/ssb/natural_spans.py`가 문서의 실제 line boundary에서 span을 고르도록
+`make_bridge_example`(`natural_boundaries=True`)과 `evaluate_diffugpt_counting_bridge`
+(`make_natural_infill`/`--natural-spans`)를 확장했다 — corruption의 target
+길이가 이제 진짜 코드 내용(그 자리에 실제로 몇 줄이 있는지)이 결정하며, 균등
+4-24가 아니라 짧은 쪽으로 치우친 자연 분포(평균 `7.76`)를 따른다.
+
+결과는 명확한 승리가 아니라 두 갈래로 갈렸다. 같은 500-step head-only 학습
+후, **rollout 없이** 실제 rollout 시작 상태를 직접 조회하면 true 길이와
+predicted remaining의 상관관계는 여전히 `0.038`로 사실상 0이다 — 신호를
+통계적으로 복원했다고 해서 500 step만으로 학습되는 건 아니었다. 하지만
+**실제 free rollout** 전체로 보면 true 길이와 generated 길이의 상관관계가
+`0.452`로 유의미하게 나타난다 — 생성이 진행되면서 보이는 국소 단서(열린 괄호,
+들여쓰기 등)가 첫 판단 시점보다 더 쓸모 있는 신호를 준다는 뜻이다. 대신
+다른 지표는 전부 악화됐다: `BOTH` 편향이 `70.5%`로 되돌아갔고, finish rate는
+`22.6%`로 붕괴했고, 이제는 과소생성이 아니라 과다생성이다(true 평균 `13.26`
+대비 생성 `32.58`). 가장 유력한 원인은 재설계 자체가 아니라, 세 stratification
+축(`stratify_probability` 등)이 기존 균등 `4-24` 분포에 맞춰 조정된 값이라
+자연분포(훨씬 짧고 치우친)에는 더 이상 맞지 않는다는 것이다.
+
+`candidate`/`diagnostic`: 순수 정보이론적 질문(신호가 존재하는가)은 이제
+해결됐지만, 아직 실질적 개선은 아니다. 다음 causal question은 "단일 시점의
+평탄함과 rollout 전체의 회귀가 같은 원인(데이터/step 부족)인지, 아니면
+서로 다른 원인(약하지만 실재하는 신호는 다단계 축적으로만 활용 가능한데,
+지금은 안 맞는 stratification 설정과 얽혀있는 것)인지"를 분리하는 것이며,
+아직 분리하지 않았다. 9절 중단 기준에 따라 step 증가, stratification
+재조정, backbone adaptation(E3) 중 어느 것도 이 분리 없이는 열지 않는다.
 
 ### 확장과 confirmation
 

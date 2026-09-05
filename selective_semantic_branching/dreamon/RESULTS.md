@@ -424,3 +424,683 @@ received nonzero gradients. The full suite passes `68/68`.
 E2 remains `active`: head mechanics pass, but no model-quality claim is made
 until the frozen-backbone training and free-rollout selection gate completes.
 Artifact: `DreamOn/artifacts/diffugpt_elbo_e2/head_mechanics.json`.
+
+## E2 head-only pilot: structure emerges, branching is uncalibrated
+
+The registered E2 gate (`SSB_ELBO_DESIGN.md` section 9) is: a single initial
+GAP, explicit `t`, frozen backbone, Rao-Blackwellized NELBO training, then
+target-12/24 free rollout finish/length/branch occupancy with `100%` original
+fixed-canvas prediction retention. This is the first run of that gate; two
+untuned exploratory runs (200 and 1000 steps, no fixed validation-limit or
+rollout-example-count convention) had been left in
+`artifacts/diffugpt_elbo_e2/head_only_200` and `head_only_1000` without being
+recorded here or evaluated against a decision.
+
+The pilot used `diffugpt-s`, the same 256-train/64-validation OpenCoder split
+as D4/N2, 500 steps, learning rate `1e-3`, and a 32-example validation/rollout
+budget (seed `89` for training sampling, matching the project's `32`-example
+selection-split convention). The backbone stayed frozen and
+`CountingBridgeSSBHead` never transforms `token_logits`, so original
+fixed-canvas retention is `100%` by construction; this is also covered by the
+passing `test_base_equivalent_initialization_is_leaf_only` and D3 LEAF-only
+trajectory-equality tests.
+
+| teacher-forced validation | before | after |
+|---|---:|---:|
+| loss per example | `125.83` | `110.20` |
+| count loss per GAP | `4.254` | `0.323` |
+| action loss per event | `12.081` | `11.727` |
+| topology support accuracy | `52.75%` | `60.44%` |
+
+| target | finish | length MAE | mean length | similarity | structural share | mean initial P(BOTH) |
+|---:|---:|---:|---:|---:|---:|---:|
+| 12 | `78.13%` | `7.9375` | `19.6875` | `0.1093` | `LEFT/RIGHT/BOTH` = `354/616` (`57.5%`) | `88.56%` |
+| 24 | `100%` | `7.3125` | `17.375` | `0.2048` | `LEFT/RIGHT/BOTH` = `309/556` (`55.6%`) | `86.90%` |
+
+This is the first arm in the whole DreamOn/SSB line where branch actions are a
+majority of emitted events rather than near-zero: N0's topology-marginal MAP
+produced `1/513` structural actions, N2's corrected hierarchical student
+produced `3.13%`/`18.75%` structural examples, and DreamOn's own EXPAND
+sentinel cycle only reached `78.13%`/`84.38%` finish. Target-24 length MAE
+(`7.3125`) is also the best of any dynamic-length arm recorded so far,
+including D4-B joint MAP (`12.7813`) and DreamOn expand/EOS (`19.4063`).
+
+The new, specific failure is over-branching rather than under-branching:
+initial `P(BOTH)` is `86-89%`, `LEFT`/`RIGHT`/`BOTH` together outnumber
+`LEAF`, and the model's own mean predicted remaining-event count grows during
+rollout instead of shrinking (`3.55 -> 10.51` for target 12, `3.59 -> 9.30`
+for target 24), consistent with a positive-feedback branching loop that the
+head does not learn to damp. Token-sequence similarity is correspondingly the
+worst of any recorded arm at target-12 (`0.1093` vs DreamOn's `0.2700` and the
+oracle fixed-canvas's `0.4531`), though not at target-24.
+
+`candidate`: the forward-process-derived training signal does teach real
+structural occupancy where every prior teacher-supervised arm (N0-N2)
+collapsed to near-zero branching, and length calibration measurably improved
+at the longer target. It does not yet pass the gate as a usable rollout
+policy because branching is uncalibrated in the opposite direction (runaway
+`BOTH`) rather than absent. Per the stop list in `RESEARCH_DIRECTION.md`
+section 9, this is not addressed by more steps or backbone adaptation (E3
+stays blocked): the next causal question is why predicted remaining-events
+grows rather than depletes during free rollout, and whether that traces to
+training-time coverage of `t` near rollout-typical trajectories, the
+count-loss's own calibration, or a state-distribution mismatch between the
+sampled-order training corruption and the model's own generated states.
+
+Artifacts are `DreamOn/artifacts/diffugpt_elbo_e2/head_only_500/metrics.json`
+and `.../head_only_500/rollout.json`. Reproduce with, from `DreamOn/`:
+
+```powershell
+python train_diffugpt_counting_bridge.py --model-path ..\..\models\diffugpt-s `
+  --train-file data\opencoder-pilot\train.jsonl `
+  --validation-file data\opencoder-pilot\validation.jsonl `
+  --output-dir artifacts\diffugpt_elbo_e2\head_only_500 `
+  --steps 500 --validation-limit 32 --max-length 128 --learning-rate 1e-3
+python evaluate_diffugpt_counting_bridge.py --model-path ..\..\models\diffugpt-s `
+  --head-path artifacts\diffugpt_elbo_e2\head_only_500\counting_bridge_head.pt `
+  --validation-file data\opencoder-pilot\validation.jsonl `
+  --output-file artifacts\diffugpt_elbo_e2\head_only_500\rollout.json `
+  --limit 32 --max-length 128
+```
+
+## E2 over-branching: the rollout time formula and head undertraining are both ruled out
+
+`ANALYSIS.md` ("the E2 rollout time update, not remaining-count itself, is
+the likely suspect") flagged that the rollout's time-advance rule derives
+`t` from the model's own `remaining_events` belief, an untested coupling
+outside the E0-E1b exact gates, as the leading suspect for E2's over-branching.
+Two isolation experiments on the same `head_only_500` checkpoint test this and
+the "head never learned time-dependence" alternative directly; neither
+survives.
+
+**Ablation 1 - decouple time from remaining-count.**
+`evaluate_diffugpt_counting_bridge.py` gained a `--time-schedule` flag.
+`step-linear` advances `t` by a fixed `1/max_events` per event instead of the
+remaining-count-derived median-time rule, leaving GAP selection
+(`remaining_events.argmax()`) untouched so only the time source changes.
+
+| target | schedule | finish | length MAE | similarity | mean final `t` |
+|---:|---|---:|---:|---:|---:|
+| 12 | remaining-count (original) | `78.13%` | `7.9375` | `0.1093` | `0.866` |
+| 12 | step-linear | `21.88%` | `13.2188` | `0.0920` | `0.982` |
+| 24 | remaining-count (original) | `100%` | `7.3125` | `0.2048` | `0.869` |
+| 24 | step-linear | `50.00%` | `23.0938` | `0.1324` | `0.942` |
+
+Decoupling time from the model's own remaining-count belief makes every
+metric worse, not better, even though `step-linear` reaches a *higher* final
+`t` on average. The untested circular formula is therefore not the cause of
+over-branching; if anything the original rule's tendency to keep `t` low
+while true occupancy is high is closer to the correct dynamics than a
+schedule blind to it.
+
+**Audit - does the topology head even learn `t`-dependence?**
+`audit_diffugpt_elbo_e2_time_conditioning.py` calls the trained head on
+`make_bridge_example` states (the exact training corruption distribution,
+not rollout) across held-out validation records, binned by the sampled
+corruption time:
+
+| `t` bin (mean) | P(LEAF) | P(LEFT) | P(RIGHT) | P(BOTH) |
+|---:|---:|---:|---:|---:|
+| `0.187` | `5.01%` | `15.24%` | `16.20%` | `63.54%` |
+| `0.399` | `19.81%` | `22.09%` | `24.28%` | `33.82%` |
+| `0.600` | `50.32%` | `19.33%` | `20.88%` | `9.48%` |
+| `0.816` | `76.50%` | `10.55%` | `11.35%` | `1.59%` |
+
+On its own training distribution the head shows a strong, monotonic swing
+from `BOTH`-dominant to `LEAF`-dominant as `t` grows, the opposite of
+undertrained or collapsed time-conditioning.
+
+Both explanations for over-branching proposed after the head-only pilot are
+therefore rejected: it is neither the rollout's untested time formula nor a
+failure of the head to learn how topology should depend on `t`. The
+localization narrows to hypothesis 3 in `RESEARCH_DIRECTION.md` section 1
+(state-distribution mismatch): a real rollout begins from one large,
+fully-masked GAP spanning the whole target at nominal `t approx 0`, and
+`make_bridge_example` samples `t` and then reveals each position of a span
+independently with probability `t`, so a genuinely single, large, fully-masked
+GAP at low `t` is a state the training corruption can produce but does not
+obviously produce with the same shape or frequency as the training mix at
+that same nominal `t` overall (most low-`t` corruption states still show
+partially-revealed structure or shorter spans). This is a hypothesis
+sharpened by elimination, not yet a measured rarity; quantifying how often
+training corruption actually reproduces a single-GAP, near-fully-masked state
+of rollout-relevant length is the next specific, cheap measurement before any
+corruption-process change.
+
+`diagnostic only`: this does not change the `candidate` verdict on the E2
+head-only pilot itself, and per `RESEARCH_DIRECTION.md` section 9 does not
+license backbone adaptation (E3) or more training steps on the current
+objective.
+
+Artifacts are
+`DreamOn/artifacts/diffugpt_elbo_e2/head_only_500/rollout_step_linear_time.json`
+and `.../head_only_500/time_conditioning_audit.json`. Reproduce with, from
+`DreamOn/`:
+
+```powershell
+python evaluate_diffugpt_counting_bridge.py --model-path ..\..\models\diffugpt-s `
+  --head-path artifacts\diffugpt_elbo_e2\head_only_500\counting_bridge_head.pt `
+  --validation-file data\opencoder-pilot\validation.jsonl `
+  --output-file artifacts\diffugpt_elbo_e2\head_only_500\rollout_step_linear_time.json `
+  --limit 32 --max-length 128 --time-schedule step-linear
+python audit_diffugpt_elbo_e2_time_conditioning.py --model-path ..\..\models\diffugpt-s `
+  --head-path artifacts\diffugpt_elbo_e2\head_only_500\counting_bridge_head.pt `
+  --validation-file data\opencoder-pilot\validation.jsonl `
+  --output-file artifacts\diffugpt_elbo_e2\head_only_500\time_conditioning_audit.json `
+  --limit 64 --samples-per-record 4 --max-length 128
+```
+
+## E2 single-large-GAP coverage: the rollout start state is rare in training
+
+`ANALYSIS.md` left one specific, checkable claim open: training corruption
+may not reproduce, with realistic frequency, the exact shape a free rollout
+always starts from (one single, fully-masked GAP spanning the whole target,
+at `t approx 0`). `audit_diffugpt_elbo_e2_single_gap_coverage.py` measures
+this directly from the corruption process alone (no model or checkpoint):
+across 3,809 sampled `make_bridge_example` states from the same
+64-record validation split, bucketed by sampled `t` and by total remaining
+(missing) token count, what fraction of each bucket is a single contiguous
+GAP versus fragmented into several smaller ones.
+
+| `t` bin | remaining count | examples | single-GAP fraction | max single-GAP length seen |
+|---|---:|---:|---:|---:|
+| `[0.02, 0.3)` | `[12, 16)` | `270` | `18.89%` | `15` |
+| `[0.02, 0.3)` | `[16, 24)` | `331` | `15.11%` | `23` |
+| `[0.02, 0.3)` | `[24, inf)` | `6` | `100%` | `24` |
+
+A target-12 rollout always starts as `t=0`, remaining `=12`, one GAP; a
+target-24 rollout always starts as `t=0`, remaining `=24`, one GAP - that
+exact combination is what the E2 pilot must generalize to. Under training
+corruption, states with remaining `>= 24` at low `t` occur in only `6` of
+`3,809` sampled states (`0.16%`), and even the closest bucket
+(remaining `[16, 24)`) is a single GAP only `15.11%` of the time. The
+low-`t`/large-remaining region shows a clear, monotonic trend, not noise:
+single-GAP fraction falls from `51.45%` (remaining `[4, 8)`) to `26.79%`
+(`[8, 12)`) to `18.89%` (`[12, 16)`) to `15.11%` (`[16, 24)`) as remaining
+count grows, i.e. the more content is missing, the more training corruption
+represents it as several separate GAPs rather than one. Combining both
+factors, the joint frequency of "low `t`, rollout-scale remaining count
+(`12-24`), single GAP" is only `2.65%` of all sampled training states
+(`51 + 50 = 101` single-GAP examples out of `3,809` total).
+
+This confirms hypothesis 3 in `RESEARCH_DIRECTION.md` section 1 with a
+number rather than an inference: the exact state every free rollout begins
+in is a thin, atypical slice of what the E2 objective actually trains on.
+The head's topology function is not wrong on its own training distribution
+(previous entry); its training distribution itself barely visits the
+region rollout depends on most.
+
+`diagnostic only`, and per `RESEARCH_DIRECTION.md` section 9 this measurement
+is what licenses considering a corruption-process change next - it does not
+itself license one yet, and it changes no model or objective.
+
+Artifact: `DreamOn/artifacts/diffugpt_elbo_e2/single_gap_coverage.json`.
+Reproduce with, from `DreamOn/`:
+
+```powershell
+python audit_diffugpt_elbo_e2_single_gap_coverage.py --model-path ..\..\models\diffugpt-s `
+  --validation-file data\opencoder-pilot\validation.jsonl `
+  --output-file artifacts\diffugpt_elbo_e2\single_gap_coverage.json `
+  --limit 64 --samples-per-record 64 --max-length 128
+```
+
+## E2 stratified time sampling: over-branching is reduced, not resolved
+
+The measured coverage gap (previous entry) licenses a corruption-process
+change per `RESEARCH_DIRECTION.md` section 9. The standard fix for this class
+of problem in the literature this project already compares against - DreamOn
+trains directly on whole-span masked states rather than relying on chance to
+produce them, and boundary-condition under-coverage is a known failure mode
+in insertion/edit-based non-autoregressive generation generally - is to make
+the rare-but-important region common in training, not to redefine the
+generative process. This is implemented as a defensive mixture proposal
+rather than a hand-inserted special case: `src/ssb/time_sampling.py` samples
+`time` from `Uniform(0.02, narrow_ceiling)` with probability
+`stratify_probability` and from the original `Uniform(0.02, 0.98)` otherwise,
+and every example's `hazard` (already a per-example multiplicative loss
+scale) is multiplied by the exact importance weight
+`target_density(time) / mixture_density(time)`. `stratify_probability=0`
+reproduces the original sampler and weight `1.0` exactly (`tests/
+test_time_sampling.py`, `7/7`, verifies the density identity and this
+no-op case pointwise); this changes how minibatches are drawn from the
+deletion-forward-process law E0-E1b already verified, not that law itself,
+and the NELBO estimator stays unbiased under the new proposal.
+
+At `stratify_probability=0.3`, `narrow_ceiling=0.06`, the single-GAP coverage
+audit confirms the intended shift on the same validation split: single-GAP
+fraction at low `t` rises from `18.89% -> 43.56%` (remaining `[12,16)`) and
+`15.11% -> 40.29%` (remaining `[16,24)`), and the joint frequency of
+"low-`t`, rollout-scale remaining, single GAP" rises from `2.65%` to
+`12.05%` (`468` of `3,885` sampled states).
+
+Retraining the identical 500-step head-only pilot with this sampler
+(everything else unchanged) and re-running the same rollout gate gives:
+
+| target | run | finish | length MAE | similarity | initial P(BOTH) | initial P(LEFT) |
+|---:|---|---:|---:|---:|---:|---:|
+| 12 | baseline | `78.13%` | `7.9375` | `0.1093` | `88.56%` | `5.24%` |
+| 12 | stratified | `96.88%` | `5.0938` | `0.1179` | `53.90%` | `25.97%` |
+| 24 | baseline | `100%` | `7.3125` | `0.2048` | `86.90%` | `5.91%` |
+| 24 | stratified | `100%` | `9.7188` | `0.2375` | `50.25%` | `27.34%` |
+
+`BOTH`-dominance roughly halves at both targets and `LEFT` goes from
+near-absent to a genuine third of initial mass; target-12 finish rate and
+length MAE both improve substantially, and similarity improves modestly at
+both targets. The fix is real but partial, not a resolution: target-24
+length MAE gets worse (`7.31 -> 9.72`), and the mean trajectory-predicted
+remaining count still grows during rollout rather than depleting
+(`5.76 -> 13.41` for target 12, `5.63 -> 11.53` for target 24) - reduced in
+relative terms from the baseline's `2.6-2.8x` growth factor to `2.0-2.3x`,
+but the same qualitative symptom persists. Teacher-forced validation loss on
+the original (unstratified) split is comparable to the baseline
+(`115.51` vs `110.20` loss per example), so this is not simply a case of
+easier training data.
+
+`candidate`: stratified time sampling measurably shifts the learned policy
+toward the structural balance the theory predicts and improves three of four
+headline rollout metrics, without touching the exact-gate-verified E0-E1b
+law or introducing bias into the loss. It does not, on its own, close the E2
+gate. The remaining growth in predicted remaining count is smaller in degree
+but not yet explained; a natural next step is sweeping
+`stratify_probability`/`narrow_ceiling` or diagnosing the residual growth
+directly, neither of which has been run.
+
+Artifacts are
+`DreamOn/artifacts/diffugpt_elbo_e2/single_gap_coverage_stratified.json` and
+`.../head_only_500_stratified/{metrics,rollout}.json`. Reproduce with, from
+`DreamOn/`:
+
+```powershell
+python train_diffugpt_counting_bridge.py --model-path ..\..\models\diffugpt-s `
+  --train-file data\opencoder-pilot\train.jsonl `
+  --validation-file data\opencoder-pilot\validation.jsonl `
+  --output-dir artifacts\diffugpt_elbo_e2\head_only_500_stratified `
+  --steps 500 --validation-limit 32 --max-length 128 --learning-rate 1e-3 `
+  --stratify-probability 0.3 --narrow-ceiling 0.06
+python evaluate_diffugpt_counting_bridge.py --model-path ..\..\models\diffugpt-s `
+  --head-path artifacts\diffugpt_elbo_e2\head_only_500_stratified\counting_bridge_head.pt `
+  --validation-file data\opencoder-pilot\validation.jsonl `
+  --output-file artifacts\diffugpt_elbo_e2\head_only_500_stratified\rollout.json `
+  --limit 32 --max-length 128
+```
+
+## E2 intermediate-state coverage: a second, larger gap in the middle of the trajectory
+
+`ANALYSIS.md` ("fixing coverage helps, but does not fully explain the
+failure") asked whether the same kind of coverage gap exists for states a
+rollout passes through *after* its first event, not just the starting state.
+There is no ground-truth remaining count for a freely generated rollout, so
+`audit_diffugpt_elbo_e2_intermediate_state_coverage.py` compares the one
+quantity that is comparable between rollout and training corruption: the
+joint distribution of `(time, number of open GAPs)`. It instruments
+`evaluate_diffugpt_counting_bridge.rollout` (unmodified logic, only an added
+`state_trace` diagnostic) to record every step of free rollout with the
+stratified checkpoint across both targets, and compares it against
+`make_bridge_example` states sampled with the same
+`stratify_probability=0.3` now used for training.
+
+| `t` bin | open GAPs | rollout share of steps | training share of states |
+|---|---|---:|---:|
+| `[0, 0.3)` | `1` | `6.5%` | `25.4%` |
+| `[0, 0.3)` | `4+` | `17.3%` | `5.5%` |
+| `[0.3, 0.5)` | `4+` | **`39.3%`** | `7.7%` |
+| `[0.5, 0.7)` | `4+` | `1.5%` | `7.7%` |
+| `[0.7, 1.0]` | `2` / `3` / `4+` | `0%` each | `4.6%` / `2.5%` / `3.3%` |
+
+The single largest bucket in the *entire* rollout trace - `39.3%` of all
+979 recorded steps across both targets - is `t in [0.3, 0.5)` with `4+` open
+GAPs. Training corruption produces that same state only `7.7%` of the time,
+a `5x` under-representation of the single most-visited region of the
+trajectory. The total variation distance between the two full joint
+distributions is `51.5%` (`1,956` sampled corruption states), and that one
+cell alone accounts for `0.316` of the `0.515` total (`61%` of the entire
+mismatch). Two smaller, secondary patterns: rollout revisits low-`t`
+single-GAP states less than training provides for it (`6.5%` vs `25.4%` at
+`t<0.3`), and rollout essentially never reaches high `t` (`0.7-1.0`) with
+more than one GAP still open (`0%` across all three multi-GAP buckets)
+while training still allocates real mass there (`4.6-6.1%` each) - training
+covers some states rollout has already learned not to need, which is
+comparatively harmless, unlike the reverse.
+
+This directly explains why stratified time sampling (previous entry) helped
+but did not resolve over-branching: it corrected coverage of the state
+rollout starts in, but the state where the model spends by far the most
+decision-making during free generation - already-branched, several GAPs
+open, at a moderate (not low) time - remained, if anything, the same
+`~5x`-under-covered gap it was before. `t in [0.3,0.5)` with `4+` GAPs is a
+plausible place for a model that has already over-branched once to keep
+over-branching, precisely because training gives it little signal there.
+
+`diagnostic only`: this identifies a second, larger, and different
+mismatch than the one already fixed; it does not itself justify a specific
+corruption change yet. `make_bridge_example` currently controls only the
+single sampled state's own `(t, reveal outcome)`, not a matched distribution
+of "how many GAPs are usually open at a moderate `t` after some have already
+resolved" - closing this gap plausibly needs the corruption process to
+condition span/reveal sampling on a target GAP count, not only oversample
+low `t`, but that redesign has not been attempted or evaluated. Per
+`RESEARCH_DIRECTION.md` section 9, no such change is made without deciding
+it deliberately, which is not yet done.
+
+Artifact:
+`DreamOn/artifacts/diffugpt_elbo_e2/intermediate_state_coverage_stratified.json`.
+Reproduce with, from `DreamOn/`:
+
+```powershell
+python audit_diffugpt_elbo_e2_intermediate_state_coverage.py --model-path ..\..\models\diffugpt-s `
+  --head-path artifacts\diffugpt_elbo_e2\head_only_500_stratified\counting_bridge_head.pt `
+  --validation-file data\opencoder-pilot\validation.jsonl `
+  --output-file artifacts\diffugpt_elbo_e2\intermediate_state_coverage_stratified.json `
+  --rollout-limit 32 --corruption-limit 64 --corruption-samples-per-record 32 `
+  --max-length 128 --stratify-probability 0.3 --narrow-ceiling 0.06
+```
+
+## E2 GAP-count-conditional corruption redesign: a mid-time interval, plus a gap-arrangement tool
+
+Two independent, importance-corrected extensions target the "GAP-count
+corruption redesign decision" left open above. Both keep every prior gate
+(exact E0-E1b math, `stratify_probability=0`-style no-op defaults) intact and
+add only new opt-in stratification axes.
+
+**`src/ssb/time_sampling.py` generalized to two stratified intervals.** A
+quick diagnostic before committing to a design (not itself a training run):
+holding `t in [0.3, 0.5)` and `n_gaps >= 4` fixed and comparing corruption's
+*within-bin* gap-count distribution (`~52-57%` already 4+, roughly matching
+what a moderate `t` over a span up to 24 naturally produces) against how
+often corruption lands in that time bin *at all* (`~14%`) versus rollout
+(`~46%` of all steps) showed the dominant driver was never the
+arrangement-given-time; it was that corruption under-visits the whole
+`[0.3, 0.5)` time region relative to how much of its own trajectory rollout
+actually spends there. `sample_stratified_time` therefore takes a second,
+independent `(mid_low, mid_high, mid_stratify_probability)` interval on top
+of the existing low-time one, with the same mixture-density/importance-weight
+treatment generalized to `N` disjoint intervals; leaving both stratification
+probabilities at `0` reproduces the original single `rng.uniform(0.02, 0.98)`
+call and weight `1.0` bit-for-bit (`tests/test_time_sampling.py`, `11/11`,
+checks this by comparing RNG state against an unstratified control, not just
+statistically).
+
+**`src/ssb/gap_arrangement_sampling.py`, a genuine GAP-count-conditional
+resampler.** Given a fixed missing count `r` out of `L` span positions, every
+specific arrangement of those `r` positions is exactly equally likely under
+independent-reveal corruption (conditioning i.i.d. Bernoulli trials on their
+sum is uniform over which positions are "successes"). This module sam­ples
+uniformly among only the arrangements with a chosen number of maximal
+missing-runs via an exact stars-and-bars construction
+(`count_arrangements_with_k_gaps(L, r, k) = C(L-r+1, k) * C(r-1, k-1)`,
+verified against brute-force enumeration for `L` up to `9` in
+`tests/test_gap_arrangement_sampling.py`, `19/19`, including that
+`E_mixture[weight * gap_count]` recovers the exact unstratified mean), and
+returns the importance weight to keep the *original* uniform-over-all-
+arrangements law unbiased. `make_bridge_example` applies it only after the
+natural per-position draw already has a non-empty missing set, replacing that
+specific arrangement (not its count) with probability
+`gap_stratify_probability`; when infeasible or `0`, it reuses the natural
+arrangement's own tuple with no extra randomness consumed and weight `1.0`.
+
+**Isolating which lever matters.** Re-running the corruption-only measurement
+(no model) with `stratify_probability=0.3` fixed and toggling the two new
+axes:
+
+| `mid_stratify_probability` | `gap_stratify_probability` | overall share of `t in [0.3,0.5)` states that are `4+` gaps |
+|---:|---:|---:|
+| `0.0` | `0.0` | `7.2%` |
+| `0.3` | `0.0` | `20.3%` |
+| `0.3` | `0.5` | `20.6%` |
+
+The mid-time interval does nearly all of the work; gap-arrangement
+stratification adds a small increment on top, confirming the diagnostic.
+Both are kept in the final configuration since neither costs anything when
+the model doesn't need it (both default to `0`, i.e. off) and gap-arrangement
+stratification is still a real, correctly-unbiased, independently useful
+tool for whatever GAP-count-conditional coverage question comes up next.
+
+**Retraining the same 500-step head-only pilot** with
+`stratify_probability=0.3, narrow_ceiling=0.06, mid_low=0.3, mid_high=0.5,
+mid_stratify_probability=0.3, gap_stratify_probability=0.3,
+gap_k_choices=(3,4,5,6)` and re-running both the rollout gate and the
+intermediate-state-coverage audit:
+
+| target | run | finish | length MAE | similarity | initial P(BOTH) | initial P(LEFT) | initial P(RIGHT) | remaining growth `x` |
+|---:|---|---:|---:|---:|---:|---:|---:|---:|
+| 12 | time-only (previous) | `96.88%` | `5.09` | `0.118` | `53.9%` | `26.0%` | - | `2.33x` |
+| 12 | time+mid+gap (this entry) | `90.63%` | `5.03` | `0.150` | `38.2%` | `30.3%` | `31.4%` | `1.63x` |
+| 24 | time-only (previous) | `100%` | `9.72` | `0.238` | `50.3%` | `27.3%` | - | `2.05x` |
+| 24 | time+mid+gap (this entry) | `100%` | `14.91` | `0.212` | `36.4%` | `31.7%` | `31.8%` | `1.21x` |
+
+("remaining growth `x`" is `mean_trajectory_predicted_remaining /
+mean_initial_predicted_remaining`, the runaway-branching symptom this whole
+line of investigation started from; baseline was `2.6-2.8x`.)
+
+The intermediate-state total variation distance falls from `51.5%` to
+`34.8%` (`2,002` sampled corruption states, `674` rollout steps), and the
+single worst cell from the previous entry - `t in [0.3,0.5)`, `4+` GAPs -
+goes from a `31.6`-point rollout-vs-corruption gap (`39.3%` vs `7.7%`) to a
+`6.5`-point gap in the *opposite* direction (`15.1%` vs `21.6%`, now
+slightly over-covered rather than under-covered).
+
+Topology is now close to uniform across `LEFT`/`RIGHT`/`BOTH` at both
+targets (previously `BOTH`-dominated at `86-89%`), and the runaway-growth
+factor roughly halves again from the already-improved time-only run
+(`2.0-2.3x -> 1.2-1.6x`). But target-24 length MAE gets markedly worse
+(`9.72 -> 14.91`, worse than even the original unstratified baseline's
+`7.31`): mean generated length is `9.09` against a target of `24`, a large
+undershoot, while target-12 generated length (`12.28`) is now nearly exact.
+The model appears to have partly traded "stops branching too late" for
+"stops too early once its budget sense is recalibrated", and that budget
+sense does not yet scale correctly between target lengths 12 and 24.
+
+`candidate`: this is real, mechanistically-explained further progress -
+structural balance and the runaway-count symptom both improve substantially,
+and the improvement is traced to a specific, correctly-isolated lever (time
+coverage of the mid-trajectory region) rather than assumed. It is not a
+resolution: a new, different miscalibration (target-length-dependent
+under-generation) has appeared in its place. Per `RESEARCH_DIRECTION.md`
+section 9, this does not license backbone adaptation (E3) or step-count
+increases; the next causal question is why the model's stopping/budget
+behavior does not scale with target length, which has not been isolated
+from remaining-count calibration versus something else.
+
+Artifacts are
+`DreamOn/artifacts/diffugpt_elbo_e2/head_only_500_stratified_v2/{metrics,rollout}.json`
+and
+`.../intermediate_state_coverage_stratified_v2.json`. Reproduce with, from
+`DreamOn/`:
+
+```powershell
+python train_diffugpt_counting_bridge.py --model-path ..\..\models\diffugpt-s `
+  --train-file data\opencoder-pilot\train.jsonl `
+  --validation-file data\opencoder-pilot\validation.jsonl `
+  --output-dir artifacts\diffugpt_elbo_e2\head_only_500_stratified_v2 `
+  --steps 500 --validation-limit 32 --max-length 128 --learning-rate 1e-3 `
+  --stratify-probability 0.3 --narrow-ceiling 0.06 `
+  --mid-stratify-probability 0.3 --mid-low 0.3 --mid-high 0.5 `
+  --gap-stratify-probability 0.3 --gap-k-choices 3 4 5 6
+python evaluate_diffugpt_counting_bridge.py --model-path ..\..\models\diffugpt-s `
+  --head-path artifacts\diffugpt_elbo_e2\head_only_500_stratified_v2\counting_bridge_head.pt `
+  --validation-file data\opencoder-pilot\validation.jsonl `
+  --output-file artifacts\diffugpt_elbo_e2\head_only_500_stratified_v2\rollout.json `
+  --limit 32 --max-length 128
+python audit_diffugpt_elbo_e2_intermediate_state_coverage.py --model-path ..\..\models\diffugpt-s `
+  --head-path artifacts\diffugpt_elbo_e2\head_only_500_stratified_v2\counting_bridge_head.pt `
+  --validation-file data\opencoder-pilot\validation.jsonl `
+  --output-file artifacts\diffugpt_elbo_e2\intermediate_state_coverage_stratified_v2.json `
+  --rollout-limit 32 --corruption-limit 64 --corruption-samples-per-record 32 --max-length 128 `
+  --stratify-probability 0.3 --narrow-ceiling 0.06 `
+  --mid-stratify-probability 0.3 --mid-low 0.3 --mid-high 0.5 `
+  --gap-stratify-probability 0.3 --gap-k-choices 3 4 5 6
+```
+
+## E2 target-length undershoot: predicted remaining count is flat, and cannot be otherwise
+
+The previous entry's flag was `mean_initial_predicted_remaining` almost equal
+for target-12 (`7.32`) and target-24 (`7.17`) despite true initial remaining
+counts of `12` and `24`. `audit_diffugpt_elbo_e2_remaining_count_calibration.py`
+tests this directly and without any free-rollout dynamics: it constructs the
+*exact* state a real rollout starts from - one single, fully-masked GAP
+spanning the whole target, `t=0`, real held-out prefix/suffix - at six true
+target lengths (`4, 8, 12, 16, 20, 24`, `64` documents each, deterministic
+placement) and reads the trained head's `remaining_events` prediction with
+no free rollout involved.
+
+| true target length | `4` | `8` | `12` | `16` | `20` | `24` |
+|---:|---:|---:|---:|---:|---:|---:|
+| mean predicted remaining | `7.231` | `7.239` | `7.232` | `7.186` | `7.209` | `7.185` |
+
+The prediction is flat to within `0.05` across a `6x` range of true length
+(correlation `-0.82`, but meaningless given the range is noise-width). The
+head cannot tell an `8`-token hole from a `24`-token hole apart at the state
+where it matters most, which mechanically explains the previous entry's
+target-24 undershoot and target-12 near-match: whatever constant the model
+converges to is close enough to `12` to look calibrated there and far enough
+from `24` to undershoot badly.
+
+This is not a training or backbone-capacity failure being diagnosed for a
+fix; the diagnosis is that no such signal exists to learn in this pilot's
+current design. `train_diffugpt_counting_bridge.make_bridge_example` samples
+`span_length` uniformly in `[4, 24]` *independent of which record, prefix, or
+suffix it is attached to* - so under the training distribution, true target
+length carries zero mutual information with context. A head trained on that
+distribution predicting a near-constant `remaining_events` regardless of
+context is not undertrained; it is close to Bayes-optimal for the task as
+posed. `evaluate_diffugpt_counting_bridge.make_infill` has the same property
+on the evaluation side: `target_length` is an experimenter-imposed constant
+and `start` is drawn uniformly at random, so target-12/target-24 rollout
+"length calibration" is not measuring whether the model can infer a natural
+content boundary from context - no such boundary is constructed. Compounding
+this, the counting-bridge representation itself is lossy exactly where this
+matters: a real rollout's canvas is `prefix + [MASK] + suffix` regardless of
+whether the true target was `12` or `24` tokens - the two cases render to an
+identical string, so no signal distinguishing them reaches the model even in
+principle. DreamOn's own sentinel design avoids this specific failure mode by
+using `number_of_mask` literal mask tokens as a visible, externally-supplied
+length budget rather than one compressed token; SSB's single-GAP compression
+was chosen specifically to avoid a fixed length scaffold (`RESEARCH_DIRECTION.md`
+section 2, invariant 4), and this result is the concrete cost of that choice
+under the current corruption/evaluation design.
+
+`diagnostic only`: more training steps, more stratification tuning, or
+backbone adaptation (E3) would not address this - none of them can create a
+context-to-length signal that the corruption and evaluation protocols do not
+contain. Per `RESEARCH_DIRECTION.md` section 9, no such change is licensed
+by this finding. The decision this surfaces is about the evaluation/corruption
+design itself, not the model: either accept target-length-conditioned length
+error as inherent to the current target-12/target-24 harness and stop reading
+it as a model defect, or change the corruption and evaluation protocols so
+target length correlates with recoverable context (e.g. natural completion
+boundaries rather than arbitrary externally-fixed lengths) - a design
+decision affecting every arm evaluated with this harness since D4, not an
+E2-specific fix, and not yet made.
+
+Artifact:
+`DreamOn/artifacts/diffugpt_elbo_e2/remaining_count_calibration_v2.json`.
+Reproduce with, from `DreamOn/`:
+
+```powershell
+python audit_diffugpt_elbo_e2_remaining_count_calibration.py --model-path ..\..\models\diffugpt-s `
+  --head-path artifacts\diffugpt_elbo_e2\head_only_500_stratified_v2\counting_bridge_head.pt `
+  --validation-file data\opencoder-pilot\validation.jsonl `
+  --output-file artifacts\diffugpt_elbo_e2\remaining_count_calibration_v2.json `
+  --limit 64 --max-length 128 --time 0.0
+```
+
+## E2 context-linked corruption redesign: the signal exists now, but is barely learned in 500 steps
+
+`ANALYSIS.md` framed the decision as accepting the target-12/24 harness's
+structural unlearnability or redesigning corruption/evaluation so target
+length correlates with recoverable context. This redesigns both sides of
+that correlation.
+
+`src/ssb/natural_spans.py` picks spans that start and end at line boundaries
+in the real document (`line_boundary_positions` from a per-token newline
+flag; `natural_span_candidates` enumerates `(start, end)` pairs within a
+length budget, verified against brute-force enumeration in
+`tests/test_natural_spans.py`, `10/10`). `make_bridge_example` gained
+`natural_boundaries=False` (opt-in, changes the corruption process itself
+rather than reweighting it - not another importance-corrected axis) and
+`evaluate_diffugpt_counting_bridge` gained `make_natural_infill`/
+`--natural-spans`, which evaluates on a real line-boundary span of whatever
+length it has rather than an externally-fixed `12`/`24`. On the training
+split, natural spans skew short and content-determined (`mean 7.76`, mode
+around `2-9`, max `24`, `~10%` of attempts skipped for lacking a fitting
+boundary) rather than uniform `4-24` - a genuinely different, context-tied
+length distribution.
+
+**Single-step calibration (no rollout).** Retraining the identical 500-step
+head-only pilot with `natural_boundaries=True` (all three prior
+stratification axes kept on) and re-running the remaining-count-calibration
+audit in `--natural-boundaries` mode - querying real natural spans of
+varying true length directly, the same isolation as the flat-`7.2`
+result - gives a correlation between true length and predicted remaining of
+`0.038` across `225` examples (mean true length `14.76`, mean predicted
+`8.42`). Still statistically flat. Restoring genuine mutual information in
+the corruption process did not, on its own, produce a learned correlation
+at the exact decision point that matters most, within `500` head-only steps
+on `256` documents.
+
+**End-to-end free rollout**, evaluated with `--natural-spans` (true target
+length varies per example, drawn the same way training now draws it):
+
+| metric | value |
+|---|---:|
+| finish rate | `22.6%` |
+| mean true length | `13.26` |
+| mean generated length | `32.58` |
+| length MAE | `19.32` |
+| correlation(true length, generated length) | `0.452` |
+| initial `P(BOTH)` | `70.5%` |
+
+Unlike the single-step audit, full rollout shows a real, moderate positive
+correlation (`0.452`) between true and generated length - some usable
+signal does emerge over a multi-step trajectory, plausibly from locally
+visible partial-generation cues (an opened bracket, an indented block) that
+a single frozen-context query before generating anything cannot see. But
+every other metric got worse than the fixed-target-length `v2` run:
+`BOTH`-dominance regressed most of the way back (`36-38% -> 70.5%`), finish
+rate collapsed (`22.6%`), and the model now badly over-generates
+(`32.58` vs a true mean of `13.26`) rather than undershooting. The most
+likely cause is not the natural-boundary redesign itself but that the three
+stratification axes (`stratify_probability`, `mid_stratify_probability`,
+`gap_stratify_probability`, all still at their `v2` values) were tuned
+against the old *uniform* `4-24` span-length distribution and are now
+miscalibrated for natural corruption's much shorter, skewed one - an
+interaction between two design axes that has not been retuned or isolated.
+
+`candidate`/`diagnostic`: this resolves the pure information-theoretic
+question from the previous entry - the signal a model would need is no
+longer statistically absent - but does not yet produce a net practical
+improvement. Per `RESEARCH_DIRECTION.md` section 9, the next causal question
+is whether the single-step flatness and the end-to-end regression are the
+same problem (undertrained head given a harder, still-scarce-data task) or
+two different ones (a real but weak length signal only exploitable through
+multi-step accumulation, confounded by stratification hyperparameters tuned
+for a distribution that no longer applies) - not yet separated, and neither
+"more training steps" nor "retune stratification" nor backbone adaptation
+(E3) is licensed without that separation.
+
+Artifacts are
+`DreamOn/artifacts/diffugpt_elbo_e2/head_only_500_natural/metrics.json`,
+`.../remaining_count_calibration_natural.json`, and `.../rollout_natural.json`.
+Reproduce with, from `DreamOn/`:
+
+```powershell
+python train_diffugpt_counting_bridge.py --model-path ..\..\models\diffugpt-s `
+  --train-file data\opencoder-pilot\train.jsonl `
+  --validation-file data\opencoder-pilot\validation.jsonl `
+  --output-dir artifacts\diffugpt_elbo_e2\head_only_500_natural `
+  --steps 500 --validation-limit 32 --max-length 128 --learning-rate 1e-3 `
+  --stratify-probability 0.3 --narrow-ceiling 0.06 `
+  --mid-stratify-probability 0.3 --mid-low 0.3 --mid-high 0.5 `
+  --gap-stratify-probability 0.3 --gap-k-choices 3 4 5 6 `
+  --natural-boundaries
+python audit_diffugpt_elbo_e2_remaining_count_calibration.py --model-path ..\..\models\diffugpt-s `
+  --head-path artifacts\diffugpt_elbo_e2\head_only_500_natural\counting_bridge_head.pt `
+  --validation-file data\opencoder-pilot\validation.jsonl `
+  --output-file artifacts\diffugpt_elbo_e2\remaining_count_calibration_natural.json `
+  --limit 64 --max-length 128 --time 0.0 --natural-boundaries --natural-spans-per-record 4
+python evaluate_diffugpt_counting_bridge.py --model-path ..\..\models\diffugpt-s `
+  --head-path artifacts\diffugpt_elbo_e2\head_only_500_natural\counting_bridge_head.pt `
+  --validation-file data\opencoder-pilot\validation.jsonl `
+  --output-file artifacts\diffugpt_elbo_e2\rollout_natural.json `
+  --limit 32 --max-length 128 --natural-spans
+```
