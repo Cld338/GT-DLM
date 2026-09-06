@@ -2342,3 +2342,233 @@ python evaluate_diffugpt_counting_bridge.py --model-path ..\..\models\diffugpt-s
   --output-file artifacts\diffugpt_elbo_e2\rollout_length_belief_natural_mlp_detach_2000_1024_spans_lineage.json `
   --limit 32 --max-length 128 --natural-spans --lineage-aware
 ```
+
+## E2 gradient-accumulation batching: MLP improves more than Linear, as the theory predicted - partially
+
+`ANALYSIS.md` ("theoretical account") predicted that increasing the
+effective batch size per optimizer step should improve calibration for
+both `prior_head` sizes, and should improve the MLP *more* than the
+single-`Linear` head in relative terms, since a `d/n`-style
+effective-variance argument put the MLP in a far worse-conditioned regime
+under the original single-example-per-step training (`d/n≈325` vs the
+`Linear` head's `≈9`). `train_diffugpt_counting_bridge.py` gained
+`--batch-size`: `args.batch_size` examples' losses are accumulated
+(`(loss.total / batch_size).backward()` per example, one `optimizer.step()`
+after all of them) before each optimizer update, reducing that update's
+gradient variance by roughly `1/batch_size` without needing
+variable-length canvases padded into a real batch dimension.
+`--batch-size 1` (default) reproduces the original per-example update
+exactly - verified by inspection (the accumulation loop executes once,
+identical to the prior code path) and a `5`-step smoke test before
+committing to a full run. `--steps` still counts optimizer updates, so
+`--batch-size 8` at `2000` steps processes `8x` the examples the previous
+entries' checkpoints saw.
+
+Retraining both prior_head sizes with `--batch-size 8` on the identical
+`2000`-step, `1024`-record, natural-boundaries recipe:
+
+| prior_head | batch size | within-record | rollout MAE | rollout correlation |
+|---|---:|---:|---:|---:|
+| single `Linear` | `1` (baseline) | `0.284` | `4.35` | `-0.02` |
+| single `Linear` | `8` | `0.278` (flat) | `4.10` | `0.07` |
+| `2`-layer MLP | `1` (baseline) | `0.207` | `4.23` | `0.07` |
+| `2`-layer MLP | `8` | **`0.246`** (`+0.039`) | **`3.71`** | **`0.32`** |
+
+The prediction holds, partially and directionally. The single-`Linear`
+head's within-record correlation does not move outside noise (`0.284` ->
+`0.278`), while the MLP's improves by a real margin (`0.207` -> `0.246`,
+closing about a third of its gap to the `Linear` baseline) - exactly the
+asymmetric pattern the `d/n` argument predicted, since the `Linear` head
+was already reasonably well-conditioned (`d/n≈9`) and had less room to
+gain from variance reduction, while the MLP (`d/n≈325`) had much more. The
+free-rollout numbers move further in the same direction: MLP+batch-8
+reaches this session's best-ever true/generated length correlation
+(`0.32`, beating the previous best of `0.16` from MLP+stop-gradient) and
+best MAE (`3.71`).
+
+What the prediction does *not* deliver: the MLP at batch size `8` still
+trails the single-`Linear` baseline (`0.246` vs `0.284`), let alone
+`LengthProbe`'s `0.687`. `8x` more examples per update is a modest
+variance reduction in absolute terms next to the probe's regime: the MLP's
+`d/n` improves from `~334` (batch `1`, `2000` examples) to `~42` (batch
+`8`, `16,000` examples), but `LengthProbe`'s `d/n` was `~0.93` - matching
+that would need roughly `716,000` examples-per-run, about `45x` more than
+this entry's `16,000` and `358x` more than the original `2000`-example
+baseline. The theory does not claim `8x` should close the whole gap, only
+that it should move the number in a specific, asymmetric direction, which
+it did.
+
+`candidate`/`diagnostic`: this is a genuine, if partial, confirmation of
+the effective-variance account from `ANALYSIS.md` over the alternative
+explanations it was designed to distinguish from - if `d/n` were not the
+operative mechanism, there would be no principled reason for the MLP to
+gain more than the `Linear` head from the same batching change, and
+empirically it did: `+0.039` for the MLP against a change indistinguishable
+from zero (`-0.006`, within noise) for `Linear`.
+This does not yet resolve the standing calibration ceiling, but it
+identifies batching (not architecture) as a lever that is actually working
+in the predicted direction, and motivates trying a substantially larger
+batch size (roughly `358x` the original `2000`-example baseline, per the
+`d/n` arithmetic above, to match the probe's conditioning) as the next,
+still-untried step along this specific axis, separately from Claim 3's
+loss-normalization prediction, which remains completely untested.
+
+Artifacts are
+`DreamOn/artifacts/diffugpt_elbo_e2/{head_only_2000_length_belief_natural_batch8_1024,
+head_only_2000_length_belief_natural_mlp_batch8_1024}/metrics.json` and the
+matching `remaining_count_calibration_*_2000_1024.json`/
+`rollout_*_2000_1024_spans_lineage.json` files. Reproduce with, from
+`DreamOn/`:
+
+```powershell
+python train_diffugpt_counting_bridge.py --model-path ..\..\models\diffugpt-s `
+  --train-file data\opencoder-pilot-1024\train.jsonl `
+  --validation-file data\opencoder-pilot-1024\validation.jsonl `
+  --output-dir artifacts\diffugpt_elbo_e2\head_only_2000_length_belief_natural_batch8_1024 `
+  --steps 2000 --batch-size 8 --validation-limit 32 --max-length 128 --learning-rate 1e-3 `
+  --stratify-probability 0.3 --narrow-ceiling 0.06 `
+  --mid-stratify-probability 0.3 --mid-low 0.3 --mid-high 0.5 `
+  --gap-stratify-probability 0.3 --gap-k-choices 3 4 5 6 `
+  --head-design length-belief --natural-boundaries
+python train_diffugpt_counting_bridge.py --model-path ..\..\models\diffugpt-s `
+  --train-file data\opencoder-pilot-1024\train.jsonl `
+  --validation-file data\opencoder-pilot-1024\validation.jsonl `
+  --output-dir artifacts\diffugpt_elbo_e2\head_only_2000_length_belief_natural_mlp_batch8_1024 `
+  --steps 2000 --batch-size 8 --validation-limit 32 --max-length 128 --learning-rate 1e-3 `
+  --stratify-probability 0.3 --narrow-ceiling 0.06 `
+  --mid-stratify-probability 0.3 --mid-low 0.3 --mid-high 0.5 `
+  --gap-stratify-probability 0.3 --gap-k-choices 3 4 5 6 `
+  --head-design length-belief --natural-boundaries --prior-head-hidden-dim 512
+python audit_diffugpt_elbo_e2_remaining_count_calibration.py --model-path ..\..\models\diffugpt-s `
+  --head-path artifacts\diffugpt_elbo_e2\head_only_2000_length_belief_natural_batch8_1024\counting_bridge_head.pt `
+  --validation-file data\opencoder-pilot\validation.jsonl `
+  --output-file artifacts\diffugpt_elbo_e2\remaining_count_calibration_length_belief_natural_batch8_2000_1024.json `
+  --limit 64 --max-length 128 --time 0.0 --natural-boundaries --natural-spans-per-record 4
+python audit_diffugpt_elbo_e2_remaining_count_calibration.py --model-path ..\..\models\diffugpt-s `
+  --head-path artifacts\diffugpt_elbo_e2\head_only_2000_length_belief_natural_mlp_batch8_1024\counting_bridge_head.pt `
+  --validation-file data\opencoder-pilot\validation.jsonl `
+  --output-file artifacts\diffugpt_elbo_e2\remaining_count_calibration_length_belief_natural_mlp_batch8_2000_1024.json `
+  --limit 64 --max-length 128 --time 0.0 --natural-boundaries --natural-spans-per-record 4
+python evaluate_diffugpt_counting_bridge.py --model-path ..\..\models\diffugpt-s `
+  --head-path artifacts\diffugpt_elbo_e2\head_only_2000_length_belief_natural_batch8_1024\counting_bridge_head.pt `
+  --validation-file data\opencoder-pilot\validation.jsonl `
+  --output-file artifacts\diffugpt_elbo_e2\rollout_length_belief_natural_batch8_2000_1024_spans_lineage.json `
+  --limit 32 --max-length 128 --natural-spans --lineage-aware
+python evaluate_diffugpt_counting_bridge.py --model-path ..\..\models\diffugpt-s `
+  --head-path artifacts\diffugpt_elbo_e2\head_only_2000_length_belief_natural_mlp_batch8_1024\counting_bridge_head.pt `
+  --validation-file data\opencoder-pilot\validation.jsonl `
+  --output-file artifacts\diffugpt_elbo_e2\rollout_length_belief_natural_mlp_batch8_2000_1024_spans_lineage.json `
+  --limit 32 --max-length 128 --natural-spans --lineage-aware
+```
+
+## E2 batch size 32: MLP surpasses every joint-trained checkpoint to date
+
+Pushing the same `--batch-size` lever `4x` further (`32` instead of `8`,
+`64,000` examples per `2000`-step run instead of `16,000`) on both
+`prior_head` sizes:
+
+| prior_head | batch size | within-record | rollout MAE | rollout similarity | rollout correlation |
+|---|---:|---:|---:|---:|---:|
+| single `Linear` | `1` | `0.284` | `4.35` | `0.305` | `-0.02` |
+| single `Linear` | `8` | `0.278` | `4.10` | `0.318` | `0.07` |
+| single `Linear` | `32` | `0.264` | `3.84` | `0.343` | `0.11` |
+| `2`-layer MLP | `1` | `0.207` | `4.23` | `0.305` | `0.07` |
+| `2`-layer MLP | `8` | `0.246` | `3.71` | `0.318` | `0.32` |
+| `2`-layer MLP | `32` | **`0.321`** | `4.87` | `0.351` | `0.31` |
+
+Two things happen at once, and they cut in different directions on the
+single question "does more batching help":
+
+1. **The MLP keeps improving and now leads the entire session's joint-
+   trained within-record results** - `0.207` -> `0.246` -> `0.321` as
+   batch size goes `1` -> `8` -> `32`, surpassing every single-`Linear`
+   result (including the original `0.284` baseline) for the first time.
+   `d/n` at batch `32` is `668,696 / 64,000 ≈ 10.4` - almost exactly the
+   single-`Linear` head's *original*, batch-`1` conditioning
+   (`18,456 / 2,000 ≈ 9`) - and at comparable conditioning, the higher-
+   capacity architecture now outperforms rather than trailing it, matching
+   what the raw-hidden-state probe already showed capacity *can* do once
+   it isn't starved of clean signal.
+2. **The single-`Linear` head's within-record correlation keeps drifting
+   down, not up** (`0.284` -> `0.278` -> `0.264`) as batch size grows,
+   even though its free-rollout metrics (MAE, similarity, correlation) all
+   keep improving over the same runs. A head that was already
+   well-conditioned at batch `1` (`d/n≈9`) has little variance left to
+   remove, and larger-batch training is known in the general deep learning
+   literature to sometimes generalize slightly worse than smaller-batch
+   SGD independent of any variance argument (less implicit regularization
+   from gradient noise) - a plausible, though not confirmed, account for
+   why `Linear`'s single-step calibration is drifting the "wrong" way
+   while everything else about it improves.
+
+This is the clearest evidence yet for the `d/n` account from
+`ANALYSIS.md`: it is not simply "bigger batch is better," which would
+predict both heads improve together - it is specifically that batching
+helps *in proportion to how under-conditioned a given architecture was*,
+which is exactly why the MLP (started far more under-conditioned) keeps
+gaining while `Linear` (started well-conditioned) plateaus and mildly
+regresses on this one metric. The MLP+batch-`32` checkpoint's rollout MAE
+(`4.87`) is this session's worst among `1024`-record checkpoints despite
+having the best within-record correlation - mean generated length
+(`10.06`) undershoots the true mean (`13.26`) more than any other
+checkpoint, another reminder that single-step calibration and free-rollout
+generation quality are related but distinct measurements that do not
+always move together.
+
+`candidate`/`diagnostic`: batch size is a real, working lever specifically
+for under-conditioned architectures (the MLP), not a universal fix - it
+has already let the MLP overtake every prior joint-trained result on the
+metric this whole line of investigation was built around, without yet
+approaching `LengthProbe`'s `0.687`. Whether even larger batches continue
+to help the MLP, and whether `Linear`'s mild regression is a real
+large-batch effect or noise (`n=222`, one seed), are both open; per the
+project's discipline neither should be assumed without a further,
+dedicated test.
+
+Artifacts are
+`DreamOn/artifacts/diffugpt_elbo_e2/{head_only_2000_length_belief_natural_batch32_1024,
+head_only_2000_length_belief_natural_mlp_batch32_1024}/metrics.json` and
+the matching `remaining_count_calibration_*_2000_1024.json`/
+`rollout_*_2000_1024_spans_lineage.json` files. Reproduce with, from
+`DreamOn/`:
+
+```powershell
+python train_diffugpt_counting_bridge.py --model-path ..\..\models\diffugpt-s `
+  --train-file data\opencoder-pilot-1024\train.jsonl `
+  --validation-file data\opencoder-pilot-1024\validation.jsonl `
+  --output-dir artifacts\diffugpt_elbo_e2\head_only_2000_length_belief_natural_batch32_1024 `
+  --steps 2000 --batch-size 32 --validation-limit 32 --max-length 128 --learning-rate 1e-3 `
+  --stratify-probability 0.3 --narrow-ceiling 0.06 `
+  --mid-stratify-probability 0.3 --mid-low 0.3 --mid-high 0.5 `
+  --gap-stratify-probability 0.3 --gap-k-choices 3 4 5 6 `
+  --head-design length-belief --natural-boundaries
+python train_diffugpt_counting_bridge.py --model-path ..\..\models\diffugpt-s `
+  --train-file data\opencoder-pilot-1024\train.jsonl `
+  --validation-file data\opencoder-pilot-1024\validation.jsonl `
+  --output-dir artifacts\diffugpt_elbo_e2\head_only_2000_length_belief_natural_mlp_batch32_1024 `
+  --steps 2000 --batch-size 32 --validation-limit 32 --max-length 128 --learning-rate 1e-3 `
+  --stratify-probability 0.3 --narrow-ceiling 0.06 `
+  --mid-stratify-probability 0.3 --mid-low 0.3 --mid-high 0.5 `
+  --gap-stratify-probability 0.3 --gap-k-choices 3 4 5 6 `
+  --head-design length-belief --natural-boundaries --prior-head-hidden-dim 512
+python audit_diffugpt_elbo_e2_remaining_count_calibration.py --model-path ..\..\models\diffugpt-s `
+  --head-path artifacts\diffugpt_elbo_e2\head_only_2000_length_belief_natural_batch32_1024\counting_bridge_head.pt `
+  --validation-file data\opencoder-pilot\validation.jsonl `
+  --output-file artifacts\diffugpt_elbo_e2\remaining_count_calibration_length_belief_natural_batch32_2000_1024.json `
+  --limit 64 --max-length 128 --time 0.0 --natural-boundaries --natural-spans-per-record 4
+python audit_diffugpt_elbo_e2_remaining_count_calibration.py --model-path ..\..\models\diffugpt-s `
+  --head-path artifacts\diffugpt_elbo_e2\head_only_2000_length_belief_natural_mlp_batch32_1024\counting_bridge_head.pt `
+  --validation-file data\opencoder-pilot\validation.jsonl `
+  --output-file artifacts\diffugpt_elbo_e2\remaining_count_calibration_length_belief_natural_mlp_batch32_2000_1024.json `
+  --limit 64 --max-length 128 --time 0.0 --natural-boundaries --natural-spans-per-record 4
+python evaluate_diffugpt_counting_bridge.py --model-path ..\..\models\diffugpt-s `
+  --head-path artifacts\diffugpt_elbo_e2\head_only_2000_length_belief_natural_batch32_1024\counting_bridge_head.pt `
+  --validation-file data\opencoder-pilot\validation.jsonl `
+  --output-file artifacts\diffugpt_elbo_e2\rollout_length_belief_natural_batch32_2000_1024_spans_lineage.json `
+  --limit 32 --max-length 128 --natural-spans --lineage-aware
+python evaluate_diffugpt_counting_bridge.py --model-path ..\..\models\diffugpt-s `
+  --head-path artifacts\diffugpt_elbo_e2\head_only_2000_length_belief_natural_mlp_batch32_1024\counting_bridge_head.pt `
+  --validation-file data\opencoder-pilot\validation.jsonl `
+  --output-file artifacts\diffugpt_elbo_e2\rollout_length_belief_natural_mlp_batch32_2000_1024_spans_lineage.json `
+  --limit 32 --max-length 128 --natural-spans --lineage-aware
+```

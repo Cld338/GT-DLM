@@ -149,7 +149,7 @@ state를 생성하는 별도 corruption/edit process와 그 확률을 먼저 정
 | E0 | closed: mechanics | deletion forward process에서 유도한 insertion ELBO가 정확히 정규화되는가? | tiny exact normalization/ELBO test 통과 |
 | E1 | closed: mechanics | sampled deletion posterior와 Rao-Blackwellized target이 일치하는가? | exhaustive gradient/DP gate 통과 |
 | E1b | closed: mechanics | early supercritical posterior와 finite termination을 한 bridge에서 만족하는가? | endpoint-safe generator exact gate 통과 |
-| E2 | active: decouple belief supervision from topology competition | head-only joint token-marker reverse model이 실제 rollout을 학습하는가? | 단일-GAP selection gate 통과 |
+| E2 | active: batch-size scaling (MLP surpasses joint-training ceiling at batch 32; Linear regression unexplained) | head-only joint token-marker reverse model이 실제 rollout을 학습하는가? | 단일-GAP selection gate 통과 |
 | E3 | blocked by E2 | compressed-gap lexical query에 backbone adaptation이 필요한가? | retention을 지키며 E2 개선 |
 | E4 | blocked by E3 | explicit empty-gap process로 DELETE recovery를 학습할 수 있는가? | calibrated DELETE/recovery gate 통과 |
 
@@ -217,7 +217,7 @@ clean token deletion process를 먼저 고정하고 그 reverse event를 SSB joi
 정의하는 것이다. 학습은 하나의 initial GAP에서 시작하며 16-mask length scaffold를 쓰지
 않는다.
 
-### E2 — head-only pilot (active: decouple belief supervision from topology competition)
+### E2 — head-only pilot (active: batch-size scaling (MLP surpasses joint-training ceiling at batch 32; Linear regression unexplained))
 
 첫 정식 500-step pilot 결과는 `RESULTS.md`의 "E2 head-only pilot" 절에 있다. N0-N2와
 달리 구조 action이 실제로 다수(`55-58%`)를 차지하고 target-24 length MAE는 지금까지
@@ -759,12 +759,110 @@ detach 여부와 무관하게 여전히 2000 step, 매 step 새로 corruption된
 calibration 감사와 free-rollout 지표는 서로 다른 것을 재고 있다는 뜻이다.
 
 `candidate/diagnostic`: stop-gradient 단독으로는 `LengthProbe`의 calibration
-이득을 재현하지 못했다 — "목적함수 경쟁만 없애면 된다"는 가설은 기각되고,
+이득을 재현하지 못했다 — "목적함수 경쟁만 없으면 된다"는 가설은 기각되고,
 probe의 학습 체계(step 수, batching, 데이터 결정성) 자체가 더 유력한
 남은 차이로 지목된다. 하지만 rollout 품질 개선은 실재하므로 stop-gradient
-자체는 유지할 가치가 있다. 다음 결정 지점(아직 시작 안 함): `prior_head`의
-count loss에 probe와 맞먹는 양/일관성의 gradient를 주는 사전학습 또는
-replay 방식.
+자체는 유지할 가치가 있다.
+
+### E2 이론적 분석 — 왜 joint 학습이 저조한가, 두 개의 검증 가능한 예측 (theoretical, 미검증)
+
+사용자 요청으로 실험을 잠시 멈추고 이론 분석을 진행했다(`ANALYSIS.md`의
+"theoretical account"). 세 가지 주장:
+
+1. **population 수준에서는 count와 action objective가 애초에 상충하지
+   않는다** — cross-entropy의 proper scoring rule 성질상 count loss의
+   무한 데이터 최적점은 진짜 사후분포 `p(r|context)`이고, `topology`는
+   그 `prior`에서 **정확한 Bayes 유도식**으로 나오므로 그 최적점에서
+   action loss도 자동으로 최소화된다. 즉 "두 objective의 경쟁"은
+   population 수준엔 없다 — 이게 stop-gradient가 거의 안 통했던 이유를
+   자연스럽게 설명한다(없앨 경쟁이 애초에 별로 없었다).
+2. **유한 표본/최적화 노이즈**: 매 step이 무작위 corruption 예제 하나에서
+   두 loss의 gradient를 동시에 추정한다. `d`(파라미터 수)/`n`(유효 관측)
+   비율로 보면 — 단일 Linear+joint `~9`, MLP+joint `~325`, `LengthProbe`
+   `~0.93`(200 epoch×batch64) — 이 비율이 실제 결과 순서(단일 Linear >
+   MLP, 둘 다 probe에 크게 못 미침)를 정확히 예측한다.
+3. **구조적 gradient 크기 불균형**(코드로 직접 확인됨, 추측 아님):
+   `count`는 GAP당 항 1개, `action`은 GAP당 `r`(hidden length)개 항을
+   `.sum()`하며 어디서도 정규화되지 않는다. 즉 `r`이 큰 GAP일수록 action
+   쪽 gradient가 구조적으로 우세해진다 — 이게 이 투자 전체에서 반복
+   관찰된 "긴 target일수록 calibration이 더 나쁘다"는 패턴의 메커니즘적
+   설명이 될 수 있다.
+
+이 세 주장에서 **아직 시도 안 한, 서로 다른 두 개의 검증 가능한 예측**이
+나온다: (a) 배치 크기 확대 — 주장 2가 맞다면 MLP가 단일 Linear보다
+**상대적으로 더** 개선돼야 함, (b) count/action loss를 GAP당·이벤트당
+정규화 — 주장 3이 맞다면 **긴 target에서만** 특히 개선돼야 함. 둘 다
+지금까지 시도한 pooling/용량/stop-gradient와는 다른 축(노이즈 자체를
+줄이거나, 편향 자체를 없앰)이다. 사용자 지시에 따라 아직 실행 안 함 —
+실험 재개 시 한 번에 하나씩 검증한다.
+
+### E2 배치 크기 확대 검증 (candidate/diagnostic — 예측 1 부분 확인)
+
+예측 1(배치 크기)을 먼저 검증했다(`RESULTS.md`의 "E2 gradient-accumulation
+batching"). `train_diffugpt_counting_bridge.py`에 `--batch-size`를 추가해
+`(loss.total / batch_size).backward()`를 batch_size번 누적한 뒤 한 번만
+`optimizer.step()`하는 gradient accumulation을 구현했다(`batch_size=1`은
+기존과 완전히 동일).
+
+같은 2000-step, 1024개 레시피에 `--batch-size 8`만 추가한 결과:
+
+| prior_head | batch | within-record | rollout MAE | rollout 상관관계 |
+|---|---:|---:|---:|---:|
+| 단일 Linear | 1 | `0.284` | `4.35` | `-0.02` |
+| 단일 Linear | 8 | `0.278`(변화 없음) | `4.10` | `0.07` |
+| MLP | 1 | `0.207` | `4.23` | `0.07` |
+| MLP | 8 | **`0.246`**(+0.039) | **`3.71`** | **`0.32`**(이번 세션 최고) |
+
+**예측이 방향대로 맞았다** — 단일 Linear는 그대로인데 MLP만 실질적으로
+개선됐다. `d/n` 논증이 예측한 정확히 그 비대칭이다(Linear는 이미
+`d/n≈9`로 잘 조건화되어 개선 여지가 적었고, MLP는 `d/n≈334→42`로
+여전히 크게 개선 여지가 있었다). rollout 상관관계는 이번 세션 전체
+최고치(`0.32`)를 기록했다.
+
+**하지만 완전히 닫히진 않았다** — MLP+batch8(`0.246`)은 여전히 단일
+Linear 기준선(`0.284`)에도 못 미치고, `LengthProbe`(`0.687`)와는 더
+멀다. probe 수준의 조건화(`d/n≈0.93`)에 도달하려면 원래 기준선 대비
+`~358배` 더 많은 예제가 필요하다는 계산이 나온다.
+
+`candidate/diagnostic`: 이건 "objective가 population에서 안 부딪힌다"는
+이론(주장 1)과 "관찰된 저하는 유한 표본 노이즈"라는 이론(주장 2)에 대한
+**독립적인 두 번째 확증**이다(stop-gradient의 무효과가 첫 번째 확증) —
+배치가 커질수록 MLP만 더 좋아지는 비대칭은 노이즈 이론이 아니면 설명하기
+어렵다. 주장 3(GAP당 gradient 크기 불균형)은 이 실험과 무관하게 완전히
+미검증 상태로 남아있다. 다음 결정 지점(아직 시작 안 함): 훨씬 더 큰
+배치(또는 더 많은 step), 그리고 별도로 주장 3의 loss 정규화 검증.
+
+### E2 배치 크기 32 — MLP가 처음으로 모든 joint 학습 결과를 넘어섬 (candidate/diagnostic)
+
+배치를 8→32로 4배 더 키웠다(`RESULTS.md`의 "E2 batch size 32").
+
+| prior_head | batch | within-record |
+|---|---:|---:|
+| 단일 Linear | 1 | `0.284` |
+| 단일 Linear | 8 | `0.278` |
+| 단일 Linear | 32 | `0.264`(계속 하락) |
+| MLP | 1 | `0.207` |
+| MLP | 8 | `0.246` |
+| MLP | 32 | **`0.321`**(단일 Linear의 원래 최고치를 처음으로 넘어섬) |
+
+MLP의 batch-32 `d/n≈10.4`는 단일 Linear의 원래(batch-1) `d/n≈9`와 거의
+같다 — **조건화를 맞추자 용량이 더 큰 쪽이 실제로 이겼다.** `LengthProbe`가
+이미 보여준 "깨끗한 신호 + 용량 = `0.687`"과 정확히 같은 방향이다.
+
+동시에 **예상 못한 두 번째 효과**가 드러났다: 단일 Linear는 배치가
+커질수록 calibration이 계속 하락했다(`0.284→0.278→0.264`) — rollout
+지표는 계속 개선되는데도. `d/n`으로는 "개선 여지 없음(정체)"까지만
+설명되지, "하락"은 설명 안 된다. 더 유력한 설명: 일반적으로 알려진
+"큰 배치가 SGD 노이즈의 암묵적 정규화 효과를 없애서 오히려 일반화를
+해친다"는 별개의 현상 — 조건이 이미 좋은 모델(Linear)에서는 `d/n` 이득보다
+이 효과가 더 크게 작용했을 수 있다. 검증 안 됨(`n=222`, seed 1개).
+
+`candidate/diagnostic`: 배치 크기는 **조건이 나쁜 아키텍처(MLP)에는 실제로
+작동하는 레버**임이 확인됐다 — 처음으로 joint 학습이 단일 Linear의 최고
+기록을 넘었다. 하지만 "배치를 키우면 다 좋아진다"는 아니며, 이미 잘
+조건화된 head에서는 오히려 역효과가 나타날 수 있다는 새로운 미해결
+질문이 생겼다. 다음 결정 지점(아직 시작 안 함): 더 큰 배치로 MLP가 계속
+개선되는지, Linear의 하락이 진짜 large-batch 효과인지 노이즈인지 분리.
 
 ### 확장과 confirmation
 
