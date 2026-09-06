@@ -558,3 +558,332 @@ is exactly the kind of result the project's "change one axis, verify before
 declaring a fix" discipline exists to catch, and it very nearly slipped
 through - the `0.679` number was reported as this investigation's best
 result for two entries before the confound was found and removed.
+
+## 2026-09-06: the remaining length signal is real, just weak - not a confound in disguise
+
+With the runaway-growth confound gone, the natural question about the
+surviving weak single-step correlation (`0.225`, "E2 length-belief
+instability isolated") was whether *it* was also secretly a confound: the
+`--natural-boundaries` audit pools several spans per record, so a positive
+correlation could come entirely from "some records have longer natural
+spans everywhere" - a document-level property the model could exploit
+without ever looking at which specific span it's being asked about, which
+would say nothing about the calibration this project actually needs (a
+root GAP's belief responding to *its own* local context).
+
+`grouped_correlations` (`RESULTS.md`, "E2 root-belief calibration
+decomposed") answers this with the standard fixed-effects decomposition:
+center both true length and predicted remaining by their own record's mean
+before correlating, isolating genuine within-record (per-span) signal from
+the between-record (document-level) one. The result reverses the worry
+rather than confirming it: within-record correlation (`0.244`) is *larger*
+than between-record (`0.133`), not smaller. The model is not coasting on a
+document-level shortcut - it is doing more of the harder thing (telling two
+different-length spans apart within the same surrounding text) than the
+easier thing (telling one document's typical span length from another's).
+
+This sharpens, rather than closes, the open question from the "standard
+solutions" discussion. Of the three-part recipe NAT/blank-language-model
+length prediction uses - dedicated supervised head, corruption tied to real
+data, and a context-summary input - SSB already has the first two, and they
+are producing a genuine (if weak) signal, not an inflated confound. What
+remains is specifically the third piece: `LengthBeliefSSBHead.prior_head`
+only ever sees the GAP position's own local hidden state, never a pooled
+summary of the surrounding prefix/suffix the way NAT's length classifier
+or BLM's blank predictor condition on their whole source. The `0.244`
+within-record number is now the concrete baseline any change to that input
+representation needs to beat to count as progress rather than a relabeled
+version of the same signal.
+
+## 2026-09-06: pooling context did not beat the baseline it was built to beat
+
+`RESULTS.md` ("E2 pooled-context root belief") ran the natural next test:
+give `prior_head` a mean-pooled summary of the whole visible context
+alongside the local GAP hidden state, then re-measure the within/between
+decomposition. The result does not clear the `0.244` bar - within-record
+correlation is `0.207`, marginally worse, not better. More informative than
+the miss itself is *where* the correlation moved: between-record roughly
+doubled (`0.133` -> `0.239`). Concatenating a whole-context mean gave the
+head an easy, coarse "which document is this" signal to lean on, and it
+appears to have leaned on exactly that rather than on anything finer-
+grained - the opposite of the intended effect, and a mild echo of the
+document-level confound the previous entry spent its effort ruling out as
+*not* the explanation for the pre-pooling baseline.
+
+This does not overturn the standard-recipe diagnosis; it narrows it. The
+recipe's third piece (a context-summary input) was the right *category* of
+fix to try, but "mean-pool everything visible" turned out to be the wrong
+*operator* within that category, or 500 steps were too few for a
+double-width `prior_head` to learn to use it - the two explanations were
+not separated, deliberately, per the project's one-axis-at-a-time
+discipline; disentangling them is now its own decision point rather than
+grounds for concluding the whole approach is dead. The one piece of
+evidence that leans mildly toward "wrong operator" over "not enough
+steps": `count_loss_per_gap` fell further during this run than the
+non-pooled recipe typically shows (`8.28` -> `4.62`), meaning the extra
+capacity was learning to fit *something* in the training distribution -
+just not, on this evidence, the within-record generalization the
+calibration audit measures. A flat mean necessarily discards position,
+which is exactly what a genuine per-span cue (distance to the next line
+boundary, brace depth near the GAP) needs to survive pooling; an
+attention-weighted summary or explicit local structural features would
+preserve it and have not yet been tried.
+
+## 2026-09-06: attention pooling fixes the confound, not the ceiling
+
+`RESULTS.md` ("E2 attention-pooled root belief") tried the operator the
+previous entry left open: `ContextAttentionPool` lets each GAP's hidden
+state query the visible context's raw, un-pooled hidden states, so
+position survives the way it could not survive a flat mean. The result
+splits the previous entry's two tangled findings apart cleanly. The part
+that was a real regression - `prior_head` leaning on a coarse document-
+identity shortcut, visible as between-record correlation nearly doubling
+under mean pooling (`0.133` -> `0.239`) - is gone (`0.123` under attention
+pooling, back at the no-pooling baseline). That confirms position was
+indeed the missing ingredient the mean was discarding, exactly as
+hypothesized. But the part that mattered more - within-record correlation
+clearing `0.244` - still does not happen (`0.236`, statistically
+indistinguishable from baseline given `n=222`). Fixing the operator
+recovered the baseline rather than beating it.
+
+This means the "wrong operator vs. not enough steps" ambiguity from the
+mean-pooling entry survives, unresolved, rather than being settled by
+switching operators - both entries are equally consistent with "500 steps
+is too few regardless of pooling shape" as they are with the more
+structural possibility this session has now tried the two most obvious
+`context_pool` designs (flat mean, single-head attention) and neither adds
+information beyond what the frozen backbone's own GAP-position hidden
+state already made available to a plain linear head. Distinguishing those
+is exactly the "independent causal evidence" `RESEARCH_DIRECTION.md`
+section 9 requires before opening backbone adaptation (E3, LoRA or
+otherwise) - and is precisely why that section gates backbone adaptation
+behind such evidence rather than treating "we tried a fix at the frozen-
+backbone layer and it didn't fully work" as sufficient grounds on its own.
+Two well-defined, still-untried next probes would separate them: a longer
+run at the current architecture (tests "not enough steps"), or a
+diagnostic that queries whether the *raw* GAP-position hidden state is
+even linearly decodable for length under an unlimited-capacity probe
+(tests "the frozen representation is the ceiling" independent of which
+head architecture is layered on top of it). Neither has been run.
+
+## 2026-09-06: more steps help, but they help the plain head more than the pooled one
+
+`RESULTS.md` ("E2 longer training") ran the first of the two probes above:
+retrain both the no-pooling baseline and the attention-pooling checkpoint
+at `4x` the step budget (`2000` vs `500`), same corpus, same corruption
+recipe. "Not enough steps" is now a confirmed, real contributor - both
+configurations' within-record correlation improves (`0.244` -> `0.286` for
+no-pooling, `0.236` -> `0.248` for attention-pooling). That is a genuine,
+usable finding on its own: this project's stop-rule against "step increase
+without independent causal evidence" was written for the earlier
+point-estimate design under N2, and this result is exactly the independent
+evidence that justifies revisiting step count for the *current*
+length-belief + natural-boundaries line specifically, not a violation of
+that rule.
+
+But the more surprising result is directional, not just magnitude: the gap
+between no-pooling and attention-pooling *widens* with more training
+(`0.244` vs `0.236`, nearly tied, at `500` steps; `0.286` vs `0.248`, a real
+gap, at `2000`), and attention-pooling's between-record correlation grows
+nearly twice as fast as its within-record one over the same steps (`0.123`
+-> `0.218` vs `0.236` -> `0.248`). This is the same document-identity-
+leaning failure mode mean pooling showed immediately - just emerging slowly
+in the higher-capacity, more expressive attention variant as training
+accumulates, rather than being absent from it. Read together with the
+finding that follows from it (training is `~256` documents seen roughly
+`8` times over at `2000` steps), the honest interpretation is not "pooling
+is confirmed useless" but "this experiment cannot yet distinguish pooling
+being intrinsically confound-prone from pooling simply having more
+parameters with which to overfit a small, repeatedly-seen corpus faster
+than the plain head does." Those predict the same observed direction
+(pooled variants drifting toward between-record reliance under repeated
+exposure) but have different implications: the first says stop building
+context-summary inputs; the second says re-run this exact comparison after
+scaling the training corpus before concluding anything about the pooling
+operator itself.
+
+This sharpens the standing "is the ceiling the frozen backbone's
+representation" question from a different angle than the one raised
+previously: before that question is answerable at all, the data-scale
+confound has to be removed, since a representation-scale ceiling and a
+data-scale one predict the same symptom (calibration plateaus regardless
+of head architecture) on a `256`-document corpus. `prepare_opencoder_pilot.py`
+already supports fetching a larger deterministic sample from the same
+source dataset (`OpenCoder-LLM/opc-sft-stage2`) via `--train-size`/
+`--validation-size` - scaling the corpus is a data-collection change, not
+a modeling one, and is the next lever this investigation has not yet
+pulled at all.
+
+## 2026-09-06: data scale explains the gap between architectures, not the plateau itself
+
+`RESULTS.md` ("E2 scaled training corpus") pulled that lever, carefully:
+`prepare_opencoder_pilot.py` could not just be re-run with a larger
+`--train-size`, because its shuffle is seeded over the *whole* fetched
+pool, so a bigger request silently reshuffles which records land in
+validation - quietly invalidating every comparison in this document, which
+all share one fixed `64`-record validation file. `scale_opencoder_train.py`
+sidesteps this by only adding new, hash-deduplicated records to a copy of
+the training file and leaving validation untouched (checked byte-identical
+via `diff`) - the general lesson being that "just fetch more data with the
+same script" is not safe once a fixed evaluation set has become load-
+bearing across many entries.
+
+The result cleanly separates the two things the previous entry's
+"data-scale vs. representation-scale" framing had conflated. Scaling
+`256 -> 1024` training records did nothing measurable for the no-pooling
+baseline (`0.286 -> 0.284`) but did meaningfully help attention pooling
+(`0.248 -> 0.268`), closing most of the gap between them. That confirms
+part of the previous entry's hypothesis: attention pooling's extra
+capacity (`135,320` vs `18,456` parameters) was indeed more data-hungry,
+and its underperformance at `256` records was at least partly a small-data
+artifact, not solely an intrinsic flaw in the operator.
+
+What did *not* resolve is the between-record creep. If it were purely a
+symptom of too little data, more data should have shrunk it relative to
+within-record; instead attention pooling's between-record correlation grew
+right alongside its within-record one (`0.218 -> 0.231` alongside
+`0.248 -> 0.268`). The more consistent reading across all of this: a
+higher-capacity architecture fits *more* of whatever correlational
+structure exists in a given amount of data - real per-span signal and
+coarse per-document coincidence together - rather than selectively
+learning one over the other. More data does not filter that out; it just
+gives the same tendency more to work with in both directions at once.
+
+Zooming out past this entry and the previous two: within-record
+correlation has now been pushed on by three independent axes - pooling
+operator (mean, attention, none), training steps (`500`, `2000`), and
+training data (`256`, `1024` records) - and none of them, alone or
+combined, has moved the number past roughly `0.28-0.29`. That is
+suggestive of a real ceiling rather than a trend still climbing, but a
+`4x` data increase is a modest scale-up in absolute terms, so it narrows
+the "needs more data" hypothesis considerably without fully closing it.
+The most direct remaining test - an unlimited-capacity probe on the frozen
+backbone's raw GAP-position hidden state, independent of any `prior_head`
+design choice - has still not been run, and is now the more clearly
+indicated next step than either more pooling variants or another round of
+step/data scaling.
+
+## 2026-09-06: the plateau was never about the backbone
+
+`RESULTS.md` ("E2 raw-hidden-state probe") ran that most-direct remaining
+test, and it overturns the reading every entry since "E2 pooled-context
+root belief" had been converging toward. An unconstrained MLP trained
+solely on length regression, with no other objective competing for its
+capacity, reaches `0.687` within-record correlation on the exact same
+validation spans every `prior_head` variant was measured against - more
+than double the best `prior_head` result (`0.284`) across every combination
+of pooling operator, step count, and data scale tried this session. The
+`~0.28-0.29` plateau was real, but it was a property of the *heads*, not of
+the representation they were reading from. The frozen backbone's
+GAP-position hidden state was carrying the answer the whole time.
+
+This is worth sitting with, because the previous three entries' reasoning
+was not sloppy - it was a textbook instance of a specific, easy-to-miss
+mistake. "We varied several things about component A (the head: pooling
+operator, steps it was trained for, data it was trained on) and none of
+them moved the metric past a plateau" is genuine evidence that *those
+specific variations of A* are not the bottleneck. It is not evidence about
+component B (the backbone representation) at all, no matter how naturally
+it reads that way once "not A" starts to feel like it must mean "must be
+B" - there was a third possibility neither ruled out nor considered
+explicitly enough: A itself, but along an axis not yet varied (raw
+capacity, or freedom from a competing joint objective). `RESEARCH_DIRECTION.md`
+section 9's insistence on "independent causal evidence" before opening
+backbone adaptation is precisely the discipline that caught this before a
+LoRA experiment was run on the strength of an inference rather than a
+direct test - the stop-rule did its job here exactly as designed, even
+though the entry that finally supplied the "independent evidence" reversed
+the standing hypothesis rather than confirming it.
+
+Two changes were bundled into `LengthProbe` relative to every `prior_head`
+tried before it - far more capacity, and a training objective undivided by
+the topology/token-NLL losses `loss_from_candidates` also optimizes - and
+this result cannot yet say which one did the work, or how much each
+contributed. That is the next question, and it is a cheap one to answer
+(a bigger `prior_head`, still trained jointly as before, isolates
+capacity alone) - not backbone adaptation, which this entry's evidence
+argues directly against opening.
+
+## 2026-09-06: it was the shared objective, not the capacity
+
+`RESULTS.md` ("E2 MLP prior_head, joint training") answered the question
+the previous entry left open, and the answer is not the intuitive one.
+Giving `prior_head` the exact same architecture as `LengthProbe` (a
+`2`-hidden-layer, `512`-wide MLP, `668,696` parameters) while keeping it
+trained *jointly*, exactly as every prior `prior_head` was, does not close
+the gap to the standalone probe's `0.687`. It does not even match the
+plain single-`Linear` baseline's `0.284` - it comes in at `0.207`, mildly
+*worse*. Capacity was never the bottleneck; the shared objective is.
+
+The mechanism is visible in the loss's own structure, not just inferred
+from the outcome: `topology_log_probabilities` is *derived* from the same
+`prior` that the count loss supervises directly
+(`marker_probabilities_from_prior` in `length_belief_head.py`), so
+`prior_head`'s parameters have always answered to two different demands at
+once - match the true hidden length exactly, and simultaneously produce a
+topology distribution that maximizes the candidate action's likelihood.
+Those two demands are not obviously aligned (a prior shaped to be a sharp,
+accurate belief about `r` is not necessarily the prior that also makes the
+best topology classifier), and a higher-capacity network has more
+parameters with which to settle into a compromise that serves neither
+demand as well as a smaller network settling into a rougher one - not
+because it is a worse learner, but because there is more room in a bigger
+network to overfit to the *interaction* between two competing pulls within
+a fixed, shared step budget.
+
+This reframes the whole "E2 root-belief calibration" line's next move.
+Every intervention tried under joint training - two pooling operators,
+more steps, more data, and now more capacity - has landed within or below
+the same `~0.2-0.29` band. The one intervention that broke through
+(`0.687`) removed the shared objective entirely. The next architectural
+question is therefore not "how do we make `prior_head` extract more from
+`hidden`" (answered: it already can, once freed from competing with
+topology) but "how do we free the belief supervision inside the *joint*
+model from that competition" - a staged/curriculum training split, a
+stop-gradient somewhere in the topology path's dependence on `prior`, or
+an auxiliary loss schedule that lets the count objective dominate early -
+none of which are implemented yet.
+
+## 2026-09-06: stop-gradient wasn't the missing piece either - the training regime was
+
+`RESULTS.md` ("E2 stop-gradient decoupling") tried the cheapest of the
+three options the previous entry named: sever the action loss's gradient
+into `prior_head` via `prior.detach()` before deriving topology from it,
+so only the count loss's direct length supervision reaches `prior_head`'s
+parameters - mechanically the same "undivided objective" property
+`LengthProbe` had, applied surgically inside the joint model instead of by
+training a separate network. It did not work: within-record correlation
+is unchanged for the single-`Linear` head (`0.284` -> `0.279`, noise) and
+barely moves for the MLP (`0.207` -> `0.219`, still well below the
+single-`Linear` baseline, let alone the probe's `0.687`).
+
+This means the "objective competition" explanation from the previous entry
+was real but incomplete. Detaching the gradient path reproduces one
+property of `LengthProbe`'s setup - an undivided objective - but not the
+others: the probe trained for `~11,000` gradient steps over `200` epochs
+of a *fixed, pre-extracted* `3,517`-example dataset with `batch_size=64`,
+while `prior_head` (detached or not) still only sees `2000` single-example
+online steps, each drawn from a freshly corrupted state with its own
+random time/arrangement noise. Removing the competing gradient pull was
+necessary to test but evidently not sufficient - the sheer quantity and
+consistency of gradient signal specifically earmarked for the count
+objective apparently also matters, and remains untested in isolation
+(e.g., many more steps with `detach_prior_for_topology=True`, or a
+dedicated pre-training phase for `prior_head` on cached states before
+joint fine-tuning).
+
+A smaller but genuinely useful finding survives the calibration audit's
+null result: stop-gradient improved every *free-rollout* metric measured
+(finish rate, length MAE, similarity, and the still-weak true/generated
+correlation) for both prior_head sizes, with the MLP+detach combination
+reaching this session's best similarity (`0.360`) and best correlation
+(`0.16`) at the cost of a larger undershoot. The single-step calibration
+audit and the free-rollout metrics are not measuring the same thing - a
+GAP's belief can fail to track true length any better in isolation while
+still producing topology decisions that compose into a more *internally
+consistent* trajectory once the belief is no longer being pulled toward
+"whatever also happens to maximize action likelihood" at every step. Both
+readings are legitimate; neither one alone tells the whole story, which is
+itself a reminder that a single audit - however carefully controlled - is
+a lens, not the complete picture, of what "working" means for this
+system.

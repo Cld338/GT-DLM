@@ -1561,3 +1561,784 @@ python audit_diffugpt_elbo_e2_sibling_inflation.py --model-path ..\..\models\dif
   --output-file artifacts\diffugpt_elbo_e2\sibling_inflation_length_belief_natural_lineage.json `
   --limit 32 --max-length 128 --natural-spans --lineage-aware
 ```
+
+## E2 root-belief calibration decomposed: the natural-boundary signal is genuine, not a document-level confound
+
+The standard fix for "a compressed placeholder must still carry context-
+correlated length" is the recipe NAT length-prediction and blank/insertion
+language models use: (1) a dedicated head with direct cross-entropy
+supervision on the true count - `LengthBeliefSSBHead` already has this: (2)
+corruption tied to real document structure instead of context-independent
+span sampling - `--natural-boundaries` already does this; (3) a
+context-summary input to the length head rather than one local hidden
+state - not yet done. Before adding (3), the single-step natural-boundaries
+correlation already on record (`0.225`, "E2 length-belief instability
+isolated") needed a sharper check: pooling several spans per record could
+make that number look like real per-span calibration when it is actually
+just a coarse "some records have longer content everywhere" confound - the
+model would never need to look at *which* span it's asked about to produce
+it.
+
+`grouped_correlations` (`audit_diffugpt_elbo_e2_remaining_count_calibration.py`)
+decomposes the pooled correlation via the standard group-mean-centering
+trick: `between_record` (each record's own mean true length vs mean
+predicted remaining - the confound) and `within_record` (both series
+centered by their record's mean, pooled across the `57` records with 2+
+sampled spans - the genuine per-span signal). `tests/test_calibration_decomposition.py`
+(`8/8`) checks it against constructed cases where pooled and within-record
+correlation deliberately disagree, including one where they point in
+opposite directions. Re-running the same `head_only_500_length_belief_natural`
+checkpoint query from that earlier entry:
+
+| metric | value |
+|---|---:|
+| pooled (`225` examples) | `0.225` |
+| between-record (`60` records) | `0.133` |
+| **within-record** (`222` samples, `57` multi-span records) | **`0.244`** |
+
+The within-record component is not smaller than the pooled number - it is
+slightly larger. The document-level confound this check was built to rule
+out is real but weaker (`0.133`) than the genuine per-span signal
+(`0.244`): the model does distinguish a longer natural span from a shorter
+one drawn from the *same* surrounding context more than it distinguishes
+one document's typical span length from another's. Option 2 of the
+standard recipe ("tie corruption to real data") has done what it can - the
+signal it produces is real, not an artifact - and the ceiling on that
+signal (`~0.24`, far from `1.0`) is now attributable to what's left of the
+recipe: the root-belief head sees only the GAP position's own local hidden
+state, not a summary of the surrounding context that could carry a
+stronger version of the same per-span cues DreamOn's literal mask count
+would have made explicit.
+
+`closed: diagnostic`. This rules out the "it's just a document-level
+confound" explanation for the natural-boundaries checkpoint's weak
+correlation and hands a specific number to beat: any change to the root
+belief's input representation (option 3 of the standard recipe - a
+pooled/global context vector alongside the local hidden state) should be
+judged against `0.244` within-record, not the more easily-inflated pooled
+number, to know whether it adds genuine signal or just re-introduces a
+document-level confound under a different name.
+
+Artifacts are
+`DreamOn/artifacts/diffugpt_elbo_e2/remaining_count_calibration_length_belief_natural_decomposed.json`.
+Reproduce with, from `DreamOn/`:
+
+```powershell
+python audit_diffugpt_elbo_e2_remaining_count_calibration.py --model-path ..\..\models\diffugpt-s `
+  --head-path artifacts\diffugpt_elbo_e2\head_only_500_length_belief_natural\counting_bridge_head.pt `
+  --validation-file data\opencoder-pilot\validation.jsonl `
+  --output-file artifacts\diffugpt_elbo_e2\remaining_count_calibration_length_belief_natural_decomposed.json `
+  --limit 64 --max-length 128 --time 0.0 --natural-boundaries --natural-spans-per-record 4
+```
+
+## E2 pooled-context root belief: negative result at 500 steps
+
+Option 3 of the standard NAT/blank-language-model length-prediction recipe
+- a context-summary input to the length head, rather than one local hidden
+state - is the only piece SSB was missing (`RESULTS.md`, "E2 root-belief
+calibration decomposed"; `ANALYSIS.md`, "the remaining length signal is
+real, just weak"). `LengthBeliefSSBHead(..., use_context_pool=True)`
+implements it: `prior_head`'s input becomes the local GAP hidden state
+concatenated with `pooled_context_vector` - the mean of the backbone's
+hidden states over every *visible* (non-GAP) position in the canvas -
+mirroring how NAT's length classifier and BLM's blank predictor condition
+on their whole source. Off by default (`prior_head`'s input size only
+changes when `use_context_pool=True`); `context_pool_for()` in
+`train_diffugpt_counting_bridge.py` and the equivalent inline computation
+in `evaluate_diffugpt_counting_bridge.rollout()` and
+`audit_diffugpt_elbo_e2_remaining_count_calibration.query_remaining()`
+compute it only when the head asks for it, so every existing checkpoint and
+script is unaffected. `tests/test_length_belief_head.py` gained `9` new
+tests (`PooledContextVectorTest`, `ContextPoolHeadTest`) - `160/160` total.
+A 5-step smoke test confirmed the wiring end-to-end before committing to a
+full run (parameter count exactly doubles to `36,888` from `18,456`, as the
+doubled `prior_head` input predicts).
+
+Retraining the identical 500-step `head_only_500_length_belief_natural`
+recipe with `--use-context-pool` added, then re-running the same
+within/between-record decomposition audit that produced the `0.244`
+baseline:
+
+| checkpoint | pooled | between-record | within-record |
+|---|---:|---:|---:|
+| length-belief + natural (baseline) | `0.225` | `0.133` | **`0.244`** |
+| length-belief + natural + context-pool | `0.207` | `0.239` | **`0.207`** |
+
+The pooled-context checkpoint does not beat the baseline it was built to
+beat - if anything it is slightly worse on the metric that matters
+(within-record `0.207` vs `0.244`), while its between-record correlation
+roughly doubles (`0.133` -> `0.239`). That shift is the opposite of what
+this change was for: a coarse, whole-context mean is apparently easier for
+`prior_head` to lean on for "which document is this" than for "which span
+within this document," so adding it appears to have nudged the model
+toward the confound this line of investigation spent the previous entry
+ruling out, rather than away from it. A natural-spans free-rollout check
+(with `--lineage-aware`, the best combination on record) shows the same
+picture - finish rate `93.5%`, MAE `4.48`, similarity `0.299`, true/generated
+correlation `-0.070` - statistically indistinguishable from the
+non-pooled+lineage-aware checkpoint's `90.3%`/`4.84`/`0.292`/`-0.058` from
+the previous entry, given `n=31`.
+
+`rejected` (at this configuration): naive mean-pooling over all visible
+context, at `500` training steps with an otherwise-unchanged recipe, is not
+an improvement. Two confounded explanations remain open and were not
+separated here, per the project's one-axis-at-a-time discipline: (a) `500`
+steps may simply be too few for a head with double the input dimensionality
+to learn to use the new signal well - `count_loss_per_gap` did fall
+substantially more during this run (`8.28` -> `4.62`) than the non-pooled
+recipe typically shows, which is at least consistent with the new capacity
+being used for *something*, just not (yet, or ever) genuine per-span
+calibration; (b) an unweighted mean over the entire visible context may be
+the wrong pooling operator - it necessarily discards *position*, which is
+exactly the cue a real per-span length signal (distance to the next line
+boundary, brace/indentation depth near the GAP) would need to survive
+pooling. Neither more steps nor a smarter pooling operator (e.g. an
+attention-weighted summary, or explicit local structural features) has been
+tried; per section 9's stop-rule, that is a new, deliberate decision point,
+not a default next action.
+
+Artifacts are
+`DreamOn/artifacts/diffugpt_elbo_e2/{head_only_500_length_belief_natural_pooled/metrics.json,
+remaining_count_calibration_length_belief_natural_pooled.json,
+rollout_length_belief_natural_pooled_spans_lineage.json}`. Reproduce with,
+from `DreamOn/`:
+
+```powershell
+python train_diffugpt_counting_bridge.py --model-path ..\..\models\diffugpt-s `
+  --train-file data\opencoder-pilot\train.jsonl `
+  --validation-file data\opencoder-pilot\validation.jsonl `
+  --output-dir artifacts\diffugpt_elbo_e2\head_only_500_length_belief_natural_pooled `
+  --steps 500 --validation-limit 32 --max-length 128 --learning-rate 1e-3 `
+  --stratify-probability 0.3 --narrow-ceiling 0.06 `
+  --mid-stratify-probability 0.3 --mid-low 0.3 --mid-high 0.5 `
+  --gap-stratify-probability 0.3 --gap-k-choices 3 4 5 6 `
+  --head-design length-belief --natural-boundaries --use-context-pool
+python audit_diffugpt_elbo_e2_remaining_count_calibration.py --model-path ..\..\models\diffugpt-s `
+  --head-path artifacts\diffugpt_elbo_e2\head_only_500_length_belief_natural_pooled\counting_bridge_head.pt `
+  --validation-file data\opencoder-pilot\validation.jsonl `
+  --output-file artifacts\diffugpt_elbo_e2\remaining_count_calibration_length_belief_natural_pooled.json `
+  --limit 64 --max-length 128 --time 0.0 --natural-boundaries --natural-spans-per-record 4
+python evaluate_diffugpt_counting_bridge.py --model-path ..\..\models\diffugpt-s `
+  --head-path artifacts\diffugpt_elbo_e2\head_only_500_length_belief_natural_pooled\counting_bridge_head.pt `
+  --validation-file data\opencoder-pilot\validation.jsonl `
+  --output-file artifacts\diffugpt_elbo_e2\rollout_length_belief_natural_pooled_spans_lineage.json `
+  --limit 32 --max-length 128 --natural-spans --lineage-aware
+```
+
+## E2 attention-pooled root belief: recovers the baseline, still doesn't beat it
+
+Mean pooling's failure mode (previous entry) was specific, not generic:
+`prior_head` leaned on the pooled vector as a document-identity shortcut
+(between-record correlation nearly doubled) rather than a per-span signal.
+`ContextAttentionPool` (`src/ssb/length_belief_head.py`) replaces the flat
+mean with a learned query/key attention from each GAP's own hidden state
+over the visible context's *raw, un-pooled* hidden states - the position
+information a mean discards survives here because the attention weighting
+can vary per GAP. Values are left unprojected (only `query_proj`/`key_proj`
+are learned, `2 * hidden_size * key_dim` parameters, `key_dim=64` by
+default) to keep the addition small relative to a full learned value
+projection. `LengthBeliefSSBHead` gained a `context_pool_mode` argument
+(`"mean"`, the previous entry's default, or `"attention"`); `predict()`
+now takes either `context_pool` (mean mode, unchanged) or `context_hidden`
+(attention mode, the raw visible rows - the head attends internally per
+GAP row). `context_pool_for()` in the training script and the equivalent
+inline logic in `rollout()`/`query_remaining()` dispatch on the head's
+`context_pool_mode` to build the right kwarg. Fully backward compatible:
+existing mean-pooled and non-pooled checkpoints (`context_pool_mode`
+defaults to `"mean"`, only consulted when `use_context_pool=True`) and
+every prior test are unaffected. `13` new tests (`ContextAttentionPoolTest`,
+`AttentionContextPoolHeadTest`, `VisibleContextHiddenStatesTest`) -
+`173/173` total. A 5-step smoke test confirmed the wiring end-to-end
+(parameter count `135,320` = `36,888` (doubled `prior_head`) + `98,432`
+(two `Linear(768, 64)` projections), before committing to a full run.
+
+Retraining the identical 500-step recipe with `--context-pool-mode
+attention` instead of the rejected `mean`, then re-running the same
+decomposition audit:
+
+| checkpoint | pooled | between-record | within-record |
+|---|---:|---:|---:|
+| no pooling (baseline) | `0.225` | `0.133` | **`0.244`** |
+| + mean pooling (rejected) | `0.207` | `0.239` | `0.207` |
+| + attention pooling | `0.216` | `0.123` | **`0.236`** |
+
+Attention pooling does not reproduce mean pooling's failure mode -
+between-record correlation stays essentially at the no-pooling baseline
+(`0.123` vs `0.133`), meaning it did *not* learn to lean on the coarse
+document-identity shortcut the way mean pooling did. But it also does not
+clear the `0.244` bar: within-record correlation (`0.236`) is
+statistically indistinguishable from the no-pooling baseline (with
+`n=222`, the standard error on a correlation this size is `~0.065` - the
+`0.008` gap is far inside noise). A natural-spans free-rollout check (with
+`--lineage-aware`) shows the same practical picture as the previous two
+checkpoints - finish `93.5%`, MAE `4.52`, similarity `0.305` - within noise
+of both prior entries at `n=31`.
+
+`rejected` (as a source of *new* signal, though not harmful the way mean
+pooling was): giving `prior_head` access to the raw visible context via
+attention, at `500` steps with a `64`-dim key projection, neither helps nor
+hurts calibration - it behaves like a more expensive way of doing
+approximately nothing. This narrows rather than closes the standard-recipe
+diagnosis further: the operator-vs-steps ambiguity from the previous entry
+survives this result rather than being resolved by it, since a hypothesis
+where "the operator category (position-aware pooling) is right but 500
+steps is still too few to learn to use *either* pooling variant
+effectively" is equally consistent with both this result and the mean-
+pooling one. Separating that from "the frozen backbone's GAP-position
+hidden state already contains everything extractable, and no pooling
+operator over it can add information the backbone did not put there in
+the first place" is exactly the causal question `RESEARCH_DIRECTION.md`
+section 9's stop-rule requires before opening backbone adaptation (E3) -
+neither a longer run at the current step budget nor that question has been
+tried here, and remain open, undecided next steps rather than a default
+action.
+
+Artifacts are
+`DreamOn/artifacts/diffugpt_elbo_e2/{head_only_500_length_belief_natural_attnpool/metrics.json,
+remaining_count_calibration_length_belief_natural_attnpool.json,
+rollout_length_belief_natural_attnpool_spans_lineage.json}`. Reproduce
+with, from `DreamOn/`:
+
+```powershell
+python train_diffugpt_counting_bridge.py --model-path ..\..\models\diffugpt-s `
+  --train-file data\opencoder-pilot\train.jsonl `
+  --validation-file data\opencoder-pilot\validation.jsonl `
+  --output-dir artifacts\diffugpt_elbo_e2\head_only_500_length_belief_natural_attnpool `
+  --steps 500 --validation-limit 32 --max-length 128 --learning-rate 1e-3 `
+  --stratify-probability 0.3 --narrow-ceiling 0.06 `
+  --mid-stratify-probability 0.3 --mid-low 0.3 --mid-high 0.5 `
+  --gap-stratify-probability 0.3 --gap-k-choices 3 4 5 6 `
+  --head-design length-belief --natural-boundaries `
+  --use-context-pool --context-pool-mode attention
+python audit_diffugpt_elbo_e2_remaining_count_calibration.py --model-path ..\..\models\diffugpt-s `
+  --head-path artifacts\diffugpt_elbo_e2\head_only_500_length_belief_natural_attnpool\counting_bridge_head.pt `
+  --validation-file data\opencoder-pilot\validation.jsonl `
+  --output-file artifacts\diffugpt_elbo_e2\remaining_count_calibration_length_belief_natural_attnpool.json `
+  --limit 64 --max-length 128 --time 0.0 --natural-boundaries --natural-spans-per-record 4
+python evaluate_diffugpt_counting_bridge.py --model-path ..\..\models\diffugpt-s `
+  --head-path artifacts\diffugpt_elbo_e2\head_only_500_length_belief_natural_attnpool\counting_bridge_head.pt `
+  --validation-file data\opencoder-pilot\validation.jsonl `
+  --output-file artifacts\diffugpt_elbo_e2\rollout_length_belief_natural_attnpool_spans_lineage.json `
+  --limit 32 --max-length 128 --natural-spans --lineage-aware
+```
+
+## E2 longer training: steps help, but pooling's edge (what little there was) shrinks
+
+The previous entry left two hypotheses tangled: "500 steps is too few for
+either pooling variant" and "the frozen backbone's GAP-position hidden
+state is the ceiling, no pooling operator can add to it." This entry tests
+the first directly by retraining the no-pooling baseline and the
+attention-pooling checkpoint at `2000` steps (4x) - same architecture, same
+corruption recipe, same `256`-record training file, only the step budget
+changed - then re-running the identical calibration decomposition:
+
+| config | steps | pooled | between-record | within-record |
+|---|---:|---:|---:|---:|
+| no pooling | `500` | `0.225` | `0.133` | `0.244` |
+| no pooling | `2000` | `0.257` | `0.177` | **`0.286`** |
+| mean pooling (rejected) | `500` | `0.207` | `0.239` | `0.207` |
+| attention pooling | `500` | `0.216` | `0.123` | `0.236` |
+| attention pooling | `2000` | `0.230` | `0.218` | `0.248` |
+
+"Not enough steps" is confirmed as a real, contributing factor - both
+configurations improve with more training (no-pooling's within-record
+`0.244` -> `0.286`; attention-pooling's `0.236` -> `0.248`). But it does not
+rescue pooling as a source of *additional* signal: at `2000` steps the
+no-pooling baseline (`0.286`) pulls further ahead of attention pooling
+(`0.248`) than the two were separated at `500` steps, and attention
+pooling's between-record correlation grows much faster than its
+within-record one (`0.123` -> `0.218`, nearly doubling, vs `0.236` -> `0.248`)
+- the same document-identity-leaning tendency mean pooling showed
+immediately at `500` steps, just emerging more slowly in the
+higher-capacity (`135,320`-parameter) attention variant as training
+continues. Free-rollout checks at `2000` steps stay within the noise band
+established by every checkpoint this session (no-pooling: finish `93.5%`,
+MAE `4.23`, similarity `0.307`; attention-pooling: finish `96.8%`, MAE
+`4.39`, similarity `0.308`).
+
+This result also bears directly on the training corpus itself: `256`
+training records at `2000` steps is roughly `8` passes over the same
+documents (`2167` sampling attempts, `random.Random(attempts + 89)` per
+attempt against `len(train_records)=256`). A head with `135,320` parameters
+having more opportunity than an `18,456`-parameter one to fit
+document-identity-correlated shortcuts specifically *as repeated exposure
+to a small, fixed set of documents accumulates* is exactly the standard
+small-data overfitting signature, not obviously distinguishable here from
+"attention pooling is intrinsically confound-prone." The training and
+validation files are a deterministic `256`/`64`-record subsample of
+`OpenCoder-LLM/opc-sft-stage2` fetched via `prepare_opencoder_pilot.py`
+(`--train-size`/`--validation-size` flags already support fetching more);
+this pilot has run every experiment in this whole investigation against
+the same `320` records.
+
+`candidate`/`diagnostic`: more steps is a genuine, now-measured lever (not
+previously ruled out for the length-belief + natural-boundaries line, only
+for the earlier point-estimate design under N2), and should stay on for
+future runs regardless of pooling choice. But it further weakens rather
+than strengthens the case for either pooling operator, and it surfaces a
+confound of its own (small corpus + repeated exposure) that the "does the
+frozen backbone's representation itself cap calibration" causal question
+from the previous entry cannot be answered against without first scaling
+the training corpus - a data-scale confound cannot be told apart from a
+representation-scale one on `256` documents. Neither backbone adaptation
+(E3) nor a firm conclusion about pooling should be decided from this data
+scale alone, per section 9's stop-rule.
+
+Artifacts are
+`DreamOn/artifacts/diffugpt_elbo_e2/{head_only_2000_length_belief_natural,
+head_only_2000_length_belief_natural_attnpool}/metrics.json` and the
+matching `remaining_count_calibration_*_2000.json`/
+`rollout_*_2000_spans_lineage.json` files. Reproduce with, from `DreamOn/`:
+
+```powershell
+python train_diffugpt_counting_bridge.py --model-path ..\..\models\diffugpt-s `
+  --train-file data\opencoder-pilot\train.jsonl `
+  --validation-file data\opencoder-pilot\validation.jsonl `
+  --output-dir artifacts\diffugpt_elbo_e2\head_only_2000_length_belief_natural `
+  --steps 2000 --validation-limit 32 --max-length 128 --learning-rate 1e-3 `
+  --stratify-probability 0.3 --narrow-ceiling 0.06 `
+  --mid-stratify-probability 0.3 --mid-low 0.3 --mid-high 0.5 `
+  --gap-stratify-probability 0.3 --gap-k-choices 3 4 5 6 `
+  --head-design length-belief --natural-boundaries
+python train_diffugpt_counting_bridge.py --model-path ..\..\models\diffugpt-s `
+  --train-file data\opencoder-pilot\train.jsonl `
+  --validation-file data\opencoder-pilot\validation.jsonl `
+  --output-dir artifacts\diffugpt_elbo_e2\head_only_2000_length_belief_natural_attnpool `
+  --steps 2000 --validation-limit 32 --max-length 128 --learning-rate 1e-3 `
+  --stratify-probability 0.3 --narrow-ceiling 0.06 `
+  --mid-stratify-probability 0.3 --mid-low 0.3 --mid-high 0.5 `
+  --gap-stratify-probability 0.3 --gap-k-choices 3 4 5 6 `
+  --head-design length-belief --natural-boundaries `
+  --use-context-pool --context-pool-mode attention
+python audit_diffugpt_elbo_e2_remaining_count_calibration.py --model-path ..\..\models\diffugpt-s `
+  --head-path artifacts\diffugpt_elbo_e2\head_only_2000_length_belief_natural\counting_bridge_head.pt `
+  --validation-file data\opencoder-pilot\validation.jsonl `
+  --output-file artifacts\diffugpt_elbo_e2\remaining_count_calibration_length_belief_natural_2000.json `
+  --limit 64 --max-length 128 --time 0.0 --natural-boundaries --natural-spans-per-record 4
+python audit_diffugpt_elbo_e2_remaining_count_calibration.py --model-path ..\..\models\diffugpt-s `
+  --head-path artifacts\diffugpt_elbo_e2\head_only_2000_length_belief_natural_attnpool\counting_bridge_head.pt `
+  --validation-file data\opencoder-pilot\validation.jsonl `
+  --output-file artifacts\diffugpt_elbo_e2\remaining_count_calibration_length_belief_natural_attnpool_2000.json `
+  --limit 64 --max-length 128 --time 0.0 --natural-boundaries --natural-spans-per-record 4
+python evaluate_diffugpt_counting_bridge.py --model-path ..\..\models\diffugpt-s `
+  --head-path artifacts\diffugpt_elbo_e2\head_only_2000_length_belief_natural\counting_bridge_head.pt `
+  --validation-file data\opencoder-pilot\validation.jsonl `
+  --output-file artifacts\diffugpt_elbo_e2\rollout_length_belief_natural_2000_spans_lineage.json `
+  --limit 32 --max-length 128 --natural-spans --lineage-aware
+python evaluate_diffugpt_counting_bridge.py --model-path ..\..\models\diffugpt-s `
+  --head-path artifacts\diffugpt_elbo_e2\head_only_2000_length_belief_natural_attnpool\counting_bridge_head.pt `
+  --validation-file data\opencoder-pilot\validation.jsonl `
+  --output-file artifacts\diffugpt_elbo_e2\rollout_length_belief_natural_attnpool_2000_spans_lineage.json `
+  --limit 32 --max-length 128 --natural-spans --lineage-aware
+```
+
+## E2 scaled training corpus: both architectures converge toward the same ~0.28 plateau
+
+The previous entry left the data-scale and representation-scale confounds
+tangled. `scale_opencoder_train.py` (new) resolves the practical obstacle
+to testing data scale directly: `prepare_opencoder_pilot.py`'s
+`--train-size` cannot simply be raised, because its deterministic shuffle
+(`random.Random(42).shuffle`) is a function of the fetched pool's *size* -
+asking for more total records reshuffles the whole split and silently
+changes which 64 records land in validation, breaking comparability with
+every prior entry in this document. The new script instead fetches only
+*additional*, previously-unseen (by code hash, checked against both the
+existing train and validation files) records from the same source
+(`OpenCoder-LLM/opc-sft-stage2`) and appends them to a copy of
+`train.jsonl`, while copying `validation.jsonl` byte-for-byte unchanged -
+verified identical via `diff` before training. `data/opencoder-pilot-1024/`
+now holds `1024` training records (the original `256` plus `768` new ones)
+and the exact same `64`-record validation split every audit in this
+document has used.
+
+Retraining both the no-pooling baseline and the attention-pooling
+checkpoint for the same `2000` steps on this `4x` corpus, then re-running
+the identical calibration decomposition against the unchanged validation
+set:
+
+| config | train records | steps | pooled | between-record | within-record |
+|---|---:|---:|---:|---:|---:|
+| no pooling | `256` | `500` | `0.225` | `0.133` | `0.244` |
+| no pooling | `256` | `2000` | `0.257` | `0.177` | `0.286` |
+| no pooling | `1024` | `2000` | `0.252` | `0.183` | **`0.284`** |
+| mean pooling (rejected) | `256` | `500` | `0.207` | `0.239` | `0.207` |
+| attention pooling | `256` | `500` | `0.216` | `0.123` | `0.236` |
+| attention pooling | `256` | `2000` | `0.230` | `0.218` | `0.248` |
+| attention pooling | `1024` | `2000` | `0.243` | `0.231` | **`0.268`** |
+
+Three findings, cutting in different directions:
+
+1. **Scaling data did nothing for the no-pooling baseline.** `0.286` at
+   `256` records to `0.284` at `1024` - flat, well inside noise. Four times
+   the unique documents did not move it. This argues against "data
+   scarcity" being what caps the plain, `18,456`-parameter head.
+2. **Scaling data did help attention pooling, closing (not eliminating)
+   the gap.** `0.248` -> `0.268` is a real move, and the gap to no-pooling
+   narrows from `0.038` to `0.016` - both now close enough to be within
+   noise of each other. Attention pooling's larger parameter count
+   (`135,320`) does appear to have been more data-hungry, exactly as the
+   "more capacity overfits a small corpus faster" hypothesis from the
+   previous entry predicted.
+3. **The between-record creep survived scaling anyway.** Attention
+   pooling's between-record correlation kept climbing with more data
+   (`0.218` -> `0.231`), growing right alongside its within-record number
+   rather than shrinking relative to it. If the document-identity lean were
+   purely a symptom of too little data, more data should have shrunk
+   between-record *relative to* within-record; instead both moved together.
+   This is now better explained as attention pooling fitting whatever
+   correlational structure is available - genuine per-span and spurious
+   per-document alike - more completely as it gets more of what it needs
+   (data, steps) to do so, not as a pure small-data artifact.
+
+Free-rollout checks stay in the same noise band as every other checkpoint
+this session (no-pooling on `1024`: finish `93.5%`, MAE `4.35`, similarity
+`0.305`; attention-pooling on `1024`: finish `96.8%`, MAE `4.45`,
+similarity `0.307`).
+
+`candidate`/`diagnostic`: the headline number worth carrying forward is
+that **no combination tried this session - two pooling operators, `4x`
+steps, `4x` data, independently and in combination - has pushed within-
+record correlation meaningfully past `~0.28-0.29`**. Every axis that was
+supposed to be able to raise it (steps, data, a smarter pooling operator)
+either did nothing (data for no-pooling) or converged toward the same
+ceiling rather than exceeding it (data for attention-pooling, steps for
+both). That convergence is suggestive of a real ceiling rather than a
+still-improving trend, but `4x` is a modest scale-up (`1024` documents is
+still small by pretraining standards) and does not by itself rule out
+"needs an order of magnitude more data" as cleanly as it weakens "needs a
+better pooling operator." Per `RESEARCH_DIRECTION.md` section 9, this is
+meaningfully closer to - but still short of - the independent causal
+evidence needed to open backbone adaptation (E3): the cleanest remaining
+test is the unlimited-capacity linear-probe diagnostic named in the
+previous `ANALYSIS.md` entry (does the frozen backbone's raw GAP-position
+hidden state even support high within-record correlation under a probe
+with no parameter-budget constraint at all, independent of any
+`prior_head` design), which has still not been run.
+
+Artifacts are
+`DreamOn/artifacts/diffugpt_elbo_e2/{head_only_2000_length_belief_natural_1024,
+head_only_2000_length_belief_natural_attnpool_1024}/metrics.json` and the
+matching `remaining_count_calibration_*_2000_1024.json`/
+`rollout_*_2000_1024_spans_lineage.json` files;
+`data/opencoder-pilot-1024/{train,validation}.jsonl`. Reproduce with, from
+`DreamOn/`:
+
+```powershell
+python scale_opencoder_train.py --source-dir data\opencoder-pilot `
+  --output-dir data\opencoder-pilot-1024 --target-train-size 1024
+python train_diffugpt_counting_bridge.py --model-path ..\..\models\diffugpt-s `
+  --train-file data\opencoder-pilot-1024\train.jsonl `
+  --validation-file data\opencoder-pilot-1024\validation.jsonl `
+  --output-dir artifacts\diffugpt_elbo_e2\head_only_2000_length_belief_natural_1024 `
+  --steps 2000 --validation-limit 32 --max-length 128 --learning-rate 1e-3 `
+  --stratify-probability 0.3 --narrow-ceiling 0.06 `
+  --mid-stratify-probability 0.3 --mid-low 0.3 --mid-high 0.5 `
+  --gap-stratify-probability 0.3 --gap-k-choices 3 4 5 6 `
+  --head-design length-belief --natural-boundaries
+python train_diffugpt_counting_bridge.py --model-path ..\..\models\diffugpt-s `
+  --train-file data\opencoder-pilot-1024\train.jsonl `
+  --validation-file data\opencoder-pilot-1024\validation.jsonl `
+  --output-dir artifacts\diffugpt_elbo_e2\head_only_2000_length_belief_natural_attnpool_1024 `
+  --steps 2000 --validation-limit 32 --max-length 128 --learning-rate 1e-3 `
+  --stratify-probability 0.3 --narrow-ceiling 0.06 `
+  --mid-stratify-probability 0.3 --mid-low 0.3 --mid-high 0.5 `
+  --gap-stratify-probability 0.3 --gap-k-choices 3 4 5 6 `
+  --head-design length-belief --natural-boundaries `
+  --use-context-pool --context-pool-mode attention
+python audit_diffugpt_elbo_e2_remaining_count_calibration.py --model-path ..\..\models\diffugpt-s `
+  --head-path artifacts\diffugpt_elbo_e2\head_only_2000_length_belief_natural_1024\counting_bridge_head.pt `
+  --validation-file data\opencoder-pilot\validation.jsonl `
+  --output-file artifacts\diffugpt_elbo_e2\remaining_count_calibration_length_belief_natural_2000_1024.json `
+  --limit 64 --max-length 128 --time 0.0 --natural-boundaries --natural-spans-per-record 4
+python audit_diffugpt_elbo_e2_remaining_count_calibration.py --model-path ..\..\models\diffugpt-s `
+  --head-path artifacts\diffugpt_elbo_e2\head_only_2000_length_belief_natural_attnpool_1024\counting_bridge_head.pt `
+  --validation-file data\opencoder-pilot\validation.jsonl `
+  --output-file artifacts\diffugpt_elbo_e2\remaining_count_calibration_length_belief_natural_attnpool_2000_1024.json `
+  --limit 64 --max-length 128 --time 0.0 --natural-boundaries --natural-spans-per-record 4
+python evaluate_diffugpt_counting_bridge.py --model-path ..\..\models\diffugpt-s `
+  --head-path artifacts\diffugpt_elbo_e2\head_only_2000_length_belief_natural_1024\counting_bridge_head.pt `
+  --validation-file data\opencoder-pilot\validation.jsonl `
+  --output-file artifacts\diffugpt_elbo_e2\rollout_length_belief_natural_2000_1024_spans_lineage.json `
+  --limit 32 --max-length 128 --natural-spans --lineage-aware
+python evaluate_diffugpt_counting_bridge.py --model-path ..\..\models\diffugpt-s `
+  --head-path artifacts\diffugpt_elbo_e2\head_only_2000_length_belief_natural_attnpool_1024\counting_bridge_head.pt `
+  --validation-file data\opencoder-pilot\validation.jsonl `
+  --output-file artifacts\diffugpt_elbo_e2\rollout_length_belief_natural_attnpool_2000_1024_spans_lineage.json `
+  --limit 32 --max-length 128 --natural-spans --lineage-aware
+```
+
+## E2 raw-hidden-state probe: the backbone was never the ceiling
+
+The previous three entries converged toward `~0.28-0.29` within-record
+correlation regardless of pooling operator, training steps, or training
+data, which read as suggestive evidence that the frozen backbone's
+GAP-position hidden state itself might be the limiting factor - the
+premise `RESEARCH_DIRECTION.md` section 9 requires independent evidence
+for before opening backbone adaptation (E3). This entry supplies that
+evidence directly, and it points the other way.
+
+`audit_diffugpt_elbo_e2_raw_hidden_probe.py` (new) removes every
+architectural and training-regime constraint every `prior_head` tried so
+far shared: `LengthProbe`, a `2`-hidden-layer MLP (`656,897` parameters at
+`probe_hidden_dim=512` - `35x` `CountingBridgeSSBHead`'s size and `~36x`
+the plain `LengthBeliefSSBHead`'s), is trained *by itself*, on nothing but
+MSE regression against the true target length, directly on the same raw
+GAP-position hidden vectors `query_remaining` extracts (identical state
+construction: one fully-masked GAP, real prefix/suffix, `t=0`). No topology
+loss, no token NLL, no time-conditioning, no shared capacity with any
+other objective - a completely undistracted, high-capacity readout of
+whatever the frozen backbone already put in that vector. Training used the
+`1024`-record corpus from the previous entry (`3,517` extracted examples);
+validation used the exact same `64`-record file and `random.Random(0)`
+sequential sampling as every other calibration entry, verified
+sample-identical by matching example/skip/multi-span counts exactly
+(`225`/`4`/`57`/`222`). `tests/test_raw_hidden_probe.py` (`5/5`, no CUDA
+needed) checks `LengthProbe`'s shape, gradient flow, parameter count, and
+input validation - `178/178` total.
+
+| probe | within-record | between-record | pooled |
+|---|---:|---:|---:|
+| best `prior_head` result to date (no pooling, `1024` records, `2000` steps) | `0.284` | `0.183` | `0.252` |
+| `LengthProbe` (unconstrained MLP, undistracted objective) | **`0.687`** | `0.256` | `0.581` |
+
+The unconstrained probe's within-record correlation is **more than double**
+the best result any `prior_head` design produced across every axis tried
+this session (pooling operator, steps, data). The raw GAP-position hidden
+state was carrying substantially more usable length information than any
+`prior_head` extracted from it - the representation was never the
+bottleneck.
+
+Two candidate explanations for the gap are not yet separated, both
+plausible and not mutually exclusive: (1) **capacity** - every `prior_head`
+tried so far has been a single `Linear` layer (or `Linear` plus one small
+attention pool), while `LengthProbe` has two full hidden layers and orders
+of magnitude more parameters; (2) **undivided objective** - `prior_head` is
+always trained jointly, sharing gradient signal and capacity with the
+topology and token-NLL losses inside `loss_from_candidates`, while
+`LengthProbe` was trained on nothing else. This experiment cannot tell
+which matters more, or how much, because both differences were changed at
+once relative to every prior `prior_head` run - a further diagnostic (a
+bigger MLP `prior_head`, trained jointly as before) would isolate capacity
+alone.
+
+`candidate`/`diagnostic`, and it overturns rather than confirms the
+standing hypothesis from the previous three entries: **backbone adaptation
+(E3, LoRA or otherwise) is not supported by this evidence** - the frozen
+representation already contains far more signal than has been extracted so
+far. The corrected next step is architectural work on `prior_head` itself
+(more capacity, and/or a decoupled length-supervision path so it is not
+starved of gradient signal by the topology/token losses), not touching the
+backbone. Per section 9, this is exactly the kind of independent causal
+evidence the stop-rule was waiting for, and it resolves the question in the
+opposite direction from what the plateau across pooling/steps/data alone
+suggested - a caution against treating a plateau across variations of one
+component (the head) as evidence about a different component (the
+backbone) without testing the latter directly.
+
+Artifacts are `DreamOn/artifacts/diffugpt_elbo_e2/raw_hidden_probe.json`.
+Reproduce with, from `DreamOn/`:
+
+```powershell
+python audit_diffugpt_elbo_e2_raw_hidden_probe.py --model-path ..\..\models\diffugpt-s `
+  --train-file data\opencoder-pilot-1024\train.jsonl `
+  --validation-file data\opencoder-pilot\validation.jsonl `
+  --output-file artifacts\diffugpt_elbo_e2\raw_hidden_probe.json `
+  --train-limit 1024 --validation-limit 64 --max-length 128 `
+  --natural-spans-per-record 4 --probe-hidden-dim 512 --probe-epochs 200 --probe-lr 1e-3
+```
+
+## E2 MLP prior_head, joint training: capacity alone does not explain the gap
+
+The previous entry's `LengthProbe` beat every `prior_head` result by
+changing two things at once - far more capacity, and an objective
+undivided by the topology/token-NLL losses `loss_from_candidates` also
+optimizes. `LengthBeliefSSBHead` gained `prior_head_hidden_dim`
+(`src/ssb/length_belief_head.py`): when set, `prior_head` becomes the same
+`2`-hidden-layer, `512`-wide MLP as `LengthProbe` (`668,696` total head
+parameters here vs the probe's `656,897`), but is still trained *jointly*
+exactly as before - only capacity changed, the objective stayed shared.
+`None` (the default) reproduces the original single-`Linear` `prior_head`
+exactly; `5` new tests (`MlpPriorHeadTest`) check the MLP is built and
+wired correctly, combines with context pooling, and backpropagates through
+every layer - `183/183` total.
+
+Retraining the identical `2000`-step, `1024`-record recipe from the
+previous two entries with `--prior-head-hidden-dim 512` added, then
+re-running the same calibration decomposition:
+
+| prior_head | training | within-record |
+|---|---|---:|
+| single `Linear` (best result to date) | joint | `0.284` |
+| `2`-layer MLP (`668,696` params) | joint | `0.207` |
+| same `2`-layer MLP architecture, standalone (`LengthProbe`) | **not joint** (length-only) | **`0.687`** |
+
+Capacity alone, holding joint training fixed, does not recover the gap -
+it makes things slightly *worse* than the single-`Linear` baseline, not
+better. This isolates the two confounded factors cleanly: the standalone
+probe's advantage comes from being freed of the shared objective, not from
+having more parameters. A plausible mechanism for the MLP's mild
+regression under joint training: `topology_log_probabilities` is *derived*
+from the same `prior` the count loss supervises directly
+(`marker_probabilities_from_prior`), so `prior_head`'s parameters already
+receive two different gradient pulls (matching the true count exactly vs.
+producing a topology distribution that maximizes candidate-action
+likelihood) even in the single-`Linear` case; a higher-capacity network has
+more parameters available to fit a compromise between those two pulls
+within the same `2000`-step budget, without necessarily improving either
+one. Free-rollout metrics stay in the same noise band as every other
+checkpoint this session (finish `93.5%`, MAE `4.23`, similarity `0.305`,
+correlation `0.071`).
+
+`candidate`/`diagnostic`: the dominant factor behind the raw-hidden-state
+probe's result is the undivided objective, not capacity - a finding that
+redirects the next architectural step away from "make `prior_head`
+bigger" (tried here, did not help) and toward decoupling *how* the length
+belief is supervised from the shared topology/action loss, e.g. a
+separate training phase, a stop-gradient on the topology path's use of
+`prior`, or an auxiliary loss weighted to dominate early training - none
+of which have been tried yet. Per section 9, this is the next deliberate
+decision point.
+
+Artifacts are
+`DreamOn/artifacts/diffugpt_elbo_e2/head_only_2000_length_belief_natural_mlp_1024/metrics.json`,
+`remaining_count_calibration_length_belief_natural_mlp_2000_1024.json`, and
+`rollout_length_belief_natural_mlp_2000_1024_spans_lineage.json`. Reproduce
+with, from `DreamOn/`:
+
+```powershell
+python train_diffugpt_counting_bridge.py --model-path ..\..\models\diffugpt-s `
+  --train-file data\opencoder-pilot-1024\train.jsonl `
+  --validation-file data\opencoder-pilot-1024\validation.jsonl `
+  --output-dir artifacts\diffugpt_elbo_e2\head_only_2000_length_belief_natural_mlp_1024 `
+  --steps 2000 --validation-limit 32 --max-length 128 --learning-rate 1e-3 `
+  --stratify-probability 0.3 --narrow-ceiling 0.06 `
+  --mid-stratify-probability 0.3 --mid-low 0.3 --mid-high 0.5 `
+  --gap-stratify-probability 0.3 --gap-k-choices 3 4 5 6 `
+  --head-design length-belief --natural-boundaries --prior-head-hidden-dim 512
+python audit_diffugpt_elbo_e2_remaining_count_calibration.py --model-path ..\..\models\diffugpt-s `
+  --head-path artifacts\diffugpt_elbo_e2\head_only_2000_length_belief_natural_mlp_1024\counting_bridge_head.pt `
+  --validation-file data\opencoder-pilot\validation.jsonl `
+  --output-file artifacts\diffugpt_elbo_e2\remaining_count_calibration_length_belief_natural_mlp_2000_1024.json `
+  --limit 64 --max-length 128 --time 0.0 --natural-boundaries --natural-spans-per-record 4
+python evaluate_diffugpt_counting_bridge.py --model-path ..\..\models\diffugpt-s `
+  --head-path artifacts\diffugpt_elbo_e2\head_only_2000_length_belief_natural_mlp_1024\counting_bridge_head.pt `
+  --validation-file data\opencoder-pilot\validation.jsonl `
+  --output-file artifacts\diffugpt_elbo_e2\rollout_length_belief_natural_mlp_2000_1024_spans_lineage.json `
+  --limit 32 --max-length 128 --natural-spans --lineage-aware
+```
+
+## E2 stop-gradient decoupling: single-step calibration unmoved, free-rollout quality improves anyway
+
+`detach_prior_for_topology=True` (`src/ssb/length_belief_head.py`) removes
+the competing pull identified in the previous entry surgically: `predict()`
+still derives `topology_log_probabilities` from the model's current
+`prior` - the *value*, and therefore every inference-time behavior, is
+completely unchanged - but via `prior.detach()`, so during training the
+action loss's gradient into topology no longer reaches `prior_head`; only
+the count loss's direct length supervision does. `6` new tests
+(`DetachPriorForTopologyTest`) check forward values are bit-identical
+regardless of the flag, that an action-only loss leaves `prior_head`
+untouched when detached but does update it when not, and that the count
+loss still reaches `prior_head` either way - `189/189` total.
+
+Retraining the `2000`-step, `1024`-record recipe with
+`--detach-prior-for-topology`, both alone (single `Linear`) and combined
+with the `512`-wide MLP `prior_head` from the previous entry:
+
+| prior_head | detach | within-record | finish | MAE | similarity | correlation |
+|---|---|---:|---:|---:|---:|---:|
+| single `Linear` | no (best to date) | `0.284` | `93.5%` | `4.35` | `0.305` | `-0.02` |
+| single `Linear` | **yes** | `0.279` | `96.8%` | **`3.94`** | `0.330` | `0.11` |
+| `2`-layer MLP | no | `0.207` | `93.5%` | `4.23` | `0.305` | `0.07` |
+| `2`-layer MLP | **yes** | `0.219` | `100%` | `5.06` | **`0.360`** | **`0.16`** |
+| `LengthProbe` (standalone, not joint) | n/a | `0.687` | - | - | - | - |
+
+Stop-gradient does not close the gap to the standalone probe on the metric
+it was designed to fix: single-`Linear` within-record correlation is
+unchanged within noise (`0.284` -> `0.279`), and the MLP variant improves
+only slightly (`0.207` -> `0.219`) while still trailing the single-`Linear`
+baseline. The hypothesis that removing the topology/count competition
+alone would let `prior_head` behave like the undistracted probe is not
+supported - something else about the probe's training regime (`~11,000`
+gradient steps over `200` epochs of a fixed, pre-extracted `3,517`-example
+dataset with `batch_size=64`, vs `2000` single-example online steps mixed
+with corruption-time/arrangement noise here) evidently also matters and
+was not isolated by this change alone.
+
+What *did* move, consistently across both prior_head sizes, is free-rollout
+quality: finish rate, MAE, similarity, and the (still weak, still noisy at
+`n=31`) true/generated length correlation all improve with detachment, and
+the MLP+detach combination reaches this session's best-ever similarity
+(`0.360`) and best-ever correlation (`0.16`), at the cost of undershooting
+more (mean generated `8.71` vs true `13.26`). A plausible mechanism: even
+though the detached `prior`'s own calibration against ground truth barely
+moved, no longer being pulled toward "whatever also maximizes action
+likelihood" may make its *internal consistency* - the relationship between
+one GAP's belief and the topology decisions derived from it - more
+stable across a rollout trajectory, which the single-step calibration
+audit (one query, no rollout dynamics) cannot see at all. This is
+consistent with, not contradictory to, the within-record numbers staying
+flat: the audit and the rollout metrics are measuring different things.
+
+`candidate`/`diagnostic`: stop-gradient alone does not reproduce
+`LengthProbe`'s calibration gain, ruling out "objective competition,
+holding the training regime otherwise fixed" as the *complete*
+explanation - the training regime itself (steps count, batching, data
+determinism) is now the more clearly implicated remaining difference. But
+stop-gradient is not a wash either: it is a free (no architecture growth
+required for the single-`Linear` case) improvement to free-rollout
+generation quality on every metric measured, with no observed downside
+beyond the MLP variant's stronger undershoot. Whether to adopt it as a
+default and how to isolate the training-regime confound (matching the
+probe's step count/batching for `prior_head`'s count loss specifically,
+e.g. via a pre-training or replay-buffer phase) are both open, undecided
+next steps.
+
+Artifacts are
+`DreamOn/artifacts/diffugpt_elbo_e2/{head_only_2000_length_belief_natural_detach_1024,
+head_only_2000_length_belief_natural_mlp_detach_1024}/metrics.json` and the
+matching `remaining_count_calibration_*_2000_1024.json`/
+`rollout_*_2000_1024_spans_lineage.json` files. Reproduce with, from
+`DreamOn/`:
+
+```powershell
+python train_diffugpt_counting_bridge.py --model-path ..\..\models\diffugpt-s `
+  --train-file data\opencoder-pilot-1024\train.jsonl `
+  --validation-file data\opencoder-pilot-1024\validation.jsonl `
+  --output-dir artifacts\diffugpt_elbo_e2\head_only_2000_length_belief_natural_detach_1024 `
+  --steps 2000 --validation-limit 32 --max-length 128 --learning-rate 1e-3 `
+  --stratify-probability 0.3 --narrow-ceiling 0.06 `
+  --mid-stratify-probability 0.3 --mid-low 0.3 --mid-high 0.5 `
+  --gap-stratify-probability 0.3 --gap-k-choices 3 4 5 6 `
+  --head-design length-belief --natural-boundaries --detach-prior-for-topology
+python train_diffugpt_counting_bridge.py --model-path ..\..\models\diffugpt-s `
+  --train-file data\opencoder-pilot-1024\train.jsonl `
+  --validation-file data\opencoder-pilot-1024\validation.jsonl `
+  --output-dir artifacts\diffugpt_elbo_e2\head_only_2000_length_belief_natural_mlp_detach_1024 `
+  --steps 2000 --validation-limit 32 --max-length 128 --learning-rate 1e-3 `
+  --stratify-probability 0.3 --narrow-ceiling 0.06 `
+  --mid-stratify-probability 0.3 --mid-low 0.3 --mid-high 0.5 `
+  --gap-stratify-probability 0.3 --gap-k-choices 3 4 5 6 `
+  --head-design length-belief --natural-boundaries `
+  --prior-head-hidden-dim 512 --detach-prior-for-topology
+python audit_diffugpt_elbo_e2_remaining_count_calibration.py --model-path ..\..\models\diffugpt-s `
+  --head-path artifacts\diffugpt_elbo_e2\head_only_2000_length_belief_natural_detach_1024\counting_bridge_head.pt `
+  --validation-file data\opencoder-pilot\validation.jsonl `
+  --output-file artifacts\diffugpt_elbo_e2\remaining_count_calibration_length_belief_natural_detach_2000_1024.json `
+  --limit 64 --max-length 128 --time 0.0 --natural-boundaries --natural-spans-per-record 4
+python audit_diffugpt_elbo_e2_remaining_count_calibration.py --model-path ..\..\models\diffugpt-s `
+  --head-path artifacts\diffugpt_elbo_e2\head_only_2000_length_belief_natural_mlp_detach_1024\counting_bridge_head.pt `
+  --validation-file data\opencoder-pilot\validation.jsonl `
+  --output-file artifacts\diffugpt_elbo_e2\remaining_count_calibration_length_belief_natural_mlp_detach_2000_1024.json `
+  --limit 64 --max-length 128 --time 0.0 --natural-boundaries --natural-spans-per-record 4
+python evaluate_diffugpt_counting_bridge.py --model-path ..\..\models\diffugpt-s `
+  --head-path artifacts\diffugpt_elbo_e2\head_only_2000_length_belief_natural_detach_1024\counting_bridge_head.pt `
+  --validation-file data\opencoder-pilot\validation.jsonl `
+  --output-file artifacts\diffugpt_elbo_e2\rollout_length_belief_natural_detach_2000_1024_spans_lineage.json `
+  --limit 32 --max-length 128 --natural-spans --lineage-aware
+python evaluate_diffugpt_counting_bridge.py --model-path ..\..\models\diffugpt-s `
+  --head-path artifacts\diffugpt_elbo_e2\head_only_2000_length_belief_natural_mlp_detach_1024\counting_bridge_head.pt `
+  --validation-file data\opencoder-pilot\validation.jsonl `
+  --output-file artifacts\diffugpt_elbo_e2\rollout_length_belief_natural_mlp_detach_2000_1024_spans_lineage.json `
+  --limit 32 --max-length 128 --natural-spans --lineage-aware
+```

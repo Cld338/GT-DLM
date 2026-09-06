@@ -149,7 +149,7 @@ state를 생성하는 별도 corruption/edit process와 그 확률을 먼저 정
 | E0 | closed: mechanics | deletion forward process에서 유도한 insertion ELBO가 정확히 정규화되는가? | tiny exact normalization/ELBO test 통과 |
 | E1 | closed: mechanics | sampled deletion posterior와 Rao-Blackwellized target이 일치하는가? | exhaustive gradient/DP gate 통과 |
 | E1b | closed: mechanics | early supercritical posterior와 finite termination을 한 bridge에서 만족하는가? | endpoint-safe generator exact gate 통과 |
-| E2 | active: root-GAP belief length calibration | head-only joint token-marker reverse model이 실제 rollout을 학습하는가? | 단일-GAP selection gate 통과 |
+| E2 | active: decouple belief supervision from topology competition | head-only joint token-marker reverse model이 실제 rollout을 학습하는가? | 단일-GAP selection gate 통과 |
 | E3 | blocked by E2 | compressed-gap lexical query에 backbone adaptation이 필요한가? | retention을 지키며 E2 개선 |
 | E4 | blocked by E3 | explicit empty-gap process로 DELETE recovery를 학습할 수 있는가? | calibrated DELETE/recovery gate 통과 |
 
@@ -217,7 +217,7 @@ clean token deletion process를 먼저 고정하고 그 reverse event를 SSB joi
 정의하는 것이다. 학습은 하나의 initial GAP에서 시작하며 16-mask length scaffold를 쓰지
 않는다.
 
-### E2 — head-only pilot (active: root-GAP belief length calibration)
+### E2 — head-only pilot (active: decouple belief supervision from topology competition)
 
 첫 정식 500-step pilot 결과는 `RESULTS.md`의 "E2 head-only pilot" 절에 있다. N0-N2와
 달리 구조 action이 실제로 다수(`55-58%`)를 차지하고 target-24 length MAE는 지금까지
@@ -488,6 +488,283 @@ checkpoint에서 순수 개선이고, 목표했던 메커니즘(형제 팽창)�
 결정 지점을 연 것이다: 다음으로 열어야 할 축은 lineage 추가 튜닝이
 아니라, root GAP의 prior가 실제 문맥 길이를 학습하도록 하는 지도 신호
 설계(아직 시작 안 함)다.
+
+### E2 root-belief calibration decomposed (closed: diagnostic)
+
+"root GAP의 prior가 문맥 길이를 학습하게 만드는" 표준 해법은 NAT
+length-prediction / blank-language-model 계열이 공통으로 쓰는 3요소다:
+(1) 전용 head의 직접 지도, (2) corruption을 실제 데이터에 연동, (3) head
+입력을 국소 hidden state가 아니라 context 전체의 pooled representation으로
+확장. SSB는 이미 (1)과 (2)를 갖추고 있으므로, (3)에 투자하기 전에 (2)가
+정말 효과를 냈는지부터 재검증했다(`RESULTS.md`의 "E2 root-belief
+calibration decomposed").
+
+우려는 이랬다: `--natural-boundaries`의 pooled 상관관계(`0.225`)가 사실은
+"어떤 문서는 자연 span이 대체로 길고, 어떤 문서는 대체로 짧다"는
+document 단위 confound일 수 있고, 그렇다면 모델이 실제로 어느 span을
+묻는지 보지 않고도 그 상관관계를 만들어낼 수 있다. `grouped_correlations`로
+record별 평균을 빼는 표준 fixed-effects 분해를 적용해 확인한 결과는
+정반대였다: within-record 상관관계(같은 문서 안에서 다른 길이의 span을
+구별하는 능력, `0.244`)가 between-record 상관관계(문서 간 평균 길이만
+구별하는 능력, `0.133`)보다 오히려 더 컸다. 즉 (2)는 이미 진짜 신호를
+만들어내고 있고, confound가 아니다 — 다만 그 신호 자체가 약할 뿐(`0.244`,
+`1.0`과는 거리가 멂).
+
+`closed: diagnostic`. 이제 남은 것은 표준 레시피의 (3)뿐이라는 게
+분명해졌다: `prior_head`는 여전히 GAP 위치 하나의 hidden state만 보고,
+DreamOn의 리터럴 mask-count가 공짜로 주는 것과 같은 "주변 context
+전체 요약" 신호는 아직 입력에 없다. 다음 결정 지점(아직 시작 안 함)은
+root GAP에 한해 `prior_head` 입력에 prefix+suffix 전체의 pooled
+representation을 추가하는 것이며, 그 효과는 이번에 측정한 within-record
+`0.244`를 기준선으로 판단해야 한다(pooled 숫자는 confound로 인플레이션될
+수 있으므로 기준으로 삼지 않는다).
+
+### E2 pooled-context root belief (rejected — 이 설정에서는)
+
+위 (3)을 실제로 구현했다(`RESULTS.md`의 "E2 pooled-context root belief").
+`LengthBeliefSSBHead(use_context_pool=True)`가 GAP 위치의 hidden state에
+`pooled_context_vector`(전체 canvas 중 GAP가 아닌 모든 visible 위치의
+평균)를 concat해서 `prior_head`에 넣는다. 기본값 off라 기존 checkpoint와
+스크립트는 전혀 영향받지 않음(테스트 160/160).
+
+동일한 500-step 레시피에 `--use-context-pool`만 추가해 재학습하고
+같은 decomposition 감사를 다시 돌린 결과, 목표였던 `0.244` 기준선을
+넘지 못했다: within-record `0.207`(오히려 약간 하락), 반면
+between-record는 `0.133→0.239`로 거의 두 배가 됐다. 즉 이 pooling은
+모델이 "같은 문서 안에서 어느 span인지"보다 "어느 문서인지"라는 더
+값싼 신호에 기대게 만들었다 — 의도한 것과 정반대 방향이다.
+natural-spans + lineage-aware rollout도 이전 checkpoint와 통계적으로
+구별되지 않았다(finish `93.5%` vs `90.3%`, MAE `4.48` vs `4.84`, 상관관계
+`-0.070` vs `-0.058`, `n=31`).
+
+`rejected`: "단순 mean-pooling" 연산 자체가 틀렸거나(위치 정보를 통째로
+버림 — 실제 필요한 신호는 "다음 줄바꿈까지 거리"처럼 위치에 의존적일
+가능성이 큼), 500 step이 두 배로 넓어진 `prior_head` 입력을 학습하기에
+부족했거나 — 두 가설은 분리되지 않았다(9절 원칙에 따라 의도적으로).
+`count_loss_per_gap`이 이전보다 더 크게 떨어진 것(`8.28→4.62`)은 추가
+용량이 뭔가는 학습했다는 약한 증거이지 calibration이 개선됐다는 증거는
+아니다. 다음 결정 지점(아직 시작 안 함): attention 기반 요약이나 명시적
+위치 특징(다음 line-boundary까지 거리 등) 같은 다른 pooling 연산자를
+시도할지, 아니면 더 많은 step으로 재검증할지 — 둘 다 시작 안 함.
+
+### E2 attention-pooled root belief (rejected — 신호 추가 없음, 부작용도 없음)
+
+위에서 미시작으로 남긴 두 후보 중 "attention 기반 pooling"을
+실행했다(`RESULTS.md`의 "E2 attention-pooled root belief").
+`ContextAttentionPool`이 각 GAP의 hidden state를 query로, visible
+context의 raw hidden state 전체를 key/value로 삼아 위치별로 다르게
+가중합을 만든다 — mean처럼 위치 정보를 뭉개지 않는다.
+
+같은 500-step 레시피에 `--context-pool-mode attention`만 바꿔 재학습한
+결과:
+
+| 구성 | pooled | between-record | within-record |
+|---|---:|---:|---:|
+| pooling 없음 (기준선) | `0.225` | `0.133` | **`0.244`** |
+| mean pooling (rejected) | `0.207` | `0.239` | `0.207` |
+| attention pooling | `0.216` | `0.123` | **`0.236`** |
+
+mean pooling이 만들었던 부작용(document-level confound로 쏠림,
+between-record `0.239`)은 사라졌다 — attention pooling의 between-record는
+`0.123`으로 기준선과 같다. 즉 "위치 정보를 보존하면 confound로 안
+쏠린다"는 가설은 맞았다. 하지만 within-record(`0.236`)는 기준선(`0.244`)과
+통계적으로 구별 불가능하다(`n=222`에서 표준오차 `~0.065`) — 새로운 신호가
+추가되지는 않았다. natural-spans + lineage-aware rollout도 이전 두
+checkpoint와 오차범위 안에서 동일했다(finish `93.5%`, MAE `4.52`,
+유사도 `0.305`, `n=31`).
+
+`rejected`(신호원으로서): mean과 attention 두 가지 pooling 연산자를 모두
+시도했지만 둘 다 기준선을 넘지 못했다. "연산자가 틀렸다"는 가설은 이제
+약해졌다(가장 유력한 두 후보를 다 써봤으므로) — 남은 두 가설은 (1) 500
+step으로는 어떤 pooling 연산자도 배우기에 부족하다, (2) frozen 백본의
+GAP 위치 hidden state가 애초에 선형 head로 뽑아낼 수 있는 길이 정보의
+상한이며, 그 상한은 어떤 pooling으로도 못 넘는다(오직 backbone 표현
+자체를 바꿔야 함, 즉 E3). 이 둘을 가르는 것이 정확히 9절이 backbone
+adaptation(E3, LoRA 포함)을 열기 전 요구하는 "독립적 causal evidence"이며,
+아직 어느 쪽도 시도 안 했다: (1)을 검증하려면 더 긴 학습, (2)를
+검증하려면 "무제한 용량의 probe로도 raw GAP hidden state에서 길이를
+선형 이상으로도 못 읽어내는가"를 재는 진단이 필요하다. 둘 다 아직
+시작 안 함.
+
+### E2 longer training (candidate/diagnostic — step은 도움되지만 pooling 우위는 아님)
+
+위 (1)을 실행했다(`RESULTS.md`의 "E2 longer training"). no-pooling과
+attention-pooling checkpoint를 동일 레시피로 `2000` step(4배)까지
+재학습했다.
+
+| 구성 | step | within-record |
+|---|---:|---:|
+| no pooling | `500` | `0.244` |
+| no pooling | `2000` | **`0.286`** |
+| attention pooling | `500` | `0.236` |
+| attention pooling | `2000` | `0.248` |
+
+"step 부족" 가설은 확인됐다 — 둘 다 개선됐다. 하지만 더 중요한 건 방향이다:
+step이 늘수록 no-pooling과 attention-pooling의 격차가 **더 벌어졌다**
+(500 step에서는 거의 동률, 2000 step에서는 no-pooling이 확실히 앞섬).
+게다가 attention-pooling의 between-record 상관관계는 within-record보다
+거의 두 배 빠르게 늘었다(`0.123→0.218` vs `0.236→0.248`) — mean pooling이
+즉시 보였던 document-identity 쏠림이 attention에서는 느리게, 하지만
+똑같은 방향으로 나타나고 있다.
+
+이건 새로운 confound를 노출한다: 학습 데이터가 256개 문서뿐이라 2000
+step이면 같은 문서를 평균 8번쯤 반복해서 본다. 파라미터가 더 많은
+attention-pooling(135,320개, no-pooling은 18,456개)이 반복 노출되는
+소규모 문서 집합의 "문서 정체성"을 더 빨리 외웠을 가능성과, "pooling이
+본질적으로 confound에 취약하다"는 가설을 이 실험만으로는 구별할 수 없다.
+
+`candidate/diagnostic`: 더 긴 학습 자체는 앞으로도 유지할 가치가 있는
+레버로 확인됐다(9절의 "step 증가 금지"는 이전 point-estimate 설계에
+대한 것이었고, 지금 이 결과가 현재 설계에 대한 독립적 causal evidence다).
+하지만 "frozen 백본이 상한인가"라는 질문에 아직 답할 수 없다 — 256개
+문서로는 data-scale confound와 representation-scale confound가 똑같은
+증상(어떤 head 구조를 얹어도 정체)을 만들기 때문이다. `prepare_opencoder_pilot.py`가
+이미 `--train-size`/`--validation-size`로 더 큰 표본을 지원하므로, 데이터
+규모를 키우는 것이 이번 조사에서 아직 당겨보지 않은 다음 레버다. 아직
+시작 안 함.
+
+### E2 scaled training corpus (candidate/diagnostic — ~0.28 근처 정체 확인)
+
+위 데이터 확장을 실행했다(`RESULTS.md`의 "E2 scaled training corpus").
+`prepare_opencoder_pilot.py`를 `--train-size`만 키워 재실행하는 건
+안전하지 않았다 — shuffle이 `random.Random(42)`로 fetch된 pool 전체
+크기에 시드되므로, 더 큰 pool을 요청하면 이 세션 전체가 공유해온 고정
+64개 validation 세트 자체가 조용히 바뀐다. 대신 `scale_opencoder_train.py`를
+새로 작성해 기존 train.jsonl에 code hash 기준으로 겹치지 않는 새 레코드만
+768개 추가해 `data/opencoder-pilot-1024/`(train 1024, validation은 기존과
+byte-identical)를 만들었다.
+
+같은 2000-step 레시피를 이 4배 데이터로 재학습한 결과:
+
+| 구성 | train 레코드 | within-record |
+|---|---:|---:|
+| no pooling | `256` | `0.286` |
+| no pooling | `1024` | `0.284`(변화 없음) |
+| attention pooling | `256` | `0.248` |
+| attention pooling | `1024` | `0.268`(격차 축소) |
+
+데이터를 늘려도 no-pooling은 전혀 개선되지 않았다 — "데이터 부족"이
+plain head의 병목은 아니라는 뜻이다. 반면 attention-pooling은 실제로
+개선되어 no-pooling과의 격차가 좁혀졌다(용량이 더 큰 만큼 데이터에 더
+목말랐다는 가설과 일치). 하지만 between-record 상관관계는 attention
+pooling에서 데이터를 늘려도 여전히 within-record와 나란히 계속
+증가했다(`0.218→0.231`) — 순수 소규모-데이터 아티팩트였다면 데이터를
+늘릴수록 within 대비 between이 줄어들어야 하는데 그렇지 않았다. 더
+일관된 설명: 용량이 큰 구조는 진짜 신호든 우연한 문서 상관이든 데이터가
+주는 만큼 더 완전히 학습한다.
+
+`candidate/diagnostic`: pooling 연산자(mean/attention/없음), step(500/2000),
+데이터(256/1024) — 세 축 모두 독립적으로도 조합해서도 within-record
+상관관계를 `~0.28-0.29` 이상으로 못 밀어올렸다. 이건 진짜 상한을
+시사하지만, 4배는 절대적으로는 여전히 작은 데이터 증가라 "데이터가 훨씬
+더 필요하다"는 가설을 완전히 기각하지는 못한다. 남은 가장 직접적인
+다음 검증은 `prior_head` 설계와 무관하게 "frozen 백본의 raw GAP 위치
+hidden state가 무제한 용량 probe로도 length를 못 읽어내는가"를 재는
+진단이며, 아직 시작 안 함 — 이게 지금 backbone adaptation(E3)보다
+우선순위가 높은 다음 단계다.
+
+### E2 raw-hidden-state probe (candidate/diagnostic — 결론이 뒤집힘: backbone이 상한이 아니었다)
+
+위 진단을 실행했다(`RESULTS.md`의 "E2 raw-hidden-state probe"). `prior_head`
+설계와 완전히 분리된 `LengthProbe`(2-hidden-layer MLP, `656,897` 파라미터 —
+`LengthBeliefSSBHead`의 `~36`배)를 오직 length regression만으로, 다른 loss와
+경쟁 없이 raw GAP 위치 hidden state 위에서 단독 학습했다. 검증은 이 세션
+내내 써온 동일한 64개 validation 세트와 동일한 `random.Random(0)` 샘플링을
+사용해 완전히 동일 조건으로 비교했다(examples/skip/multi-span 카운트가
+정확히 일치함을 확인).
+
+| probe | within-record |
+|---|---:|
+| 지금까지 최고 `prior_head` 결과(no pooling, 1024개, 2000 step) | `0.284` |
+| **`LengthProbe`(무제한 용량, 다른 목적함수와 경쟁 없음)** | **`0.687`** |
+
+**2배 이상 차이다.** frozen 백본의 raw GAP 위치 hidden state는 그동안
+어떤 `prior_head`도 뽑아내지 못한 훨씬 많은 길이 정보를 이미 담고 있었다
+— **backbone 표현력은 애초에 상한이 아니었다.**
+
+이 결과는 pooling/step/데이터 세 축에 걸친 정체가 "backbone이 상한"이라는
+결론으로 보였던 것이 사실은 성급한 추론이었음을 보여준다: "A(head)의
+여러 변형을 다 시도했는데 안 됐다"는 A의 그 변형들에 대한 증거이지, B(백본)에
+대한 증거가 아니다 — A 자체를 다른 축(용량, 또는 경쟁 없는 목적함수)으로
+바꾸는 걸 안 해봤을 뿐이었다. 9절의 "독립적 causal evidence" 요구가 정확히
+이 실수를 막기 위한 것이었고, 실제로 LoRA를 성급히 열지 않도록 막아냈다 —
+다만 그 증거가 기존 가설을 뒤집는 방향으로 나왔을 뿐이다.
+
+`LengthProbe`가 기존 `prior_head`보다 나은 이유로 용량(파라미터 수)과
+목적함수 분리(topology/token NLL와 경쟁 없음) 두 가지가 동시에 바뀌었는데,
+이 둘을 아직 분리하지 않았다. 다음 결정 지점(아직 시작 안 함): `prior_head`를
+더 큰 MLP로 바꾸되 기존처럼 joint하게 학습해서, 용량만으로 이 격차의
+얼마나가 회복되는지 확인.
+
+`candidate/diagnostic`: **backbone adaptation(E3, LoRA)은 이 증거로
+뒷받침되지 않는다** — frozen 표현력 자체는 이미 충분하다. 올바른 다음
+레버는 backbone이 아니라 `prior_head` 자체의 구조(더 큰 용량, 그리고/또는
+다른 loss에 굶주리지 않는 분리된 학습 경로)다.
+
+### E2 MLP prior_head, joint 학습 (candidate/diagnostic — 용량이 아니라 목적함수 공유가 원인)
+
+위에서 분리 안 된 두 가설(용량 vs 목적함수 분리) 중 "용량"을 검증했다
+(`RESULTS.md`의 "E2 MLP prior_head, joint training"). `prior_head`를
+`LengthProbe`와 완전히 동일한 구조(2-hidden-layer, 512-wide MLP)로
+바꾸되, 기존처럼 topology/token loss와 함께 joint하게 학습했다.
+
+| prior_head | 학습 방식 | within-record |
+|---|---|---:|
+| 단일 Linear (지금까지 최고) | joint | `0.284` |
+| 2-layer MLP (668,696 파라미터) | joint | `0.207` |
+| 동일 MLP 구조, standalone(`LengthProbe`) | **분리** (길이만 학습) | **`0.687`** |
+
+**용량만으로는 격차가 안 메워졌다** — 오히려 단일 Linear보다 약간
+나빠졌다. 원인은 loss 구조 자체에 있다: `topology_log_probabilities`가
+`prior`(count loss가 직접 지도하는 바로 그 belief)에서 유도되기 때문에,
+`prior_head`의 파라미터는 애초부터 "진짜 길이를 정확히 맞추기"와
+"topology 분류를 잘하기"라는 서로 다른 두 요구를 동시에 받는다. 용량이
+큰 네트워크는 이 두 요구 사이의 타협점에 안착할 파라미터가 더 많아서,
+같은 step 예산 안에서는 오히려 둘 다 덜 잘 만족시킬 수 있다.
+
+`candidate/diagnostic`: **`LengthProbe`가 앞선 이유는 용량이 아니라
+목적함수 분리였다.** 다음으로 열어야 할 축은 `prior_head`를 더 키우는
+것이 아니라, joint 모델 안에서 belief 지도를 topology와의 경쟁에서
+분리하는 것 — 단계적/커리큘럼 학습, topology 경로가 `prior`를 쓸 때
+stop-gradient를 거는 것, 또는 count loss가 초반에 우세하도록 가중치를
+스케줄링하는 것 등. 아직 아무것도 시작 안 함.
+
+### E2 stop-gradient decoupling (candidate/diagnostic — calibration은 그대로, rollout 품질은 개선)
+
+위 세 후보 중 가장 저렴한 stop-gradient를 실행했다(`RESULTS.md`의 "E2
+stop-gradient decoupling"). `predict()`가 topology를 유도할 때 `prior`
+대신 `prior.detach()`를 써서, action loss의 gradient가 `prior_head`에
+도달하지 못하게 막았다(forward 값은 완전히 동일 — topology 자체는 여전히
+현재 belief의 정확한 Bayesian 결과다).
+
+| prior_head | detach | within-record |
+|---|---|---:|
+| 단일 Linear | 아니오(기존 최고) | `0.284` |
+| 단일 Linear | **예** | `0.279`(변화 없음) |
+| MLP | 아니오 | `0.207` |
+| MLP | **예** | `0.219`(소폭 개선, 여전히 단일 Linear보다 낮음) |
+
+**calibration 숫자는 거의 안 움직였다** — gradient 경쟁을 없애는 것만으로는
+`LengthProbe`의 `0.687`을 재현하지 못했다. 목적함수 경쟁은 진짜
+원인이었지만 전부는 아니었다: probe는 고정된 3,517개 예제 데이터셋에서
+200 epoch(~11,000 gradient step, batch_size=64)를 돌았는데, `prior_head`는
+detach 여부와 무관하게 여전히 2000 step, 매 step 새로 corruption된
+단일 예제만 본다. gradient 경로를 분리하는 것과, count 목적함수에 실제로
+할당되는 학습량/일관성을 맞추는 것은 별개였다.
+
+다만 완전히 무의미하진 않았다: free-rollout 품질(finish rate, MAE,
+유사도, 상관관계)은 두 prior_head 크기 모두에서 stop-gradient로
+일관되게 개선됐고, MLP+detach 조합은 이번 세션 최고 유사도(`0.360`)와
+최고 상관관계(`0.16`)를 기록했다(대신 언더슛이 커짐). single-step
+calibration 감사와 free-rollout 지표는 서로 다른 것을 재고 있다는 뜻이다.
+
+`candidate/diagnostic`: stop-gradient 단독으로는 `LengthProbe`의 calibration
+이득을 재현하지 못했다 — "목적함수 경쟁만 없애면 된다"는 가설은 기각되고,
+probe의 학습 체계(step 수, batching, 데이터 결정성) 자체가 더 유력한
+남은 차이로 지목된다. 하지만 rollout 품질 개선은 실재하므로 stop-gradient
+자체는 유지할 가치가 있다. 다음 결정 지점(아직 시작 안 함): `prior_head`의
+count loss에 probe와 맞먹는 양/일관성의 gradient를 주는 사전학습 또는
+replay 방식.
 
 ### 확장과 confirmation
 
