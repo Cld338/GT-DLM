@@ -149,7 +149,7 @@ state를 생성하는 별도 corruption/edit process와 그 확률을 먼저 정
 | E0 | closed: mechanics | deletion forward process에서 유도한 insertion ELBO가 정확히 정규화되는가? | tiny exact normalization/ELBO test 통과 |
 | E1 | closed: mechanics | sampled deletion posterior와 Rao-Blackwellized target이 일치하는가? | exhaustive gradient/DP gate 통과 |
 | E1b | closed: mechanics | early supercritical posterior와 finite termination을 한 bridge에서 만족하는가? | endpoint-safe generator exact gate 통과 |
-| E2 | active: single-step vs rollout signal separation | head-only joint token-marker reverse model이 실제 rollout을 학습하는가? | 단일-GAP selection gate 통과 |
+| E2 | active: root-GAP belief length calibration | head-only joint token-marker reverse model이 실제 rollout을 학습하는가? | 단일-GAP selection gate 통과 |
 | E3 | blocked by E2 | compressed-gap lexical query에 backbone adaptation이 필요한가? | retention을 지키며 E2 개선 |
 | E4 | blocked by E3 | explicit empty-gap process로 DELETE recovery를 학습할 수 있는가? | calibrated DELETE/recovery gate 통과 |
 
@@ -217,7 +217,7 @@ clean token deletion process를 먼저 고정하고 그 reverse event를 SSB joi
 정의하는 것이다. 학습은 하나의 initial GAP에서 시작하며 16-mask length scaffold를 쓰지
 않는다.
 
-### E2 — head-only pilot (active: single-step vs rollout signal separation)
+### E2 — head-only pilot (active: root-GAP belief length calibration)
 
 첫 정식 500-step pilot 결과는 `RESULTS.md`의 "E2 head-only pilot" 절에 있다. N0-N2와
 달리 구조 action이 실제로 다수(`55-58%`)를 차지하고 target-24 length MAE는 지금까지
@@ -350,6 +350,144 @@ predicted remaining의 상관관계는 여전히 `0.038`로 사실상 0이다 �
 지금은 안 맞는 stratification 설정과 얽혀있는 것)인지"를 분리하는 것이며,
 아직 분리하지 않았다. 9절 중단 기준에 따라 step 증가, stratification
 재조정, backbone adaptation(E3) 중 어느 것도 이 분리 없이는 열지 않는다.
+
+### E2 length-posterior mechanics (closed: mechanics)
+
+Rollout의 time 갱신식(`1-(1-t)*0.5**(1/total_remaining)`)을 역으로 유도해보니
+공식 자체는 정확한 median-next-event-time 닫힌 형태였다 — 문제는 거기 들어가는
+`R`이 `CountingBridgeSSBHead`의 **제약 없는 점추정**이라 틀려도 스스로 교정되지
+않는다는 것이었다. E1b의 `toy_unknown_length_marginal_bridge`가 이미 길이-2종
+toy 사례에 대해 정답(점추정 대신 생존 시간 자체를 증거로 쓰는 베이즈 사후확률)을
+갖고 있었지만 일반화되지 않았었다.
+
+`src/ssb/length_posterior.py`가 이를 임의의 discrete prior로 일반화했다 —
+`marker_rates`/`survival_probability`가 toy bridge의 수치와 부동소수점 수준까지
+정확히 일치하고(`tests/test_length_posterior.py`, `14/14`), point-mass prior는
+기존 per-GAP 조건부 확률과 정확히 일치하며, `posterior_given_marker`/
+`child_prior_after_marker`로 관측된 marker에 대한 베이즈 갱신과 자식 GAP의 길이
+prior까지 유도했다. 신경망도, 학습도, rollout도 아직 건드리지 않은 순수 수학
+단계다. E0/E1/E1b와 같은 게이트("먼저 법칙을 정의하고 독립적으로 검증") 통과.
+
+다음 단계(아직 결정하지 않음)는 이 벨리프를 신경망이 어떻게 만들고 갱신하게
+할지, 여러 GAP이 서로 correlated일 때(지금은 GAP마다 독립으로 다룸) 어떻게
+확장할지, 그리고 실제로 rollout 문제를 개선하는지 측정하는 것이다.
+
+### E2 length-belief head (candidate)
+
+위 수학을 실제로 신경망 head로 만들었다(`src/ssb/length_belief_head.py`,
+`--head-design length-belief`). `prior_head`는 **time을 입력으로 받지 않고**
+hidden state만으로 24-way 길이 belief를 예측하고, topology/remaining_events는
+전부 `length_posterior.py`의 정확한 공식으로 그 belief와 time에서 **유도**된다
+— 더 이상 topology를 `(hidden,time)`의 별도 학습 함수로 두지 않는다.
+
+`head_only_500_stratified_v2`와 동일한 corruption 설정(시간 stratification
+2개 축 + gap-arrangement)으로 같은 500-step 재학습 후 비교하면, 지금까지
+어떤 stratification 조정으로도 부분적으로만 줄였던 remaining-count 폭주
+증가율(`2.6-2.8x → 1.2-2.3x`)이 **`1.07-1.08x`로 사실상 사라졌다** —
+파라미터 수는 오히려 18배 이상 적다(`595,973 → 18,456`). length MAE와
+similarity도 두 target 모두 개선됐다(target-12 similarity `0.162`, length
+MAE `4.31`로 이번 세션 전체 중 최고 기록).
+
+단, 이 head가 고친 건 "belief가 있을 때 그걸 어떻게 쓰는가"이지 "belief가
+context로부터 얼마나 informed한가"가 아니다 — target-24는 여전히 undershoot
+한다(이미 별도로 진단한 문제, `natural_boundaries`가 겨냥하는 축). 그리고
+`LEFT`/`RIGHT`가 실제 확률(각 9%)을 갖는데도 greedy argmax에서 한 번도
+선택되지 않았다 — 이건 belief 품질과 무관한 greedy decoding 자체의 한계다.
+
+`candidate`: self-correction 가설은 검증됐지만, 아직 `natural_boundaries`와
+결합하지 않았고 greedy decoding 문제도 다루지 않았다. 9절 중단 기준에 따라
+둘 다 신중한 결정 없이 진행하지 않는다.
+
+### E2 length-belief + natural_boundaries 결합 (candidate/diagnostic)
+
+두 검증된 수정을 합쳐 재학습했다(`RESULTS.md`의 "E2 length-belief +
+natural-boundary corruption combined"). natural-span 길이 상관관계는
+`0.679`로 이번 세션 전체 최고치를 기록했다 — 두 문제가 정말 독립적이고
+같이 고치면 함께 개선된다는 뜻이다. 하지만 다른 모든 지표가 후퇴했다:
+remaining count 증가율이 `1.07-1.08x`에서 `1.5-1.7x`로 다시 늘었고
+(여전히 원래 baseline `2.6-2.8x`보다는 낫다), natural-span rollout의
+finish rate는 `9.7%`로 붕괴했으며 심하게 과다생성한다(진짜 평균 `13.26`
+대비 생성 `36.32`).
+
+가장 유력한 설명: length-belief의 self-correction 보장은 "주어진 prior를
+올바르게 쓴다"는 보장이지 "그 prior의 **스케일** 자체가 rollout 메커니즘
+(경쟁 강도 기반 GAP 선택, time 갱신식)에 맞게 보정되어 있다"는 보장이
+아니다. natural span은 학습 분포의 길이 스케일 자체를 바꿔놓는데, rollout
+쪽(`event_cap`, time 공식이 암묵적으로 가정하는 스케일)은 그에 맞춰
+재검토되지 않았다. self-correction은 "한 rollout 안에서 틀린 벨리프가
+더 나빠지는 것"은 막지만, "애초에 스케일이 잘못 잡힌 벨리프"까지 막지는
+못한다.
+
+부수적 발견: `length-belief`에서는 `RIGHT`가 `LEFT`와 경쟁할 때 한 번도
+이기지 못한다 — `marker_probabilities_from_prior`가 둘을 수학적으로
+완전히 대칭으로 만들기 때문에 항상 정확히 동점이고, `torch.argmax`가
+동점을 낮은 enum 인덱스(`LEFT=1` < `RIGHT=2`) 쪽으로 깬다. calibration과
+무관한 순수 decoding artifact다.
+
+그 분리를 실행했고, "스케일 불일치"는 기각됐다(`RESULTS.md`의 "E2
+length-belief instability isolated"). 같은 checkpoint를 rollout 없이
+단일 시점으로 다시 재보니 natural span에서 predicted remaining `12.33`
+(진짜 평균 `14.76`, 비율 `0.84`)로 rollout의 초기 추정치(`12.60`)와
+거의 정확히 일치했다 — 이전 "3배 차이"는 같은 checkpoint를 **서로 다른
+평가 방식**(고정 target-12/24 vs natural-spans)으로 비교한 오류였다.
+
+진짜 원인은 다른 데 있었다: `length_posterior.py`를 만들 때 이미 명시했던
+미해결 지점 — "자식 GAP의 belief가 부모와 아무 관계 없이 독립적으로
+새로 추정된다"는 것. `audit_diffugpt_elbo_e2_sibling_inflation.py`로
+rollout 중 marker별로 총 predicted remaining의 변화량을 직접 측정하니,
+`BOTH`는 두 checkpoint 모두에서 91-93%의 경우 총합을 증가시키고
+(`+0.8~+1.2`), `LEAF`/`LEFT`는 거의 항상 감소시켰다(`0~0.4%`만 증가).
+이 메커니즘은 `natural_boundaries`와 무관하게 `LengthBeliefSSBHead`
+자체에 보편적이다 — 차이는 오직 `BOTH`를 얼마나 자주 고르느냐였다
+(순수 length-belief는 LEAF/BOTH가 거의 50/50이라 상쇄되어 성장률
+`~1.0x`, length-belief+natural은 BOTH가 훨씬 우세해서 순증가).
+
+다음 결정 지점(아직 시작 안 함)은 `child_prior_after_marker`(이미 정확한
+수식은 유도됨)를 실제로 연결하는 것이다 — 이건 rollout 중에 "어느 GAP이
+누구의 자식인지" lineage를 추적해야 하는, 지금까지보다 더 큰 아키텍처
+작업이다. 9절 중단 기준에 따라 이 lineage 추적 없이 corruption 재조정이나
+step 증가로 대응하지 않는다.
+
+### E2 lineage-aware child belief (candidate — 위 lineage 작업 실제 연결)
+
+위에서 "아직 시작 안 함"으로 남겨뒀던 `child_prior_after_marker` 연결을
+실행했다(`RESULTS.md`의 "E2 lineage-aware child beliefs"). `predict()`에
+`prior_override`/`override_mask`를 추가하고, rollout의 GAP 위치 북키핑
+(`apply_joint_actions`의 `[MASK,token]`/`[token,MASK]`/`[MASK,token,MASK]`
+치환 레이아웃에서 자식 위치가 바로 나온다)을 이용해 매 `LEFT`/`RIGHT`/
+`BOTH` 이벤트 직후 자식의 belief를 부모 belief로부터 정확히 유도된 값으로
+강제 고정했다. 재학습 없음 — 두 기존 500-step checkpoint에 대해 rollout
+평가 방식만 바꿨다. 테스트 143/143 통과.
+
+결과는 "확실히 해결"이 아니라 세 갈래로 갈렸다. (1) 목표했던 성장 불안정
+자체는 사라졌다 — 모든 성장률이 `0.82x-1.07x` 범위로 들어왔다(불안정
+checkpoint는 기존 `1.5-1.7x`였음). (2) 이미 거의 안정적이던 checkpoint
+(`length-belief`, natural 없음)는 모든 지표(finish/MAE/similarity)가
+동시에 개선됐다 — 순수한 개선. (3) 불안정했던 checkpoint
+(`length-belief+natural`)에서는 natural-span finish rate가 `9.7%→90.3%`,
+MAE가 `23.06→4.84`로 극적으로 좋아졌지만, 이 세션 최고 성과였던 길이
+상관관계(`0.679`)가 `-0.058`로 완전히 사라졌다.
+
+`ANALYSIS.md`("the natural-span correlation was runaway growth in
+disguise")에서 그 상관관계 자체를 재해석했다: `0.679`는 belief가 문맥
+길이를 실제로 읽어낸 증거가 아니라, natural-boundary corruption이 만드는
+"실제 콘텐츠 양 → multi-GAP 시작 상태 빈도"와 (당시 고쳐지지 않았던)
+runaway 성장 버그가 만드는 "그 시작 상태 → 얼마나 많이 폭주할 기회를
+얻는가"라는 두 개의 독립적 대리 신호가 우연히 같은 방향으로 움직이며
+만든 결과였다. runaway를 고치자 그 우연한 결합의 절반이 사라졌고, 원래
+한 번도 만들어진 적 없던 나머지 절반(root GAP 자신의 belief가 문맥
+길이를 실제로 추적하게 만드는 지도 신호)이 드러났을 뿐이다. 이는 이번
+투자 초기에 확인했던 "target-length undershoot"(압축된 단일-GAP-토큰
+표현이 DreamOn의 리터럴 mask-count 설계가 보존하는 길이 정보를 구조적으로
+잃는다는 문제)가 애초에 한 번도 닫힌 적이 없었고, 우연히 다른 버그에
+가려져 있었을 뿐임을 뜻한다.
+
+`candidate`: lineage-aware child belief는 유지한다 — 이미 안정적이던
+checkpoint에서 순수 개선이고, 목표했던 메커니즘(형제 팽창)도 정확히
+예측대로 사라졌다. 하지만 9절 기준으로 이건 "완료"가 아니라 새로운
+결정 지점을 연 것이다: 다음으로 열어야 할 축은 lineage 추가 튜닝이
+아니라, root GAP의 prior가 실제 문맥 길이를 학습하도록 하는 지도 신호
+설계(아직 시작 안 함)다.
 
 ### 확장과 confirmation
 

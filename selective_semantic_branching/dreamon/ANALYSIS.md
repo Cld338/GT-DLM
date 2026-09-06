@@ -315,3 +315,246 @@ exposure in `500` steps over `256` documents), a frozen-backbone
 representational ceiling, or something else entirely has not been isolated,
 and neither has the stratification-recalibration question. Both remain open
 decisions, not yet made.
+
+## 2026-09-06: where SSB actually diverges from its own cited literature
+
+`SSB_ELBO_DESIGN.md` section 2 already tabulates how DreamOn, FlexMDM
+(`Any-Order Flexible Length Masked Diffusion`), Edit Flows, DILM
+(`A CTMC Framework for Insertion Language Models`), DID
+(`Deletion-Insertion Diffusion`), and Branching Flows each treat "how much
+more to generate." Read across a row that table did not draw explicitly:
+every one of them, DreamOn included, reduces that question to a *local*
+judgment conditioned on the current, evolving state - an expand/no-expand
+call per visible mask token (DreamOn), a branch/death rate per element
+(Branching Flows), an edit rate per position (Edit Flows, DID), or a
+length-to-go term defined against the real remaining continuation of an
+actual document (DILM). None of them ask a model to read one static initial
+context and output a single global scalar count in one shot.
+
+SSB's E0-E1b derivation is a faithful, exactly-verified member of the same
+DILM/DID family - the uniform-deletion CTMC time reversal and its
+Rao-Blackwellized joint action are not where anything failed. What
+diverged is two engineering choices made while turning that theory into
+the E2 code-infilling pilot, neither required by the theory itself:
+
+1. **Representational compression.** DreamOn keeps its length budget as
+   `number_of_mask` literal, visible mask tokens. SSB's single-GAP
+   compression (`RESEARCH_DIRECTION.md` section 2, invariant 4) replaces
+   that with one opaque token standing for an a priori unknown count,
+   specifically to avoid a fixed scaffold. This is a deliberate and
+   otherwise reasonable trade, but it deletes exactly the information a
+   `number_of_mask`-style setup would have kept.
+2. **A corruption/evaluation protocol that severs context from length.**
+   DILM/DID/Branching Flows train against the true remaining content of
+   real documents, so "how much is left" is context-correlated by
+   construction; DreamOn's evaluation gives that number externally rather
+   than asking a model to infer it. The original E2 pilot did neither: it
+   borrowed DreamOn's externally-fixed-length evaluation convention while
+   also sampling training `span_length` independent of context, then asked
+   the compressed single-token representation to reconstruct a quantity
+   that was, by that construction, statistically absent from context (`E2
+   target-length undershoot`).
+
+The single-step-vs-rollout correlation gap this session found
+(`0.038` at a static initial query vs `0.452` over full free rollout,
+`E2 context-linked corruption redesign`) is exactly what this comparison
+predicts: the *local, state-conditioned* signal every cited method actually
+relies on is the one SSB's checkpoint partially learned, over a multi-step
+trajectory where local cues accumulate; the *global, one-shot* signal - a
+requirement none of DreamOn/FlexMDM/Edit Flows/DILM/DID/Branching Flows
+impose on a model - is the one that stayed flat. The theory did not fail;
+the pilot's specific combination of a compressed representation with a
+context-severing corruption design asked a strictly harder, more unusual
+question of it than any cited baseline answers.
+
+## 2026-09-06: the point-estimate design is the mechanism, not just the data problem
+
+The previous entry explained *why* length is hard to learn from context.
+It does not fully explain why a bad guess, once made, gets worse rather
+than self-correcting during rollout. Re-deriving the rollout time formula
+(`RESULTS.md`, "E2 length-posterior derivation") answers that: the formula
+itself is an exact median-next-event-time closed form, not a heuristic - it
+is only as good as the scalar `R` fed into it, and `CountingBridgeSSBHead`
+supplies `R` as an unconstrained point estimate with no mechanism forcing
+it to become more certain, or more correct, as evidence accumulates. A
+wrong `R` distorts `t`, which distorts every head's otherwise-correct
+`t`-dependence, with nothing pulling the estimate back toward calibration.
+
+E1b's `toy_unknown_length_marginal_bridge` already contains the fix, just
+never generalized past a two-value toy example: treat the unknown length as
+a genuine Bayesian belief, not a point estimate. Under that construction,
+survival to a later time is *itself* evidence, and the posterior
+mechanically sharpens toward the correct hypothesis - it cannot compound an
+early mistake the way a free-floating scalar regression can, because it is
+constrained to stay a normalized probability distribution updated by exact
+Bayes' rule at every step. `src/ssb/length_posterior.py` generalizes this
+exactly (verified against the toy bridge to floating-point precision and
+against brute-force marker enumeration), which reframes the design question
+from "how do we get a better point estimate" (more data, more steps,
+backbone adaptation - all previously ruled out or unproductive) to "replace
+the point estimate with a belief that is structurally guaranteed to
+concentrate correctly." That reframing is mechanics only so far; it says
+nothing yet about how a neural network should produce or update such a
+belief, how multiple correlated sibling GAPs should be handled jointly, or
+whether it fixes anything empirically. Those are the next, undecided
+questions.
+
+## 2026-09-06: the self-correction hypothesis holds; a second, independent one remains
+
+`RESULTS.md` ("E2 length-belief head") answers the empirical question the
+previous entry left open. Replacing `CountingBridgeSSBHead`'s point-estimate
+regression with `LengthBeliefSSBHead`'s constrained categorical belief -
+same corruption settings, same step budget, an order of magnitude fewer
+parameters - reduces the runaway remaining-count growth factor from
+`1.2-2.3x` (every prior stratification fix) to `1.07-1.08x`, and improves
+length MAE and similarity at both targets. The mechanism-level diagnosis
+from the previous two entries was correct: an unconstrained scalar can
+drift arbitrarily far from calibration once wrong, while a normalized
+distribution over a bounded support, updated by exact Bayes' rule, cannot -
+it is mathematically prevented from doing so, not merely encouraged not to.
+
+This is best read as confirming one of the two independent problems this
+line of investigation identified, not both. "E2 target-length undershoot"
+and "ANALYSIS.md: where SSB actually diverges from its own cited
+literature" diagnosed a *representational* problem: the compressed
+single-GAP token structurally cannot carry, and the original corruption
+process did not even statistically contain, information correlating true
+length with context. The length-belief head does not touch that axis at
+all - its prior is exactly as informed by context as whatever hidden state
+the frozen backbone already produces, which is why target-24 still
+undershoots for the same reason as before. What it fixes is a *dynamical*
+problem: given whatever belief the network does form, does using it
+compound errors or self-correct. Those are genuinely separate axes, and
+this session tested them one at a time by design; combining the
+length-belief head with `natural_boundaries` corruption is the natural next
+experiment, not yet run.
+
+A second, smaller finding worth carrying forward: initial `P(BOTH)` under
+the new head (`78%`) is higher than the old head's post-stratification
+value (`36-38%`), yet the rollout behaves far better (no runaway growth,
+better length/similarity). The old head's topology distribution was a
+freely fit function that happened to look more balanced on paper; the new
+head's is a checkable consequence of an explicit belief, and no marker
+other than `LEAF`/`BOTH` was ever selected in either rollout despite
+`LEFT`/`RIGHT` carrying real probability mass (`9%` each) - a pure artifact
+of greedy argmax decoding discarding close second-place options, unrelated
+to whether the underlying distribution is well-calibrated. A more balanced-
+*looking* marker histogram is not the same thing as a better-calibrated
+one, and greedy decoding can hide or manufacture the difference either way.
+
+## 2026-09-06: the two fixes are not additive - combining them trades one failure for another
+
+`RESULTS.md` ("E2 length-belief + natural-boundary corruption combined")
+ran the obvious next experiment: both validated fixes together. The result
+is not a straightforward win. Natural-span length correlation reaches
+`0.679` - the best of the session, well above `0.452` (old head +
+`natural_boundaries`) and `0.038` (flat, no fix) - confirming the two
+problems really are separable and both contribute when addressed together.
+But `mean_initial_predicted_remaining` jumps to `~12.6`, roughly `3x` the
+same head's value without `natural_boundaries` (`3.8-4.8`), and free-rollout
+finish rate on natural spans collapses to `9.7%` with severe overshoot
+(`36.32` generated vs a true mean of `13.26`).
+
+The likely mechanism: `length-belief`'s self-correction guarantee (the
+posterior cannot compound an error the way a point estimate can) is a
+guarantee about *given a prior, using it correctly* - it says nothing about
+whether the prior's own *scale* is calibrated to the process it feeds into
+(the competing-intensity GAP selection and the time-advance formula both
+implicitly assume `remaining_events`' scale matches the training
+corruption's typical magnitudes). Natural-span training shifts that scale
+(shorter, more skewed lengths) while the rest of the rollout machinery
+(`event_cap`, the time formula's implicit assumptions) was never
+re-examined against the new distribution. Self-correction prevents a wrong
+belief from getting worse over the course of one rollout; it does not
+prevent a belief that is systematically mis-scaled from the start.
+
+A smaller, mechanical finding from the same run: `RIGHT` never wins greedy
+argmax in any `length-belief` run, `LEFT` always does when the two compete.
+`marker_probabilities_from_prior` gives them mathematically identical
+probability for every state (the construction is exactly symmetric), so
+they are always exactly tied, and `torch.argmax` breaks ties toward the
+lower enum index (`LEFT=1` before `RIGHT=2`). This is a decoding artifact
+of exact symmetry plus greedy selection, not a signal about calibration -
+worth remembering before reading any `LEFT`/`RIGHT` imbalance in a
+`length-belief` rollout as meaningful.
+
+## 2026-09-06: retraction - it was never a scale problem, it was uninherited children
+
+The "belief-scale mismatch" hypothesis above does not survive a fair
+comparison: `mean_predicted_remaining` under a rollout-free, single-step
+audit on natural spans (`12.33`) matches the rollout's own initial estimate
+(`12.60`) almost exactly, and both are reasonably close to the true mean
+(`14.76`, ratio `0.84`). The earlier `~3x` figure compared two different
+evaluation modes on the checkpoint, not two different beliefs - an
+apples-to-oranges error worth flagging precisely because it looked like a
+clean, damning number.
+
+`RESULTS.md` ("E2 length-belief instability isolated") finds the real
+mechanism instead, and it is exactly the gap `length_posterior.py` named
+when it was written but left unimplemented: nothing constrains a child
+GAP's belief relative to the parent's. Instrumenting free rollout shows
+`BOTH` actions increase the model's own summed remaining-count belief
+`91-93%` of the time (mean `+0.8` to `+1.2`) in *both* the `length-belief`
+and `length-belief + natural` checkpoints, while `LEAF`/`LEFT` decrease it
+essentially always. This is not a training artifact specific to one
+corruption recipe; it is what happens whenever two freshly-initialized
+child beliefs are summed without subtracting the resolved parent's share.
+The two checkpoints differ only in how often `BOTH` is chosen relative to
+`LEAF`/`LEFT` - roughly `50/50` in one (inflation and deflation cancel,
+matching its `~1.0x` growth factor) and heavily `BOTH`-skewed in the other
+(matching its `1.5-1.7x` growth and overshoot).
+
+This reframes the open question cleanly. It is not "is the belief's scale
+calibrated" (it is, reasonably) and not really "is `natural_boundaries`
+destabilizing" (the mechanism predates it and is universal to this head).
+It is a structural gap in `LengthBeliefSSBHead` itself: the self-correction
+guarantee holds *within* one GAP's own lifetime (its posterior over its own
+length concentrates correctly as it survives), but nothing yet makes a
+freshly created sibling's belief a properly normalized *share* of what its
+parent already believed, so a `BOTH`-heavy policy can inflate the total
+without any single belief ever being locally miscalibrated. Wiring in
+`child_prior_after_marker` - which already has the exact math for this -
+requires tracking which GAP is whose child across a rollout, not yet
+attempted.
+
+## 2026-09-06: the natural-span correlation was runaway growth in disguise
+
+Wiring `child_prior_after_marker` in (`RESULTS.md`, "E2 lineage-aware child
+beliefs") does what the diagnosis above predicted: growth factors on both
+checkpoints move into `0.82x`-`1.07x`, and the previously-catastrophic
+`length-belief + natural` checkpoint's natural-span finish rate jumps from
+`9.7%` to `90.3%` with MAE falling from `23.06` to `4.84`. On the mechanism
+this investigation actually targeted, the fix works exactly as derived.
+
+But the same run's true/generated-length correlation - `0.679`, the single
+best number this whole investigation produced, and the headline result of
+the "natural-boundary corruption" entry - collapses to `-0.058`, indistin-
+guishable from noise. Read against everything else that improved in the
+same run, this is not evidence the fix broke length-tracking. It is evidence
+that `0.679` was never measuring length-tracking to begin with. The natural-
+boundary corruption redesign made target length correlate with *how much
+real content the corruption process had to work with*; separately, the
+(uncorrected) sibling-inflation bug made generation length correlate with
+*how many opportunities the runaway dynamics got to keep compounding*. Both
+of those correlate with the same underlying quantity - more real content
+behind a span meant more natural boundaries available for the corruption
+process to have produced a multi-GAP state from, which gave the runaway
+bug more fuel. The `0.679` correlation was the product of two independent,
+unrelated proxies both tracking real content incidentally, not the model
+learning to read context length into its belief. Removing the runaway bug
+removed its half of that accidental coupling and exposed that the other
+half - the belief's own root-GAP prior actually tracking context - was
+never built. This is the same "target-length undershoot" gap identified far
+earlier in this investigation (root cause: the compressed single-GAP-token
+representation structurally loses the length information DreamOn's literal
+mask-count design preserves), which `natural_boundaries` never closed - it
+was only ever masked by a second, unrelated bug that happened to point the
+same direction.
+
+The methodological lesson worth keeping: a correlation that improves when
+you change corruption but *before* you have fixed a known confound in the
+generation dynamics is not yet evidence about the corruption change. This
+is exactly the kind of result the project's "change one axis, verify before
+declaring a fix" discipline exists to catch, and it very nearly slipped
+through - the `0.679` number was reported as this investigation's best
+result for two entries before the confound was found and removed.

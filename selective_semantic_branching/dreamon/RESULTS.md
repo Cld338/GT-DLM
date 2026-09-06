@@ -1104,3 +1104,460 @@ python evaluate_diffugpt_counting_bridge.py --model-path ..\..\models\diffugpt-s
   --output-file artifacts\diffugpt_elbo_e2\rollout_natural.json `
   --limit 32 --max-length 128 --natural-spans
 ```
+
+## E2 length-posterior derivation: E1b's unknown-length machinery, generalized (mechanics only)
+
+Re-deriving the rollout's time-advance formula
+(`time = 1 - (1-time) * 0.5**(1/total_remaining)`) shows it is *not* an
+untested heuristic in its functional form: it is exactly the closed-form
+median next-event time of a Poisson process with rate `R * h(t)`,
+`h(t) = 1/(1-t)` - the same hazard already used throughout E0-E1b. The
+`branching_bridge.py` "exact" hazard functions
+(`conditional_total_exit_rate` etc.) cannot replace it, though, because they
+require the *true* candidate count, which only exists when the clean target
+is known - never available at real generation time. The actual defect is
+that `R` is supplied by `CountingBridgeSSBHead`'s point-estimate regression,
+so any error in that single scalar directly distorts every head's
+`t`-dependence (already shown correct in isolation, `RESULTS.md` "E2
+over-branching ... time formula and head undertraining are both ruled out"),
+and nothing in the current design causes that error to self-correct.
+
+E1b already solved exactly this problem for a toy two-value length prior:
+`toy_unknown_length_marginal_bridge` computes each transition's rate as a
+survival-weighted Bayesian posterior over which length hypothesis is true,
+not a point estimate, so the belief necessarily sharpens as more of the
+process is observed rather than compounding an early mistake.
+`src/ssb/length_posterior.py` generalizes that construction from a two-value
+prior to an arbitrary discrete prior `{r: p_r}` over one GAP's hidden
+length, built only from the already-established per-GAP uniform-pivot law
+(`marker_event_counts`, matching `deletion_elbo._marker` exactly). No neural
+network component is touched; this is the exact-math layer a later stage
+would use in place of a point-estimate `remaining_head`.
+
+`tests/test_length_posterior.py` (`14/14`) verifies this three ways: (1)
+`marker_event_counts` matches exhaustive enumeration via
+`build_deletion_elbo_state` for `remaining` up to `7`; (2)
+`survival_probability` and `marker_rates` reduce *exactly* to
+`toy_unknown_length_marginal_bridge`'s `root`/`root_to_terminal_one`/
+`root_to_left` values (`places=12`, i.e. floating-point exact) across a grid
+of times and mixture weights - not approximately consistent, identical
+closed forms; (3) a point-mass prior reproduces the plain per-GAP
+conditional rate/probability (`count_marker(r)/r`) used elsewhere in the
+project. `posterior_given_marker` and `child_prior_after_marker` (Bayes
+update after an observed marker, and the resulting child GAPs' length
+priors, with `BOTH`'s interior-pivot split handled as a uniform mixture)
+are exact but have no independent literature cross-check yet beyond
+normalization and support-consistency tests.
+
+`closed: mechanics`. This is the same "define exact law, verify it in
+isolation" gate E0/E1/E1b passed before touching a checkpoint. It is not
+yet wired into `CountingBridgeSSBHead` or `rollout()`, does not yet handle
+correlated siblings during actual multi-GAP rollout (each GAP's prior is
+still treated independently), and no training or evaluation has been run
+against it. Per `RESEARCH_DIRECTION.md` section 9, none of the open E2
+questions (single-step vs. rollout signal, stratification recalibration)
+are resolved by this entry alone.
+
+Artifacts: none (pure mechanics, no run to record). Reproduce with, from
+`DreamOn/`:
+
+```powershell
+python -m unittest discover -s tests -p "test_length_posterior.py" -v
+```
+
+## E2 length-belief head: runaway remaining-count growth is essentially gone
+
+`src/ssb/length_belief_head.py` makes the mechanics above differentiable and
+wires it into a real head: `LengthBeliefSSBHead.prior_head` predicts a
+`24`-way categorical belief over hidden length from `hidden` alone (no
+`time` input - a GAP's true hidden length is fixed at "birth", so only the
+Bayesian update, not the belief itself, should depend on elapsed time), and
+`topology_log_probabilities`/`remaining_events` are *derived* from that
+belief and `time` by the exact formulas in `length_posterior.py`
+(`marker_probabilities_from_prior`, `posterior_mean_remaining`), not learned
+as a separate function of `(hidden, time)`. It exposes the same field names
+and method signatures as `CountingBridgeSSBHead`
+(`predict`/`greedy_event`/`loss_from_candidates`), so it is a drop-in
+replacement via a new `--head-design length-belief` flag on
+`train_diffugpt_counting_bridge.py`/`evaluate_diffugpt_counting_bridge.py`.
+`tests/test_length_belief_head.py` (`11/11`) checks the tensorized Bayes
+math against the plain-Python reference element-by-element, an enumerated-
+joint-NLL cross-check of `loss_from_candidates`, that the prior is provably
+time-invariant while the derived topology is not, and gradient flow to
+`prior_head`.
+
+Retraining the identical 500-step pilot with `--head-design length-belief`
+and otherwise the exact stratification settings as `head_only_500_stratified_v2`
+(`stratify_probability=0.3`, `mid_stratify_probability=0.3`,
+`gap_stratify_probability=0.3`), then running the same rollout gate:
+
+| target | head | finish | length MAE | similarity | initial P(BOTH) | remaining growth `x` |
+|---:|---|---:|---:|---:|---:|---:|
+| 12 | counting-bridge (v2) | `90.63%` | `5.03` | `0.150` | `38.2%` | `1.63x` |
+| 12 | length-belief | `93.75%` | **`4.31`** | **`0.162`** | `78.3%` | **`1.073x`** |
+| 24 | counting-bridge (v2) | `100%` | `14.91` | `0.212` | `36.4%` | `2.05x`\* |
+| 24 | length-belief | `100%` | `10.25` | `0.237` | `78.5%` | **`1.079x`** |
+
+(\* the `v2` growth factor shown here is its target-24 number from the
+earlier entry, `8.70/7.17`.)
+
+The runaway-remaining-count symptom that every prior stratification fix
+only partially reduced (baseline `2.6-2.8x` -> time-only `2.0-2.3x` ->
+time+mid+gap `1.2-1.6x`) is now essentially gone (`1.07-1.08x`) with an
+18,456-parameter head, a fraction of `CountingBridgeSSBHead`'s `595,973`.
+Length MAE and similarity both improve at both targets over the `v2`
+counting-bridge head, with target-12 similarity (`0.162`) and length MAE
+(`4.31`) the best recorded for any arm this session. This is exactly what
+the design predicted: a belief constrained to be a normalized distribution
+over a bounded support cannot free-float the way a point estimate can, so
+it cannot compound an early mistake into the runaway branching/growth
+pattern seen throughout this line of investigation.
+
+It did not fix, and was not designed to fix, the separately-diagnosed
+representational problem: initial `P(BOTH)` is now `78%` (higher than `v2`'s
+`36-38%`, though for a different reason - `v2`'s topology head was a free
+parameter fit to whatever the corrupted training states looked like, while
+here `BOTH` dominance is a direct, checkable consequence of the predicted
+prior together with the exact Bayes update), and every observed marker in
+both rollouts was `LEAF` or `BOTH` - `LEFT`/`RIGHT` never won the greedy
+argmax despite carrying real, non-trivial probability mass (`9%` each in
+`mean_initial_topology_probability`). Greedy decoding structurally cannot
+select a second-place option no matter how close, which this design does
+not address; target-24 still undershoots (`15.94` generated vs a true `24`)
+for the same context-independent-length reason established in "E2
+target-length undershoot" - this head changes how a length belief is used,
+not whether the belief itself is informed by content.
+
+`candidate`: this validates the core mechanism-level hypothesis (a
+structurally self-correcting belief eliminates runaway compounding) with a
+smaller, simpler head, but has not yet been combined with the
+context-linked (`natural_boundaries`) corruption that targets the other,
+independently-diagnosed problem, nor does it address greedy decoding
+discarding non-argmax markers. Per `RESEARCH_DIRECTION.md` section 9,
+combining both fixes and/or moving to sampled rather than greedy decoding
+are the next open decisions, not yet made.
+
+Artifacts are
+`DreamOn/artifacts/diffugpt_elbo_e2/head_only_500_length_belief/metrics.json`
+and `.../rollout_length_belief.json`. Reproduce with, from `DreamOn/`:
+
+```powershell
+python train_diffugpt_counting_bridge.py --model-path ..\..\models\diffugpt-s `
+  --train-file data\opencoder-pilot\train.jsonl `
+  --validation-file data\opencoder-pilot\validation.jsonl `
+  --output-dir artifacts\diffugpt_elbo_e2\head_only_500_length_belief `
+  --steps 500 --validation-limit 32 --max-length 128 --learning-rate 1e-3 `
+  --stratify-probability 0.3 --narrow-ceiling 0.06 `
+  --mid-stratify-probability 0.3 --mid-low 0.3 --mid-high 0.5 `
+  --gap-stratify-probability 0.3 --gap-k-choices 3 4 5 6 `
+  --head-design length-belief
+python evaluate_diffugpt_counting_bridge.py --model-path ..\..\models\diffugpt-s `
+  --head-path artifacts\diffugpt_elbo_e2\head_only_500_length_belief\counting_bridge_head.pt `
+  --validation-file data\opencoder-pilot\validation.jsonl `
+  --output-file artifacts\diffugpt_elbo_e2\rollout_length_belief.json `
+  --limit 32 --max-length 128
+```
+
+## E2 length-belief + natural-boundary corruption combined: best length signal yet, new instability
+
+(`src/ssb/head_registry.py` was added first so `evaluate_diffugpt_counting_bridge.py`
+and the three `audit_*` scripts load whichever head design a checkpoint
+records instead of hardcoding `CountingBridgeSSBHead`; no behavior change
+for existing checkpoints, which default to `"counting-bridge"`.)
+
+Combining the two independently-validated fixes - `--head-design
+length-belief` (fixes runaway compounding) and `--natural-boundaries`
+(restores genuine context-length mutual information) - in one 500-step
+retrain, then running both the fixed-target rollout gate and the
+`--natural-spans` evaluation:
+
+| target/mode | finish | length MAE | similarity | remaining growth `x` | true/generated length correlation |
+|---|---:|---:|---:|---:|---:|
+| 12 (fixed) | `87.5%` | `7.125` | `0.135` | `1.505x` | - |
+| 24 (fixed) | `100%` | `10.94` | `0.229` | `1.738x` | - |
+| natural spans | **`9.7%`** | `23.06` | `0.130` | - | **`0.679`** |
+
+The natural-span correlation (`0.679`) is the best recorded this session -
+well above the `0.452` the old counting-bridge head reached with the same
+corruption change, and far above the `0.038`/flat single-step result before
+any corruption change. Combining both fixes does transfer more real length
+signal into the belief than either fix alone. But stability regressed on
+every other axis: the runaway-growth factor, essentially eliminated by
+`length-belief` alone (`1.07-1.08x`), partially returned (`1.5-1.7x`,
+still well below the original `2.6-2.8x` baseline but clearly worse than
+`length-belief` without `natural_boundaries`); free-rollout finish rate on
+natural spans collapsed to `9.7%`, and generation massively overshoots
+(`36.32` mean generated vs a true mean of `13.26`). `mean_initial_predicted_
+remaining` under natural spans (`12.6`) is roughly `3x` higher than the same
+head trained without `natural_boundaries` (`3.8-4.8`), suggesting the belief
+learned a much larger-scale prior from the shorter, more skewed natural
+span-length distribution, and that scale is not yet well-calibrated against
+the actual competing-intensity dynamics it feeds into.
+
+This also incidentally explains a puzzle from the previous entry: `RIGHT`
+never wins the greedy argmax in *any* length-belief run, including this
+one, while `LEFT` does. `marker_probabilities_from_prior` is exactly
+symmetric between `LEFT` and `RIGHT` by construction (`marker_event_counts`
+gives them identical counts for every `r`), so the two are always exactly
+tied; PyTorch's `argmax` deterministically breaks ties toward the
+lower-index option, and `Marker.LEFT` (`1`) precedes `Marker.RIGHT` (`2`).
+This is a mechanical property of greedy decoding over an exactly-symmetric
+distribution, not evidence about calibration - flagged in
+`RESEARCH_DIRECTION.md` section 9's open "greedy decoding" question rather
+than fixed here.
+
+`candidate`/`diagnostic`: the two fixes are not simply additive - each
+targets a real, independently-confirmed problem, but composing them surfaces
+a new belief-scale calibration issue neither fix alone exposed. Per
+`RESEARCH_DIRECTION.md` section 9, this is not addressed by more steps or
+further stratification tuning without first separating whether the scale
+mismatch comes from the natural span-length distribution's own statistics
+(shorter, more skewed than the uniform `4-24` prior implicitly assumed
+elsewhere) or from an interaction between `length-belief`'s training
+objective and that distribution - not yet isolated.
+
+Artifacts are
+`DreamOn/artifacts/diffugpt_elbo_e2/head_only_500_length_belief_natural/metrics.json`,
+`.../rollout_length_belief_natural.json`, and
+`.../rollout_length_belief_natural_spans.json`. Reproduce with, from
+`DreamOn/`:
+
+```powershell
+python train_diffugpt_counting_bridge.py --model-path ..\..\models\diffugpt-s `
+  --train-file data\opencoder-pilot\train.jsonl `
+  --validation-file data\opencoder-pilot\validation.jsonl `
+  --output-dir artifacts\diffugpt_elbo_e2\head_only_500_length_belief_natural `
+  --steps 500 --validation-limit 32 --max-length 128 --learning-rate 1e-3 `
+  --stratify-probability 0.3 --narrow-ceiling 0.06 `
+  --mid-stratify-probability 0.3 --mid-low 0.3 --mid-high 0.5 `
+  --gap-stratify-probability 0.3 --gap-k-choices 3 4 5 6 `
+  --head-design length-belief --natural-boundaries
+python evaluate_diffugpt_counting_bridge.py --model-path ..\..\models\diffugpt-s `
+  --head-path artifacts\diffugpt_elbo_e2\head_only_500_length_belief_natural\counting_bridge_head.pt `
+  --validation-file data\opencoder-pilot\validation.jsonl `
+  --output-file artifacts\diffugpt_elbo_e2\rollout_length_belief_natural.json `
+  --limit 32 --max-length 128
+python evaluate_diffugpt_counting_bridge.py --model-path ..\..\models\diffugpt-s `
+  --head-path artifacts\diffugpt_elbo_e2\head_only_500_length_belief_natural\counting_bridge_head.pt `
+  --validation-file data\opencoder-pilot\validation.jsonl `
+  --output-file artifacts\diffugpt_elbo_e2\rollout_length_belief_natural_spans.json `
+  --limit 32 --max-length 128 --natural-spans
+```
+
+## E2 length-belief instability isolated: BOTH inflates the belief sum, not miscalibrated scale
+
+The previous entry's "belief-scale mismatch" hypothesis compared
+`mean_initial_predicted_remaining` across *two different evaluation modes*
+on the same checkpoint (`3.8-4.8` from the fixed target-12/24 gate vs
+`12.6` from `--natural-spans`) - not a fair comparison. Re-running the
+single-step, rollout-free calibration audit
+(`audit_diffugpt_elbo_e2_remaining_count_calibration.py
+--natural-boundaries`) on the same checkpoint gives `mean_predicted_remaining
+= 12.33` against a true mean of `14.76` (ratio `0.84`) - matching the
+rollout's own initial estimate (`12.60`) almost exactly. The belief's
+*average scale* was never the problem; it is reasonably calibrated in a
+fair comparison. The single-step correlation (`0.225`) is real but, as with
+the original counting-bridge head, much weaker than the full-rollout
+correlation (`0.679`) - the same single-step-vs-rollout gap persists with
+the new head, just at a higher baseline.
+
+`length_posterior.py`'s own docstring flagged the actual candidate cause
+when it was built: each GAP's belief is predicted independently, with no
+constraint relating a newly created child's belief to its parent's -
+`child_prior_after_marker`'s exact Bayesian relationship was derived but
+never wired into the neural head. `audit_diffugpt_elbo_e2_sibling_inflation.py`
+tests this directly, instrumenting free rollout (via a new `remaining_trace`
+field in `rollout()`'s diagnostics) to record how the model's own summed
+`remaining_events` belief changes immediately after each marker:
+
+| checkpoint | marker | events | mean `Δ(total remaining)` | fraction increasing |
+|---|---|---:|---:|---:|
+| length-belief + natural | `BOTH` | `355` | **`+1.24`** | `93.2%` |
+| length-belief + natural | `LEFT` | `278` | `-0.51` | `0.4%` |
+| length-belief + natural | `LEAF` | `108` | `-1.78` | `0%` |
+| length-belief (no natural) | `BOTH` | `468` | **`+0.82`** | `90.8%` |
+| length-belief (no natural) | `LEAF` | `462` | `-1.81` | `0%` |
+
+`BOTH` inflates the total belief in *both* checkpoints, essentially always
+(`91-93%` of events), while `LEAF`/`LEFT` deflate it essentially always
+(`0-0.4%` of events) - exactly what "each child re-estimates independently
+rather than inheriting a constrained share of the parent's belief" predicts:
+splitting one GAP into two fresh, independently-estimated children adds
+their two new beliefs to the running total without subtracting the parent's
+resolved share proportionally. The mechanism is universal to
+`LengthBeliefSSBHead`, not specific to `natural_boundaries`. What differs
+between the two checkpoints is the *mix*: `length-belief` alone splits
+`LEAF`/`BOTH` almost `50/50` (`462` vs `468`), so inflation and deflation
+roughly cancel over a trajectory (matching its near-`1.0x` growth factor);
+`length-belief + natural` chooses `BOTH` far more often (`355` vs `108`
+`LEAF`, plus `278` `LEFT`), so inflation dominates and the running total
+climbs (matching its `1.5-1.7x`/severe-overshoot behavior). The instability
+is therefore a consequence of *which* checkpoint's topology mix interacts
+with an already-present structural gap, not a new problem `natural_boundaries`
+introduced on its own.
+
+`closed: diagnostic`. This corrects the previous entry's hypothesis with a
+sharper, quantitatively confirmed one, and identifies a concrete next
+design task: constrain child GAPs' beliefs relative to their parent's
+(wiring in `child_prior_after_marker`, which requires tracking GAP lineage
+across a rollout - not yet attempted) rather than treating the scale or the
+corruption mix as the target of further tuning. Per `RESEARCH_DIRECTION.md`
+section 9, that lineage-aware redesign is its own next stage, not started
+here.
+
+Artifacts are
+`DreamOn/artifacts/diffugpt_elbo_e2/remaining_count_calibration_length_belief_natural.json`,
+`.../sibling_inflation_length_belief_natural.json`, and
+`.../sibling_inflation_length_belief.json`. Reproduce with, from `DreamOn/`:
+
+```powershell
+python audit_diffugpt_elbo_e2_remaining_count_calibration.py --model-path ..\..\models\diffugpt-s `
+  --head-path artifacts\diffugpt_elbo_e2\head_only_500_length_belief_natural\counting_bridge_head.pt `
+  --validation-file data\opencoder-pilot\validation.jsonl `
+  --output-file artifacts\diffugpt_elbo_e2\remaining_count_calibration_length_belief_natural.json `
+  --limit 64 --max-length 128 --time 0.0 --natural-boundaries --natural-spans-per-record 4
+python audit_diffugpt_elbo_e2_sibling_inflation.py --model-path ..\..\models\diffugpt-s `
+  --head-path artifacts\diffugpt_elbo_e2\head_only_500_length_belief_natural\counting_bridge_head.pt `
+  --validation-file data\opencoder-pilot\validation.jsonl `
+  --output-file artifacts\diffugpt_elbo_e2\sibling_inflation_length_belief_natural.json `
+  --limit 32 --max-length 128 --natural-spans
+python audit_diffugpt_elbo_e2_sibling_inflation.py --model-path ..\..\models\diffugpt-s `
+  --head-path artifacts\diffugpt_elbo_e2\head_only_500_length_belief\counting_bridge_head.pt `
+  --validation-file data\opencoder-pilot\validation.jsonl `
+  --output-file artifacts\diffugpt_elbo_e2\sibling_inflation_length_belief.json `
+  --limit 32 --max-length 128
+```
+
+## E2 lineage-aware child beliefs: growth instability fixed, natural-span correlation traded away
+
+`length_posterior.child_prior_after_marker`'s exact math (derived, never
+wired in) is now actually connected. `LengthBeliefSSBHead.predict()` gained
+`prior_override`/`override_mask` arguments (`length_belief_head.py`):
+when given, a masked row's belief is forced to the supplied value instead of
+`prior_head(hidden)`'s own guess, otherwise behaving exactly as before
+(both arguments default to `None`; all 11 pre-existing tests are untouched
+by this). `evaluate_diffugpt_counting_bridge.rollout(..., lineage_aware=True)`
+uses this: after each `LEFT`/`RIGHT`/`BOTH` event, it converts the *parent's*
+belief row and the event's own time into the child prior(s) via
+`child_prior_after_marker`, and threads them through the rollout's own
+GAP-position bookkeeping (`apply_joint_actions`'s `[MASK, token]` /
+`[token, MASK]` / `[MASK, token, MASK]` replacement layout gives the new
+child positions directly) so the next step's `predict()` call overrides
+exactly those rows. No retraining - this only changes what belief a child
+GAP is *evaluated* with during free rollout; the checkpoints are the same
+500-step pilots from the previous two entries.
+`tests/test_length_belief_head.py` gained `PriorOverrideTest` (masked rows
+only change the overridden ones; a hand-built parent prior split via
+`child_prior_after_marker` and fed back in as an override reproduces
+`length_posterior.marker_probabilities`'s topology exactly) and
+`PriorVectorDictConversionTest` (round-trip against
+`prior_vector_from_dict`/`prior_dict_from_vector`) - `143/143` total.
+
+Re-running the exact eval commands from the previous two entries with
+`--lineage-aware` added, on both checkpoints:
+
+| checkpoint | mode | finish | length MAE | similarity | remaining growth `x` | true/generated correlation |
+|---|---|---:|---:|---:|---:|---:|
+| length-belief (no natural) | 12, baseline | `93.75%` | `4.31` | `0.162` | `1.073x` | - |
+| length-belief (no natural) | 12, lineage-aware | `100%` | **`2.56`** | **`0.177`** | `1.059x` | - |
+| length-belief (no natural) | 24, baseline | `100%` | `10.25` | `0.237` | `1.079x` | - |
+| length-belief (no natural) | 24, lineage-aware | `100%` | **`9.53`** | **`0.270`** | `1.038x` | - |
+| length-belief + natural | 12, baseline | `87.5%` | `7.13` | `0.135` | `1.505x` | - |
+| length-belief + natural | 12, lineage-aware | `100%` | `6.44`\* | `0.171` | **`1.068x`** | - |
+| length-belief + natural | 24, baseline | `100%` | `10.94` | `0.229` | `1.738x` | - |
+| length-belief + natural | 24, lineage-aware | `100%` | `16.44`\* | `0.212` | **`1.034x`** | - |
+| length-belief + natural | natural spans, baseline | `9.7%` | `23.06` | `0.130` | (n/a) | `0.679` |
+| length-belief + natural | natural spans, lineage-aware | **`90.3%`** | **`4.84`** | **`0.292`** | `0.818` | `-0.058` |
+
+(\* on the `length-belief + natural` checkpoint, the fixed target-12/24 gate's
+MAE moves in opposite directions - `12` improves, `24` worsens - because the
+fix corrects the growth *direction* to near-neutral/slightly-deflating rather
+than a magnitude that happens to land near either fixed target; see below.)
+
+The `sibling_inflation` audit confirms the mechanism is doing what it should
+on both checkpoints, though incompletely on one:
+
+| checkpoint | marker | events | mean `Δ(total remaining)`, baseline → lineage-aware | fraction increasing, baseline → lineage-aware |
+|---|---|---:|---:|---:|
+| length-belief (no natural) | `BOTH` | `432` | `+0.82` → `+0.68` | `90.8%` → `99.5%` |
+| length-belief + natural | `BOTH` | `221` | `+1.24` → `+0.31` | `93.2%` → `86.4%` |
+
+Three findings, none of them a clean "solved":
+
+1. **The runaway-growth instability that motivated this design is gone.**
+   Every growth factor above is now in `0.82x`-`1.07x` (previously up to
+   `1.74x` on the unstable checkpoint) - a newly split child's belief can no
+   longer add mass to the running total the way an independently-re-guessed
+   one could. This is the mechanism the diagnosis predicted and it behaves
+   exactly as derived.
+2. **On the checkpoint that was already near-stable (`length-belief`, no
+   natural), the fix is a clean improvement on every axis** - finish rate,
+   MAE, and similarity all improve at both targets, consistent with removing
+   a small residual bias rather than papering over a large one.
+3. **On the unstable checkpoint (`length-belief + natural`), the fix trades
+   one problem for two others.** Fixed-target-24 MAE gets *worse* (`10.94`
+   -> `16.44`) because the corrected (near-neutral) growth no longer happens
+   to overshoot into the `24` target the way the old runaway growth did by
+   accident. More importantly, the natural-spans correlation - the best
+   result of the whole investigation (`0.679`) - collapses to noise
+   (`-0.058`), even though finish rate, MAE, and similarity all improve
+   dramatically in the same run. The likely explanation: that `0.679`
+   correlation was never evidence of calibrated length belief. It was a
+   side effect of the *uncorrected* runaway dynamics happening to scale with
+   how much real content was available to keep splitting into - longer true
+   spans gave the corruption process more natural boundaries to have
+   produced multi-GAP states from, which gave runaway growth more fuel, which
+   produced longer generations, which correlated with the longer true
+   length. Removing the runaway growth removes that accidental proxy signal
+   without replacing it with a genuine one, because `prior_head` still has
+   no mechanism forcing its *root*-GAP belief (the one prediction lineage-awareness
+   does not touch, since a root GAP has no parent to inherit from) to track
+   context length - the original "target-length undershoot" gap from earlier
+   in this investigation, never actually closed, just previously masked by
+   runaway growth.
+
+`candidate`: lineage-aware child beliefs are a real, mechanistically-confirmed
+fix for sibling inflation and should stay on for any further `length-belief`
+work - the improvement on the already-stable checkpoint has no downside
+found here. But this diagnosis was more encouraging than the outcome; the
+next open task is unchanged in kind from before this entry: the *root* GAP's
+belief still needs a supervision signal tying it to actual context length,
+independent of whatever lineage does for its descendants. Per
+`RESEARCH_DIRECTION.md` section 9, that root-belief calibration question -
+not further lineage tuning - is the next deliberate decision point.
+
+Artifacts are
+`DreamOn/artifacts/diffugpt_elbo_e2/{rollout_length_belief_lineage,
+rollout_length_belief_natural_lineage,
+rollout_length_belief_natural_spans_lineage,
+sibling_inflation_length_belief_lineage,
+sibling_inflation_length_belief_natural_lineage}.json`. Reproduce with, from
+`DreamOn/`:
+
+```powershell
+python evaluate_diffugpt_counting_bridge.py --model-path ..\..\models\diffugpt-s `
+  --head-path artifacts\diffugpt_elbo_e2\head_only_500_length_belief\counting_bridge_head.pt `
+  --validation-file data\opencoder-pilot\validation.jsonl `
+  --output-file artifacts\diffugpt_elbo_e2\rollout_length_belief_lineage.json `
+  --limit 32 --max-length 128 --lineage-aware
+python evaluate_diffugpt_counting_bridge.py --model-path ..\..\models\diffugpt-s `
+  --head-path artifacts\diffugpt_elbo_e2\head_only_500_length_belief_natural\counting_bridge_head.pt `
+  --validation-file data\opencoder-pilot\validation.jsonl `
+  --output-file artifacts\diffugpt_elbo_e2\rollout_length_belief_natural_lineage.json `
+  --limit 32 --max-length 128 --lineage-aware
+python evaluate_diffugpt_counting_bridge.py --model-path ..\..\models\diffugpt-s `
+  --head-path artifacts\diffugpt_elbo_e2\head_only_500_length_belief_natural\counting_bridge_head.pt `
+  --validation-file data\opencoder-pilot\validation.jsonl `
+  --output-file artifacts\diffugpt_elbo_e2\rollout_length_belief_natural_spans_lineage.json `
+  --limit 32 --max-length 128 --natural-spans --lineage-aware
+python audit_diffugpt_elbo_e2_sibling_inflation.py --model-path ..\..\models\diffugpt-s `
+  --head-path artifacts\diffugpt_elbo_e2\head_only_500_length_belief\counting_bridge_head.pt `
+  --validation-file data\opencoder-pilot\validation.jsonl `
+  --output-file artifacts\diffugpt_elbo_e2\sibling_inflation_length_belief_lineage.json `
+  --limit 32 --max-length 128 --lineage-aware
+python audit_diffugpt_elbo_e2_sibling_inflation.py --model-path ..\..\models\diffugpt-s `
+  --head-path artifacts\diffugpt_elbo_e2\head_only_500_length_belief_natural\counting_bridge_head.pt `
+  --validation-file data\opencoder-pilot\validation.jsonl `
+  --output-file artifacts\diffugpt_elbo_e2\sibling_inflation_length_belief_natural_lineage.json `
+  --limit 32 --max-length 128 --natural-spans --lineage-aware
+```
